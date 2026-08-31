@@ -47,7 +47,7 @@ from .game_loop import GameLoop
 from .llm import LLM
 from .logging_utils import setup_logging
 from .relay_client import RelayClient
-from .safety import SafetyManager
+from .safety import DeviceOutputError, SafetyManager
 from .timeline.models import CycleGapPolicy
 from .timeline.replay_store import ReplayStore, ReplayStoreError, ReplaySummary
 from .timeline.session import SessionController
@@ -179,6 +179,11 @@ def _replay_summary_payload(summary: ReplaySummary) -> dict:
 def _timeline_error_response(exc: Exception) -> JSONResponse:
     if isinstance(exc, _ReplayNotFoundError):
         return JSONResponse({"error": "replay not found"}, status_code=404)
+    if isinstance(exc, DeviceOutputError):
+        return JSONResponse(
+            {"error": "device output was not confirmed"},
+            status_code=exc.status_code,
+        )
     if isinstance(exc, RuntimeError):
         return JSONResponse({"error": str(exc)}, status_code=409)
     if isinstance(exc, (ReplayStoreError, TypeError, ValueError)):
@@ -725,14 +730,15 @@ def make_app() -> FastAPI:
             async with state.timeline_transition_lock:
                 result = await state.loop.set_channel_enabled(ch, enabled)
                 save_device_channels(cfg, {ch: {"enabled": enabled}})
+        except DeviceOutputError as exc:
+            return JSONResponse(
+                {"error": "通道物理清除失败"}, status_code=exc.status_code
+            )
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         if result["dropped"]:
             return JSONResponse(
-                {
-                    "error": "通道物理清除失败",
-                    "dropped": result["dropped"],
-                },
+                {"error": "通道物理清除失败"},
                 status_code=503,
             )
         await state.broadcast()
@@ -799,14 +805,16 @@ def make_app() -> FastAPI:
         try:
             async with state.timeline_transition_lock:
                 result = await state.loop.set_runtime_cap(ch, value)
+        except DeviceOutputError as exc:
+            return JSONResponse(
+                {"error": "运行时上限物理降档失败"},
+                status_code=exc.status_code,
+            )
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         if result["dropped"]:
             return JSONResponse(
-                {
-                    "error": "运行时上限物理降档失败",
-                    "dropped": result["dropped"],
-                },
+                {"error": "运行时上限物理降档失败"},
                 status_code=503,
             )
         await state.broadcast()

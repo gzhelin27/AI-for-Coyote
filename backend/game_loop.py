@@ -13,7 +13,12 @@ from dataclasses import dataclass
 
 from .config import reload_character
 from .device_ops import CHANNEL, DeviceOps
-from .safety import SafetyManager
+from .output_coordinator import (
+    DeviceOutputCoordinator,
+    OutputIntentKind,
+    TransportOutcome,
+)
+from .safety import DeviceOutputError, SafetyManager
 
 logger = logging.getLogger("ai-for-coyote.game")
 
@@ -35,6 +40,15 @@ class GameLoop:
         self.camera = camera
         self.audio = audio
         self.ops = DeviceOps()
+        self.output_coordinator = DeviceOutputCoordinator()
+        for channel in ("A", "B"):
+            self.output_coordinator.seed_confirmed(
+                channel,
+                strength=int(self.safety.current.get(channel, 0)),
+                waveform=None,
+                waveform_mode=None,
+                enabled=bool(self.safety.enabled.get(channel, True)),
+            )
 
         self.history: list[dict] = []          # [{"role","content"}]
         self.notes: list[str] = []             # 反馈按钮等系统备注，注入下一轮
@@ -647,6 +661,9 @@ class GameLoop:
         if not ready and not self.safety.dry_run:
             return
         for ch in ("A", "B"):
+            pending = self.output_coordinator.pending(ch)
+            if pending.clear_required or pending.target_strength is not None:
+                continue
             base = int(self.cfg["device_channels"].get(ch, {}).get("baseline", 15 if ch == "A" else 5))
             wave_active = (ch in self.loop_tasks) or bool(self.safety.pulse_active().get(ch))
             strength = self.safety.current.get(ch, 0)
@@ -691,125 +708,433 @@ class GameLoop:
                 logger.info("通道保底：%s 通道强度/波形已自动补齐（第 %d 轮）", ch, self.turn_count)
 
     async def set_runtime_cap(self, channel: str, value: int) -> dict:
-        """Atomically lower a runtime cap, physically enforce it, then reconcile live output."""
+        """Apply desired cap policy and publish strength only after delivery."""
         channel = self.safety.norm_channel(channel)
         requested_cap = max(1, min(self.safety.caps[channel], int(value)))
-        old_effective_cap = self.safety.cap_for(channel)
-        new_effective_cap = min(old_effective_cap, requested_cap)
-        should_reconcile = new_effective_cap < old_effective_cap
+        applied = self.safety.set_user_cap(channel, requested_cap)
+        self._sync_output_coordinator_channel(channel)
+        confirmed_strength = self.output_coordinator.confirmed(channel).strength
+        effective_cap = self.safety.cap_for(channel)
+        if confirmed_strength is not None and confirmed_strength > effective_cap:
+            self.output_coordinator.mark_reduction(channel, effective_cap)
+
+        pending = self.output_coordinator.pending(channel)
+        needs_reconciliation = (
+            pending.clear_required or pending.target_strength is not None
+        )
         restart = False
         controller = self.timeline_session
-        if should_reconcile and controller is not None:
+        if needs_reconciliation and controller is not None:
             restart = await controller.suspend_channel_for_safety(
                 channel, reason="runtime_cap"
             )
 
-        executed: list = []
-        dropped: list = []
         async with self._action_lock:
-            physical_before = int(self.safety.current.get(channel, 0))
-            applied = self.safety.set_user_cap(channel, requested_cap)
+            self._sync_output_coordinator_channel(channel)
+            confirmed_strength = self.output_coordinator.confirmed(channel).strength
             effective_cap = self.safety.cap_for(channel)
-            if physical_before > effective_cap:
-                executed, dropped = await self._execute_actions_locked(
-                    [
-                        {
-                            "op": "hold_strength",
-                            "channel": channel,
-                            "value": effective_cap,
-                        }
-                    ]
-                )
+            if confirmed_strength is not None and confirmed_strength > effective_cap:
+                self.output_coordinator.mark_reduction(channel, effective_cap)
+            reconciled = await self._reconcile_runtime_safety_locked((channel,))
 
-        if restart and not dropped:
+        confirmed_strength = self.output_coordinator.confirmed(channel).strength or 0
+        if (
+            restart
+            and self.safety.desired_enabled[channel]
+            and self.safety.cap_for(channel) <= confirmed_strength
+        ):
             await controller.resume_channel_after_safety(channel)
+        result = reconciled[channel]
         return {
             "value": applied,
             "effective_cap": self.safety.cap_for(channel),
-            "executed": executed,
-            "dropped": dropped,
+            "executed": result["executed"],
+            "dropped": result["dropped"],
         }
 
     async def set_channel_enabled(self, channel: str, enabled: bool) -> dict:
-        """Quiesce a live runner before disabling and physically clearing a channel."""
+        """Commit enabled state only after any required clear is confirmed."""
         channel = self.safety.norm_channel(channel)
+        desired = self.safety.request_channel_enabled(channel, enabled)
+        self._sync_output_coordinator_channel(channel)
+        confirmed = self.output_coordinator.confirmed(channel)
+        was_confirmed_enabled = confirmed.enabled
+        pending = self.output_coordinator.pending(channel)
+        if (
+            not desired
+            and not pending.clear_required
+            and (
+                confirmed.enabled
+                or confirmed.strength not in (None, 0)
+                or confirmed.waveform is not None
+                or confirmed.waveform_mode is not None
+            )
+        ):
+            self.output_coordinator.require_clear(channel)
+
         controller = self.timeline_session
         restart = False
-        if not enabled and controller is not None:
+        pending = self.output_coordinator.pending(channel)
+        if controller is not None and (
+            not desired
+            or pending.clear_required
+            or pending.target_strength is not None
+        ):
             restart = await controller.suspend_channel_for_safety(
                 channel, reason="channel_disabled"
             )
 
-        executed: list = []
-        dropped: list = []
         async with self._action_lock:
-            self.safety.set_channel_enabled(channel, enabled)
-            if not enabled:
-                executed, dropped = await self._execute_actions_locked(
-                    [{"op": "clear", "channel": channel}]
-                )
+            reconciled = await self._reconcile_runtime_safety_locked((channel,))
 
-        if enabled and controller is not None:
+        if (
+            desired
+            and controller is not None
+            and (restart or not was_confirmed_enabled)
+        ):
             await controller.resume_channel_after_safety(channel)
+        result = reconciled[channel]
         return {
-            "enabled": bool(enabled),
-            "executed": executed,
-            "dropped": dropped,
+            "enabled": self.safety.enabled[channel],
+            "executed": result["executed"],
+            "dropped": result["dropped"],
             "runner_was_active": restart,
         }
 
     async def update_device_state(
         self, props: dict | None, slot_state: dict | None
     ) -> dict[str, dict]:
-        """Apply device feedback and enforce newly lowered overheat caps."""
-        slot_state = slot_state if isinstance(slot_state, dict) else {}
-        lowering: list[str] = []
-        for channel, key in (("A", "channelA"), ("B", "channelB")):
-            channel_state = slot_state.get(key)
-            comfort = (
-                channel_state.get("comfortLimit")
-                if isinstance(channel_state, dict)
-                else None
-            )
-            if not isinstance(comfort, dict) or "overheat" not in comfort:
-                continue
-            old_cap = self.safety.cap_for(channel)
-            overheat = bool(comfort["overheat"])
-            new_cap = min(
-                self.safety.caps[channel],
-                self.safety.user_caps.get(channel, self.safety.caps[channel]),
-            )
-            if overheat:
-                new_cap = min(new_cap, self.safety.overheat_reduce_to)
-            if new_cap < old_cap:
-                lowering.append(channel)
+        """Apply device feedback and retry every pending safety transition."""
+        self.safety.update_device_policy(slot_state)
+        self.safety.update_reported_strength(props)
+
+        reconcile_channels: list[str] = []
+        for channel in ("A", "B"):
+            self._sync_output_coordinator_channel(channel)
+            confirmed_strength = self.output_coordinator.confirmed(channel).strength
+            cap = self.safety.cap_for(channel)
+            if confirmed_strength is not None and confirmed_strength > cap:
+                self.output_coordinator.mark_reduction(channel, cap)
+            pending = self.output_coordinator.pending(channel)
+            if pending.clear_required or pending.target_strength is not None:
+                reconcile_channels.append(channel)
 
         controller = self.timeline_session
         restart: dict[str, bool] = {}
         if controller is not None:
-            for channel in lowering:
+            for channel in reconcile_channels:
                 restart[channel] = await controller.suspend_channel_for_safety(
                     channel, reason="overheat"
                 )
 
         results: dict[str, dict] = {}
         async with self._action_lock:
-            self.safety.update_device_state(props, slot_state)
-            for channel in lowering:
+            for channel in reconcile_channels:
+                self._sync_output_coordinator_channel(channel)
                 cap = self.safety.cap_for(channel)
-                if self.safety.current[channel] <= cap:
-                    results[channel] = {"executed": [], "dropped": []}
-                    continue
-                executed, dropped = await self._execute_actions_locked(
-                    [{"op": "hold_strength", "channel": channel, "value": cap}]
-                )
-                results[channel] = {"executed": executed, "dropped": dropped}
+                confirmed_strength = self.output_coordinator.confirmed(channel).strength
+                if confirmed_strength is not None and confirmed_strength > cap:
+                    self.output_coordinator.mark_reduction(channel, cap)
+                try:
+                    reconciled = await self._reconcile_runtime_safety_locked(
+                        (channel,)
+                    )
+                except DeviceOutputError as exc:
+                    results[channel] = self._safety_failure_result(channel, exc)
+                else:
+                    results[channel] = reconciled[channel]
 
         if controller is not None:
-            for channel in lowering:
-                if restart.get(channel) and not results[channel]["dropped"]:
+            for channel in reconcile_channels:
+                confirmed_strength = (
+                    self.output_coordinator.confirmed(channel).strength or 0
+                )
+                if (
+                    restart.get(channel)
+                    and not results[channel]["dropped"]
+                    and self.safety.desired_enabled[channel]
+                    and self.safety.cap_for(channel) <= confirmed_strength
+                ):
                     await controller.resume_channel_after_safety(channel)
         return results
+
+    async def reconcile_runtime_safety(
+        self, channel: str | None = None
+    ) -> dict[str, dict]:
+        """Retry pending clear/reduction work through dedicated transports."""
+        channels = (
+            ("A", "B")
+            if channel is None
+            else (self.safety.norm_channel(channel),)
+        )
+        async with self._action_lock:
+            return await self._reconcile_runtime_safety_locked(channels)
+
+    async def _reconcile_runtime_safety_locked(
+        self, channels: tuple[str, ...]
+    ) -> dict[str, dict]:
+        results: dict[str, dict] = {}
+        failures: list[DeviceOutputError] = []
+        for channel in channels:
+            try:
+                results[channel] = await self._reconcile_channel_safety_locked(
+                    channel
+                )
+            except DeviceOutputError as exc:
+                failures.append(exc)
+                results[channel] = self._safety_failure_result(channel, exc)
+        if failures:
+            raise failures[0]
+        return results
+
+    async def _reconcile_channel_safety_locked(self, channel: str) -> dict:
+        coordinator = self.output_coordinator
+        desired_enabled = self.safety.desired_enabled[channel]
+        confirmed = coordinator.confirmed(channel)
+        pending = coordinator.pending(channel)
+
+        if (
+            not desired_enabled
+            and not pending.clear_required
+            and (
+                confirmed.enabled
+                or confirmed.strength not in (None, 0)
+                or confirmed.waveform is not None
+                or confirmed.waveform_mode is not None
+            )
+        ):
+            coordinator.require_clear(channel)
+            pending = coordinator.pending(channel)
+
+        cap = self.safety.cap_for(channel)
+        if (
+            not pending.clear_required
+            and confirmed.strength is not None
+            and confirmed.strength > cap
+        ):
+            coordinator.mark_reduction(channel, cap)
+            pending = coordinator.pending(channel)
+
+        executed: list[dict] = []
+        if pending.clear_required:
+            self._cancel_loops(channel, reset_pulse=False)
+            outcome = await coordinator.run(
+                channel,
+                OutputIntentKind.CLEAR_OR_DISABLE,
+                lambda snapshot: self._transport_safety_clear(
+                    channel, snapshot, desired_enabled
+                ),
+            )
+            self._require_safety_outcome(channel, "clear", outcome)
+            confirmed = coordinator.confirmed(channel)
+            self.safety.confirm_clear(channel)
+            self.safety.confirm_channel_enabled(channel, confirmed.enabled)
+            self.patterns[channel] = None
+            executed.append(
+                self._safety_success_result(channel, "clear", outcome)
+            )
+
+        confirmed = coordinator.confirmed(channel)
+        pending = coordinator.pending(channel)
+        if pending.target_strength is not None:
+            target = pending.target_strength
+            outcome = await coordinator.run(
+                channel,
+                OutputIntentKind.SAFETY_REDUCE,
+                lambda snapshot: self._transport_safety_strength_delta(
+                    channel, target, snapshot
+                ),
+            )
+            self._require_safety_outcome(channel, "strength_delta", outcome)
+            confirmed = coordinator.confirmed(channel)
+            self.safety.confirm_strength(channel, int(confirmed.strength or 0))
+            executed.append(
+                self._safety_success_result(
+                    channel, "strength_delta", outcome
+                )
+            )
+
+        confirmed = coordinator.confirmed(channel)
+        if desired_enabled and not confirmed.enabled:
+            outcome = await coordinator.run(
+                channel,
+                OutputIntentKind.CLEAR_OR_DISABLE,
+                lambda snapshot: self._confirmed_local_enable(snapshot),
+            )
+            self._require_safety_outcome(channel, "enable", outcome)
+            confirmed = coordinator.confirmed(channel)
+            self.safety.confirm_clear(channel)
+            self.safety.confirm_channel_enabled(channel, confirmed.enabled)
+            self.patterns[channel] = None
+            executed.append(
+                self._safety_success_result(channel, "enable", outcome)
+            )
+
+        return {"executed": executed, "dropped": []}
+
+    async def _transport_safety_strength_delta(
+        self, channel: str, target: int, confirmed
+    ) -> TransportOutcome:
+        current = int(confirmed.strength or 0)
+        if current <= target:
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": current},
+            )
+        if self.safety.dry_run:
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": target},
+            )
+        client_id = self.relay.first_client_id()
+        slot_id = self.relay.get_slot_id()
+        if not client_id or not slot_id:
+            return TransportOutcome(sent=False, error="device is not connected")
+        frame = self.ops.add_strength(
+            client_id,
+            slot_id,
+            CHANNEL[channel],
+            target - current,
+        )
+        sent = bool(await self.relay.send_frame(frame))
+        return TransportOutcome(
+            sent=sent,
+            effective={"strength": target} if sent else None,
+            error=None if sent else "strength delta transport failed",
+        )
+
+    async def _transport_safety_clear(
+        self, channel: str, confirmed, enabled: bool
+    ) -> TransportOutcome:
+        effective = {
+            "strength": 0,
+            "waveform": None,
+            "waveform_mode": None,
+            "enabled": enabled,
+        }
+        if self.safety.dry_run:
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective=effective,
+            )
+        client_id = self.relay.first_client_id()
+        slot_id = self.relay.get_slot_id()
+        if not client_id or not slot_id:
+            return TransportOutcome(sent=False, error="device is not connected")
+        numeric_channel = CHANNEL[channel]
+        frames = [self.ops.clear(client_id, slot_id, numeric_channel)]
+        strength = int(confirmed.strength or 0)
+        if strength:
+            frames.append(
+                self.ops.add_strength(
+                    client_id, slot_id, numeric_channel, -strength
+                )
+            )
+        frames.append(
+            self.ops.reset_intensity(client_id, slot_id, numeric_channel)
+        )
+        sent = all(await self._send_all(frames))
+        return TransportOutcome(
+            sent=sent,
+            effective=effective if sent else None,
+            error=None if sent else "channel clear transport failed",
+        )
+
+    @staticmethod
+    async def _confirmed_local_enable(confirmed) -> TransportOutcome:
+        return TransportOutcome(
+            sent=True,
+            simulated=True,
+            effective={
+                "strength": int(confirmed.strength or 0),
+                "waveform": None,
+                "waveform_mode": None,
+                "enabled": True,
+            },
+        )
+
+    @staticmethod
+    def _require_safety_outcome(
+        channel: str, operation: str, outcome: TransportOutcome
+    ) -> None:
+        if outcome.sent:
+            return
+        detail = outcome.error or "device output was not confirmed"
+        conflict = any(
+            marker in detail
+            for marker in (
+                "stale output generation",
+                "blocked by higher-priority output intent",
+                "pending safety reduction changed",
+                "channel is disabled",
+            )
+        )
+        raise DeviceOutputError(
+            f"{channel} {operation} was not confirmed",
+            status_code=409 if conflict else 503,
+            detail=detail,
+        )
+
+    @staticmethod
+    def _safety_success_result(
+        channel: str, operation: str, outcome: TransportOutcome
+    ) -> dict:
+        effective_strength = 0
+        if outcome.effective is not None:
+            effective_strength = int(outcome.effective.get("strength") or 0)
+        return {
+            "action": {"op": operation, "channel": channel},
+            "effective": {
+                "op": operation,
+                "channel": channel,
+                "effective_strength": effective_strength,
+            },
+            "reason": "runtime safety reconciled",
+            "sent": not outcome.simulated,
+        }
+
+    @staticmethod
+    def _safety_failure_result(
+        channel: str, error: DeviceOutputError
+    ) -> dict:
+        return {
+            "executed": [],
+            "dropped": [
+                {
+                    "action": {"op": "safety_reconcile", "channel": channel},
+                    "reason": "device output was not confirmed",
+                    "sent": False,
+                }
+            ],
+        }
+
+    def _sync_output_coordinator_channel(self, channel: str) -> None:
+        confirmed = self.output_coordinator.confirmed(channel)
+        pattern = self.patterns.get(channel)
+        waveform = confirmed.waveform
+        waveform_mode = confirmed.waveform_mode
+        if pattern is None:
+            waveform = None
+            waveform_mode = None
+        elif channel in self.loop_tasks:
+            waveform = pattern
+            waveform_mode = "loop"
+        elif self.safety.pulse_active().get(channel):
+            waveform = pattern
+            waveform_mode = waveform_mode or "finite"
+        else:
+            waveform = None
+            waveform_mode = None
+        self.output_coordinator.seed_confirmed(
+            channel,
+            strength=int(self.safety.current.get(channel, 0)),
+            waveform=waveform,
+            waveform_mode=waveform_mode,
+            enabled=bool(self.safety.enabled.get(channel, True)),
+        )
 
     async def execute_actions(self, actions: list) -> tuple[list, list]:
         async with self._action_lock:
@@ -842,6 +1167,22 @@ class GameLoop:
                 dropped.append({"action": action, "reason": reason})
                 logger.warning("动作被安全层拒绝: %s -> %s", action, reason)
                 continue
+
+            channel = cmd.get("channel")
+            if (
+                channel in ("A", "B")
+                and cmd["kind"] not in ("clear", "stop")
+            ):
+                pending = self.output_coordinator.pending(channel)
+                if pending.clear_required or pending.target_strength is not None:
+                    dropped.append(
+                        {
+                            "action": action,
+                            "reason": "通道安全状态仍待物理确认",
+                            "sent": False,
+                        }
+                    )
+                    continue
 
             if not ready and not dry_run:
                 dropped.append({"action": action, "reason": "设备未连接（无 clientId/slotId）"})
@@ -1189,7 +1530,9 @@ class GameLoop:
         self.loop_tasks[ch_name] = asyncio.create_task(worker())
         return True
 
-    def _cancel_loops(self, ch_name: str | None) -> None:
+    def _cancel_loops(
+        self, ch_name: str | None, *, reset_pulse: bool = True
+    ) -> None:
         """取消循环波形；ch_name=None 时取消全部。"""
         names = [ch_name] if ch_name else list(self.loop_events)
         for name in names:
@@ -1199,7 +1542,7 @@ class GameLoop:
             task = self.loop_tasks.pop(name, None)
             if task:
                 task.cancel()
-        if ch_name and ch_name in self.safety.pulse_until:
+        if reset_pulse and ch_name and ch_name in self.safety.pulse_until:
             self.safety.pulse_until[ch_name] = 0.0
 
     async def _send_all(self, frames: list[dict]) -> list[bool]:

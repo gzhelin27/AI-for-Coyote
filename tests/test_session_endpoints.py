@@ -259,6 +259,45 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(completed[-1].effective_strength, 20)
 
+    async def test_cap_transport_exception_returns_safe_retryable_service_error(self):
+        await self._start_physical_live(30)
+        self.harness.relay.fail_next_strength_delta(
+            "A", OSError("PRIVATE_RELAY_FAILURE_DETAIL")
+        )
+
+        response = await self.client.post(
+            "/api/device/channels/cap", json={"channel": "A", "value": 10}
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"error": "运行时上限物理降档失败"})
+        self.assertNotIn("PRIVATE_RELAY_FAILURE_DETAIL", response.text)
+        self.assertEqual(self.harness.safety.user_caps["A"], 10)
+        self.assertEqual(self.harness.safety.current["A"], 30)
+        self.assertEqual(
+            self.harness.loop.output_coordinator.pending("A").target_strength,
+            10,
+        )
+
+    async def test_disable_clear_failure_is_not_persisted_or_reported_as_disabled(self):
+        await self._start_physical_live(25)
+        self.harness.relay.fail_next_clear("A")
+
+        with patch.object(main_module, "save_device_channels") as save_channels:
+            response = await self.client.post(
+                "/api/device/channels/enabled",
+                json={"channel": "A", "enabled": False},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"error": "通道物理清除失败"})
+        save_channels.assert_not_called()
+        self.assertTrue(self.harness.safety.enabled["A"])
+        self.assertEqual(self.harness.safety.current["A"], 25)
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("A").clear_required
+        )
+
     async def test_disabling_active_channel_physically_clears_and_never_outputs_later(self):
         await self._start_physical_live(25)
 

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from backend.config import DEFAULTS
 from backend.game_loop import GameLoop
-from backend.safety import SafetyManager
+from backend.safety import DeviceOutputError, SafetyManager
 from backend.timeline.cycle_runner import RunnerPhase
 from backend.timeline.models import CycleGapPolicy
 from backend.timeline.replay_store import ReplayStore
@@ -26,6 +26,8 @@ class FakeRelay:
         self.controller_id = "controller-test"
         self.clients = {}
         self.sent_frames = []
+        self._strength_failures = []
+        self._clear_failures = []
 
     def first_client_id(self):
         return "client-test"
@@ -35,7 +37,38 @@ class FakeRelay:
 
     async def send_frame(self, frame):
         self.sent_frames.append(frame)
+        inner = frame.get("data", {}) if isinstance(frame, dict) else {}
+        method = inner.get("m")
+        data = inner.get("data", {}) if isinstance(inner, dict) else {}
+        if method == "device.op" and data.get("t") == 3:
+            channel = data.get("c")
+            for index, (failed_channel, failure) in enumerate(
+                self._strength_failures
+            ):
+                if failed_channel is None or failed_channel == channel:
+                    self._strength_failures.pop(index)
+                    if isinstance(failure, BaseException):
+                        raise failure
+                    return False
+        if method == "device.op.clear":
+            channel = data.get("c")
+            for index, (failed_channel, failure) in enumerate(
+                self._clear_failures
+            ):
+                if failed_channel is None or failed_channel == channel:
+                    self._clear_failures.pop(index)
+                    if isinstance(failure, BaseException):
+                        raise failure
+                    return False
         return True
+
+    def fail_next_strength_delta(self, channel=None, failure=False):
+        numeric = {"A": 0, "B": 1}.get(channel, channel)
+        self._strength_failures.append((numeric, failure))
+
+    def fail_next_clear(self, channel=None, failure=False):
+        numeric = {"A": 0, "B": 1}.get(channel, channel)
+        self._clear_failures.append((numeric, failure))
 
     def to_state(self):
         return {
@@ -45,6 +78,24 @@ class FakeRelay:
             "clients": [],
             "last_error": "",
         }
+
+
+def relay_output_operations(frames):
+    """Decode the real DeviceOps frames at the GameLoop relay boundary."""
+    operations = []
+    for frame in frames:
+        inner = frame["data"]
+        method = inner["m"]
+        data = inner.get("data") or {}
+        if method == "device.op.clear":
+            operations.append(("clear", data.get("c")))
+        elif method == "device.op" and data.get("t") == 0:
+            operations.append(("waveform", data["c"], data["d"]))
+        elif method == "device.op" and data.get("t") == 3:
+            operations.append(("strength_delta", data["c"], data["v"]))
+        elif method == "device.op" and data.get("t") == 7:
+            operations.append(("reset", data["c"]))
+    return operations
 
 
 def make_game_loop_for_test(
@@ -151,6 +202,16 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         with patch("backend.game_loop.reload_character"):
             return await self.harness.loop._autopilot_turn()
 
+    async def _start_physical_live(self, strength):
+        self.harness.safety.dry_run = False
+        self.harness.llm.chat.return_value = (
+            "timeline line",
+            [{"op": "hold_strength", "channel": "A", "value": strength}],
+        )
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        self.assertEqual(self.harness.safety.current["A"], strength)
+
     async def _advance_until_phase(self, channel, phase):
         for _ in range(20):
             if self.harness.controller.runners[channel].state().phase is phase:
@@ -160,6 +221,25 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
                 self.harness.clock.advance(remaining)
             await asyncio.sleep(0)
         self.fail(f"runner {channel} did not reach {phase.value}")
+
+    async def _complete_active_cycle(self, channel):
+        initial = sum(
+            record.channel == channel and record.completed
+            for record in self.harness.controller.recorded_cycles
+        )
+        for _ in range(60):
+            completed = [
+                record
+                for record in self.harness.controller.recorded_cycles
+                if record.channel == channel and record.completed
+            ]
+            if len(completed) > initial:
+                return
+            remaining = self.harness.clock.next_remaining_ms
+            if remaining is not None:
+                self.harness.clock.advance(remaining)
+            await asyncio.sleep(0)
+        self.fail("active cycle did not complete")
 
     async def _assert_live_turn_finishing_late_is_discarded(self, invoke):
         entered_llm = asyncio.Event()
@@ -255,6 +335,75 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.harness.resolver.calls), 1)
         self.assertEqual(self.harness.cycle_rngs["A"].calls, 1)
         self.harness.llm.chat.assert_not_awaited()
+
+    async def test_cap_reduction_during_raw_cycle_uses_only_safety_delta_before_runner_restart(self):
+        await self._start_physical_live(30)
+        self.assertIs(
+            self.harness.controller.runners["A"].state().phase,
+            RunnerPhase.CYCLE,
+        )
+        self.harness.safety.pulse_until["A"] = 0
+        self.harness.relay.sent_frames.clear()
+
+        await self.harness.loop.set_runtime_cap("A", 10)
+
+        operations = relay_output_operations(self.harness.relay.sent_frames)
+        self.assertEqual(
+            [operation for operation in operations if operation[0] == "strength_delta"],
+            [("strength_delta", 0, -20)],
+        )
+        self.assertNotIn(("waveform", 0, 30000), operations)
+        self.assertNotIn("A", self.harness.loop.loop_tasks)
+        self.assertEqual(
+            self.harness.loop.output_coordinator.confirmed("A").strength,
+            10,
+        )
+
+    async def test_cap_reduction_during_gap_does_not_install_default_waveform_loop(self):
+        await self._start_physical_live(30)
+        await self._advance_until_phase("A", RunnerPhase.GAP)
+        self.harness.safety.pulse_until["A"] = 0
+        self.harness.relay.sent_frames.clear()
+
+        await self.harness.loop.set_runtime_cap("A", 10)
+
+        operations = relay_output_operations(self.harness.relay.sent_frames)
+        self.assertEqual(
+            [operation for operation in operations if operation[0] == "strength_delta"],
+            [("strength_delta", 0, -20)],
+        )
+        self.assertNotIn(("waveform", 0, 30000), operations)
+        self.assertNotIn("A", self.harness.loop.loop_tasks)
+        await self._complete_active_cycle("A")
+        completed = [
+            record
+            for record in self.harness.controller.recorded_cycles
+            if record.channel == "A" and record.completed
+        ]
+        self.assertEqual(completed[-1].effective_strength, 10)
+
+    async def test_failed_disable_keeps_runner_terminal_and_clear_pending(self):
+        await self._start_physical_live(25)
+        self.harness.relay.sent_frames.clear()
+        self.harness.relay.fail_next_clear("A")
+
+        with self.assertRaises(DeviceOutputError):
+            await self.harness.loop.set_channel_enabled("A", False)
+
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("A").clear_required
+        )
+        self.assertTrue(self.harness.safety.enabled["A"])
+        self.assertEqual(self.harness.safety.current["A"], 25)
+        frames_after_failure = len(self.harness.relay.sent_frames)
+        for _ in range(20):
+            remaining = self.harness.clock.next_remaining_ms
+            if remaining is not None:
+                self.harness.clock.advance(remaining)
+            await asyncio.sleep(0)
+        self.assertEqual(len(self.harness.relay.sent_frames), frames_after_failure)
+        self.assertNotIn("A", self.harness.controller.runners)
+        self.assertIn("B", self.harness.controller.runners)
 
     async def test_state_exposes_only_current_runner_schedule_fields(self):
         await self.harness.controller.start_live()

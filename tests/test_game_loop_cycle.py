@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 from backend.config import DEFAULTS
 from backend.game_loop import GameLoop
-from backend.safety import SafetyManager
+from backend.safety import DeviceOutputError, SafetyManager
 
 
 class RecordingOps:
@@ -39,6 +39,8 @@ class RecordingOps:
 class ConnectedRelay:
     def __init__(self) -> None:
         self.sent_frames = []
+        self._strength_failures = []
+        self._clear_failures = []
 
     def first_client_id(self):
         return "client-1"
@@ -48,7 +50,35 @@ class ConnectedRelay:
 
     async def send_frame(self, frame):
         self.sent_frames.append(frame)
+        if isinstance(frame, dict) and "strength" in frame:
+            channel = frame["strength"][0]
+            for index, (failed_channel, failure) in enumerate(
+                self._strength_failures
+            ):
+                if failed_channel is None or failed_channel == channel:
+                    self._strength_failures.pop(index)
+                    if isinstance(failure, BaseException):
+                        raise failure
+                    return False
+        if isinstance(frame, dict) and "clear" in frame:
+            channel = frame["clear"]
+            for index, (failed_channel, failure) in enumerate(
+                self._clear_failures
+            ):
+                if failed_channel is None or failed_channel == channel:
+                    self._clear_failures.pop(index)
+                    if isinstance(failure, BaseException):
+                        raise failure
+                    return False
         return True
+
+    def fail_next_strength_delta(self, channel=None, failure=False):
+        numeric = {"A": 0, "B": 1}.get(channel, channel)
+        self._strength_failures.append((numeric, failure))
+
+    def fail_next_clear(self, channel=None, failure=False):
+        numeric = {"A": 0, "B": 1}.get(channel, channel)
+        self._clear_failures.append((numeric, failure))
 
 
 class YieldingConnectedRelay(ConnectedRelay):
@@ -82,6 +112,18 @@ def make_game_loop_for_test(*, pattern="呼吸", frames=None):
     loop = GameLoop(cfg, None, safety, ConnectedRelay())
     loop.ops = RecordingOps()
     return loop
+
+
+async def activate_strength(loop, channel, value):
+    loop.safety.pulse_until[channel] = float("inf")
+    executed, dropped = await loop.execute_actions(
+        [{"op": "hold_strength", "channel": channel, "value": value}]
+    )
+    if dropped or len(executed) != 1:
+        raise AssertionError("test setup could not activate strength")
+    loop.safety.pulse_until[channel] = 0
+    loop.ops.strength_deltas.clear()
+    loop.relay.sent_frames.clear()
 
 
 class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
@@ -269,6 +311,180 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             [(["a", "b", "c"], 300, 30000), (["x", "y", "x"], 300, 30000)],
         )
         loop._cancel_loops(None)
+
+    async def test_failed_safety_delta_retains_confirmed_strength_and_pending_target(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        loop.relay.fail_next_strength_delta("A")
+
+        with self.assertRaises(DeviceOutputError):
+            await loop.set_runtime_cap("A", 10)
+
+        self.assertEqual(loop.ops.strength_deltas, [(0, -20)])
+        self.assertEqual(loop.safety.current["A"], 30)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 30)
+        self.assertEqual(
+            loop.output_coordinator.pending("A").target_strength,
+            10,
+        )
+        self.assertIsNone(loop.patterns["A"])
+        self.assertNotIn("A", loop.loop_tasks)
+
+    async def test_safety_delta_transport_exception_is_retryable_without_state_commit(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        loop.relay.fail_next_strength_delta(
+            "A", OSError("private relay failure detail")
+        )
+
+        with self.assertRaises(DeviceOutputError):
+            await loop.set_runtime_cap("A", 10)
+
+        self.assertEqual(loop.safety.current["A"], 30)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 30)
+        self.assertEqual(
+            loop.output_coordinator.pending("A").target_strength,
+            10,
+        )
+
+    async def test_explicit_runtime_safety_reconciliation_retries_pending_delta(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        loop.relay.fail_next_strength_delta("A")
+        with self.assertRaises(DeviceOutputError):
+            await loop.set_runtime_cap("A", 10)
+
+        reconcile = getattr(loop, "reconcile_runtime_safety", None)
+        self.assertIsNotNone(reconcile)
+        result = await reconcile("A")
+
+        self.assertEqual(result["A"]["dropped"], [])
+        self.assertEqual(loop.ops.strength_deltas, [(0, -20), (0, -20)])
+        self.assertEqual(loop.safety.current["A"], 10)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 10)
+        self.assertIsNone(
+            loop.output_coordinator.pending("A").target_strength
+        )
+
+    async def test_identical_overheat_report_retries_failed_pending_reduction(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        loop.relay.fail_next_strength_delta("A")
+        overheat = {
+            "channelA": {"comfortLimit": {"overheat": True}},
+        }
+
+        first = await loop.update_device_state(None, overheat)
+        second = await loop.update_device_state(None, overheat)
+
+        self.assertEqual(loop.ops.strength_deltas, [(0, -10), (0, -10)])
+        self.assertTrue(first["A"]["dropped"])
+        self.assertEqual(second["A"]["dropped"], [])
+        self.assertEqual(loop.safety.current["A"], 20)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 20)
+        self.assertIsNone(
+            loop.output_coordinator.pending("A").target_strength
+        )
+        self.assertIsNone(loop.patterns["A"])
+
+    async def test_overheat_recovery_does_not_reescalate_confirmed_strength(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+
+        await loop.update_device_state(
+            None,
+            {"channelA": {"comfortLimit": {"overheat": True}}},
+        )
+        await loop.update_device_state(
+            None,
+            {"channelA": {"comfortLimit": {"overheat": False}}},
+        )
+
+        self.assertEqual(loop.ops.strength_deltas, [(0, -10)])
+        self.assertFalse(loop.safety.overheat["A"])
+        self.assertEqual(loop.safety.current["A"], 20)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 20)
+        self.assertIsNone(loop.patterns["A"])
+
+    async def test_disable_failure_retries_clear_before_committing_enabled_state(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 25)
+        loop.relay.fail_next_clear("A")
+
+        with self.assertRaises(DeviceOutputError):
+            await loop.set_channel_enabled("A", False)
+
+        self.assertTrue(loop.safety.enabled["A"])
+        self.assertEqual(loop.safety.current["A"], 25)
+        self.assertTrue(loop.output_coordinator.pending("A").clear_required)
+        frames_after_failure = len(loop.relay.sent_frames)
+
+        executed, dropped = await loop.execute_actions(
+            [{"op": "hold_strength", "channel": "A", "value": 5}]
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(len(loop.relay.sent_frames), frames_after_failure)
+        self.assertEqual(loop.safety.current["A"], 25)
+        loop.turn_count = 2
+        loop.last_strength = {"A": 2, "B": 2}
+        loop.last_wave = {"A": 2, "B": 2}
+        loop.safety.current["B"] = 1
+        loop.safety.pulse_until["B"] = float("inf")
+
+        await loop._apply_channel_floor()
+
+        self.assertEqual(len(loop.relay.sent_frames), frames_after_failure)
+        self.assertEqual(loop.safety.current["A"], 25)
+
+        result = await loop.set_channel_enabled("A", False)
+
+        self.assertEqual(result["dropped"], [])
+        self.assertFalse(loop.safety.enabled["A"])
+        self.assertEqual(loop.safety.current["A"], 0)
+        self.assertFalse(loop.output_coordinator.pending("A").clear_required)
+        self.assertEqual(loop.ops.clear_calls, [("slot-1", 0), ("slot-1", 0)])
+
+    async def test_failed_a_reduction_does_not_block_b_reconciliation(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        await activate_strength(loop, "B", 30)
+        loop.relay.fail_next_strength_delta("A")
+
+        with self.assertRaises(DeviceOutputError):
+            await loop.set_runtime_cap("A", 10)
+        result_b = await loop.set_runtime_cap("B", 10)
+
+        self.assertEqual(result_b["dropped"], [])
+        self.assertEqual(loop.safety.current, {"A": 30, "B": 10})
+        self.assertEqual(loop.output_coordinator.confirmed("B").strength, 10)
+        self.assertEqual(
+            loop.output_coordinator.pending("A").target_strength,
+            10,
+        )
+
+    async def test_dry_run_safety_reduction_has_transport_parity_without_waveform_state(self):
+        loop = make_game_loop_for_test()
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.dry_run = True
+        await activate_strength(loop, "A", 30)
+
+        result = await loop.set_runtime_cap("A", 10)
+
+        self.assertEqual(result["dropped"], [])
+        self.assertEqual(loop.relay.sent_frames, [])
+        self.assertEqual(loop.safety.current["A"], 10)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 10)
+        self.assertIsNone(loop.patterns["A"])
+        self.assertNotIn("A", loop.loop_tasks)
 
     async def test_clear_output_does_not_enter_estop(self):
         loop = make_game_loop_for_test()

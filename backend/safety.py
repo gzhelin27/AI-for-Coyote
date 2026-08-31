@@ -24,6 +24,23 @@ class SafetyError(Exception):
     """命令被安全层拒绝。"""
 
 
+class DeviceOutputError(RuntimeError):
+    """A requested safety transition was not confirmed by device transport."""
+
+    def __init__(
+        self,
+        message: str = "device output reconciliation failed",
+        *,
+        status_code: int = 503,
+        detail: str | None = None,
+    ) -> None:
+        if status_code not in (409, 503):
+            raise ValueError("device output status must be 409 or 503")
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+
 class SafetyManager:
     def __init__(self, cfg) -> None:
         s = cfg["safety"]
@@ -54,6 +71,7 @@ class SafetyManager:
             d = cfg.get("device_channels", {}).get(ch) or {}
             if isinstance(d, dict) and "enabled" in d:
                 self.enabled[ch] = bool(d["enabled"])
+        self.desired_enabled = dict(self.enabled)
         self.estop_active = False             # 急停中（AI 循环暂停）
         self.dry_run = bool(cfg["app"].get("dry_run", True))
 
@@ -116,9 +134,34 @@ class SafetyManager:
         return False, "未知错误", None
 
     def set_channel_enabled(self, ch: str, on: bool) -> None:
-        """手动开关通道；物理清零及成功后的状态记录由 GameLoop 负责。"""
+        """Set desired and confirmed state for non-transport initialization."""
+        ch = self.norm_channel(ch)
+        enabled = bool(on)
+        self.desired_enabled[ch] = enabled
+        self.enabled[ch] = enabled
+
+    def request_channel_enabled(self, ch: str, on: bool) -> bool:
+        """Set desired policy without publishing an unconfirmed device state."""
+        ch = self.norm_channel(ch)
+        enabled = bool(on)
+        self.desired_enabled[ch] = enabled
+        return enabled
+
+    def confirm_channel_enabled(self, ch: str, on: bool) -> None:
+        """Publish a channel state only after coordinator confirmation."""
         ch = self.norm_channel(ch)
         self.enabled[ch] = bool(on)
+
+    def confirm_strength(self, ch: str, value: int) -> None:
+        """Publish transport-confirmed physical strength without changing intent."""
+        ch = self.norm_channel(ch)
+        self.current[ch] = max(0, min(200, int(value)))
+
+    def confirm_clear(self, ch: str) -> None:
+        """Publish a transport-confirmed per-channel clear."""
+        ch = self.norm_channel(ch)
+        self.current[ch] = 0
+        self.pulse_until[ch] = 0.0
 
     def _check_enabled(self, ch: str) -> str | None:
         if not self.enabled.get(ch, True):
@@ -318,36 +361,55 @@ class SafetyManager:
             self.pulse_until = {"A": 0.0, "B": 0.0}
 
     # ---------- 设备状态同步 ----------
+    def update_reported_strength(self, props: dict | None) -> set[str]:
+        """Commit strength values directly confirmed by a device report."""
+        if not isinstance(props, dict):
+            props = {}
+        updated: set[str] = set()
+        now = time.monotonic()
+        for ch, key in (("A", "intensityA"), ("B", "intensityB")):
+            if key not in props or now < self.pulse_until[ch]:
+                continue
+            try:
+                self.current[ch] = int(props[key])
+            except (TypeError, ValueError):
+                continue
+            updated.add(ch)
+        return updated
+
+    def update_device_policy(self, slot_state: dict | None) -> set[str]:
+        """Apply desired overheat/app-cap policy without changing output state."""
+        if not isinstance(slot_state, dict):
+            slot_state = {}
+        changed: set[str] = set()
+        for ch, key in (("A", "channelA"), ("B", "channelB")):
+            ch_state = slot_state.get(key)
+            if not isinstance(ch_state, dict):
+                continue
+            comfort = ch_state.get("comfortLimit")
+            if not isinstance(comfort, dict):
+                continue
+            if "overheat" in comfort:
+                overheat = bool(comfort["overheat"])
+                if self.overheat[ch] != overheat:
+                    changed.add(ch)
+                self.overheat[ch] = overheat
+            # App 舒适强度上限：comfortMax 优先，其次 absoluteMax
+            for field in ("comfortMax", "absoluteMax"):
+                value = comfort.get(field)
+                if isinstance(value, (int, float)) and value > 0:
+                    self.app_caps[ch] = int(value)
+                    break
+        return changed
+
     def update_device_state(self, props: dict | None, slot_state: dict | None) -> None:
         """用设备上报的 props / slotState 同步强度与过热状态。
 
         波形播放期间设备会上报当前帧振幅，因此该通道的强度值被忽略，
         避免页面数值跟着波形帧乱跳。
         """
-        if not isinstance(props, dict):
-            props = {}
-        if not isinstance(slot_state, dict):
-            slot_state = {}
-        now = time.monotonic()
-        try:
-            for ch, key in (("A", "intensityA"), ("B", "intensityB")):
-                if key in props and now >= self.pulse_until[ch]:
-                    self.current[ch] = int(props[key])
-        except (TypeError, ValueError):
-            pass
-        for ch, key in (("A", "channelA"), ("B", "channelB")):
-            ch_state = slot_state.get(key)
-            if isinstance(ch_state, dict):
-                comfort = ch_state.get("comfortLimit")
-                if isinstance(comfort, dict):
-                    if "overheat" in comfort:
-                        self.overheat[ch] = bool(comfort["overheat"])
-                    # App 舒适强度上限：comfortMax 优先，其次 absoluteMax
-                    for field in ("comfortMax", "absoluteMax"):
-                        value = comfort.get(field)
-                        if isinstance(value, (int, float)) and value > 0:
-                            self.app_caps[ch] = int(value)
-                            break
+        self.update_reported_strength(props)
+        self.update_device_policy(slot_state)
 
     def pulse_active(self) -> dict:
         now = time.monotonic()
