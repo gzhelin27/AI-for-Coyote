@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from backend.safety import DeviceOutputError
+from backend.timeline.models import SessionStatus
 from tests.timeline_fakes import SequenceGapRandom, TimelineHarness
 
 
@@ -35,6 +36,44 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.rng_calls, 0)
         self.assertEqual(harness.relay.frames, [])
         self.assertEqual({cycle.channel for cycle in replay.timeline.cycles}, {"A", "B"})
+        self.assertFalse(result.adjusted)
+        self.assertTrue(result.completed)
+        self.assertEqual(result.final_status, SessionStatus.IDLE)
+        self.assertEqual(
+            result.executed_cycle_actions,
+            tuple(
+                (
+                    {
+                        "op": "hold_strength",
+                        "channel": cycle.channel,
+                        "value": cycle.requested_strength,
+                    },
+                    {
+                        "op": "pulse_cycle",
+                        "channel": cycle.channel,
+                        "pattern": cycle.pattern,
+                    },
+                )
+                for cycle in replay.timeline.cycles
+            ),
+        )
+
+    async def test_waveform_mismatch_marks_executed_replay_adjusted(self):
+        harness = await TimelineHarness.create(seed=20260907, dry_run=True)
+        self.addAsyncCleanup(harness.close)
+
+        await harness.start()
+        await harness.turn([{"op": "hold_strength", "channel": "A", "value": 20}])
+        await harness.complete_cycles("A", count=1)
+        saved = await harness.finish()
+        replay = harness.store.load(saved.replay_id)
+        pattern = replay.timeline.cycles[0].pattern
+        harness.safety.presets[pattern]["frames"][0] = "mismatched-frame"
+
+        result = await harness.replay(replay)
+
+        self.assertTrue(result.adjusted)
+        self.assertTrue(result.completed)
 
     async def test_cap_lower_in_a_gap_has_no_waveform_helper_and_b_continues(self):
         harness = await TimelineHarness.create(

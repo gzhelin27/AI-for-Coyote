@@ -1002,24 +1002,48 @@ class TimelineHarness:
 
     async def replay(self, replay: Any) -> SimpleNamespace:
         before = self.rng_calls
-        await self.controller.start_replay(replay.manifest.replay_id)
-        player = self.controller.player
-        if player is None:
-            raise AssertionError("replay player was not installed")
-        requested_cycles = player.ordered_cycles
-        for _ in range(max(1, len(requested_cycles)) * 100):
-            if self.controller.to_state().status is SessionStatus.IDLE:
-                break
-            remaining = self.clock.next_remaining_ms
-            if remaining is not None:
-                self.clock.advance(remaining)
-            await asyncio.sleep(0)
-        else:
-            raise AssertionError("recorded replay did not finish")
-        return SimpleNamespace(
-            requested_cycles=requested_cycles,
-            rng_calls=self.rng_calls - before,
-        )
+        executed_cycle_actions: list[tuple[dict[str, Any], ...]] = []
+        original_execute = self.loop.execute_timeline_actions
+
+        async def record_executed_cycles(actions, owner_generations):
+            executed, dropped = await original_execute(actions, owner_generations)
+            if dropped:
+                return executed, dropped
+            executed_cycle_actions.append(
+                tuple(dict(item["action"]) for item in executed)
+            )
+            return executed, dropped
+
+        self.loop.execute_timeline_actions = record_executed_cycles
+        try:
+            await self.controller.start_replay(replay.manifest.replay_id)
+            player = self.controller.player
+            if player is None:
+                raise AssertionError("replay player was not installed")
+            requested_cycles = player.ordered_cycles
+            for _ in range(max(1, len(requested_cycles)) * 100):
+                if self.controller.to_state().status is SessionStatus.IDLE:
+                    break
+                remaining = self.clock.next_remaining_ms
+                if remaining is not None:
+                    self.clock.advance(remaining)
+                await asyncio.sleep(0)
+            else:
+                raise AssertionError("recorded replay did not finish")
+            return SimpleNamespace(
+                requested_cycles=requested_cycles,
+                executed_cycle_actions=tuple(executed_cycle_actions),
+                rng_calls=self.rng_calls - before,
+                adjusted=player.adjusted,
+                completed=(
+                    player.cursor == len(requested_cycles)
+                    and player.failure is None
+                    and player.cleared
+                ),
+                final_status=self.controller.to_state().status,
+            )
+        finally:
+            self.loop.execute_timeline_actions = original_execute
 
     async def close(self) -> None:
         await self.controller.stop()
