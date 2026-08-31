@@ -48,7 +48,9 @@ class GameLoop:
         self.autopilot_interval = float(cfg.get("autopilot", {}).get("interval_s", 12))
         self.autopilot_task: asyncio.Task | None = None
         self.autopilot_stop = asyncio.Event()
+        self._autopilot_transition_lock = asyncio.Lock()
         self.on_ai_turn = None                 # 由 AppState 注入：把 AI 主动回合推送到页面
+        self.timeline_session = None            # 由 AppState 注入：确定性会话/重放控制器
 
         # 双通道保底：轮次计数 + 每通道最近一次强度/波形调整轮次
         self.turn_count = 0
@@ -124,6 +126,40 @@ class GameLoop:
         state["profile_level"] = str(self.cfg["character"].get("profile_level") or "中")
         state["autopilot"] = bool(self.autopilot)
         state["autopilot_interval_s"] = self.autopilot_interval
+        # 安全层内部需要原始波形帧，但 HTTP/WebSocket 状态只公开显示元数据。
+        state["presets"] = [
+            {key: value for key, value in preset.items() if key != "frames"}
+            for preset in state.get("presets", [])
+        ]
+        if self.timeline_session is not None:
+            state["session"] = self.timeline_session.to_state().to_dict()
+            runners = self.timeline_session.runners
+            state["runners"] = {}
+            for channel in ("A", "B"):
+                runner = runners.get(channel)
+                if runner is None:
+                    state["runners"][channel] = {
+                        "phase": "idle",
+                        "pattern": None,
+                        "strength": 0,
+                        "cycle_index": 0,
+                        "next_cycle_start_ms": None,
+                    }
+                    continue
+                runner_state = runner.state()
+                directive = runner_state.directive
+                state["runners"][channel] = {
+                    "phase": runner_state.phase.value,
+                    "pattern": (
+                        directive.pattern
+                        if directive is not None
+                        and runner_state.phase.value in ("cycle", "gap")
+                        else None
+                    ),
+                    "strength": int(self.safety.current.get(channel, 0)),
+                    "cycle_index": runner_state.cycle_index,
+                    "next_cycle_start_ms": runner_state.next_cycle_start_ms,
+                }
         return state
 
     # ---------- 用户回合 ----------
@@ -160,10 +196,12 @@ class GameLoop:
                     line = f"（模型调用失败：{exc}。请检查 API 配置与网络。）"
                 actions = []
             self.turn_count += 1
-            executed, dropped = await self.execute_actions(actions)
+            executed, dropped, timeline_managed = await self._execute_ai_actions(
+                actions
+            )
             # 模型失败时绝不能执行通道保底，否则用户只会看到错误，
             # 设备却可能在没有有效 AI 决策的情况下自行开始输出。
-            if error is None:
+            if error is None and not timeline_managed:
                 await self._apply_channel_floor()
         finally:
             self.turn_busy = False
@@ -208,8 +246,11 @@ class GameLoop:
                 line = f"（开场调用失败：{exc}）"
                 actions = []
             self.turn_count += 1
-            executed, dropped = await self.execute_actions(actions)
-            await self._apply_channel_floor()
+            executed, dropped, timeline_managed = await self._execute_ai_actions(
+                actions
+            )
+            if not timeline_managed:
+                await self._apply_channel_floor()
         finally:
             self.turn_busy = False
         self.history.append({"role": "assistant", "content": line})
@@ -288,27 +329,88 @@ class GameLoop:
                 logger.exception("自动观察模型调用失败")
                 return None
             self.turn_count += 1
-            executed, dropped = await self.execute_actions(actions)
-            await self._apply_channel_floor()
+            executed, dropped, timeline_managed = await self._execute_ai_actions(
+                actions
+            )
+            if not timeline_managed:
+                await self._apply_channel_floor()
         finally:
             self.turn_busy = False
         self.history.append({"role": "assistant", "content": line})
         return {"line": line, "executed": executed, "dropped": dropped}
 
     # ---------- 自动运行（玩家不输入，AI 自主回合） ----------
-    def set_autopilot(self, enabled: bool) -> None:
+    async def start_timeline_session(self):
+        """Atomically start live recording and its automatic turn task."""
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            session_state = await self.timeline_session.start_live()
+            self._start_autopilot_task()
+            return session_state
+
+    async def resume_timeline_session(self, cursor: int | None = None):
+        """Atomically resume live recording and its automatic turn task."""
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            if self.timeline_session.to_state().mode != "autopilot":
+                raise RuntimeError("no live session to resume")
+            session_state = await self.timeline_session.resume(cursor)
+            self._start_autopilot_task()
+            return session_state
+
+    async def set_autopilot(self, enabled: bool) -> None:
         """开启/关闭自动运行：AI 每 interval_s 秒自主观察、描写、调整设备并发言。"""
-        self.autopilot = bool(enabled)
-        if self.autopilot and (self.autopilot_task is None or self.autopilot_task.done()):
+        async with self._autopilot_transition_lock:
+            if enabled:
+                if self.timeline_session is not None:
+                    session_state = self.timeline_session.to_state()
+                    if session_state.mode not in (None, "autopilot"):
+                        raise RuntimeError("replay playback is active")
+                    if session_state.status.value in ("idle", "paused"):
+                        await self.timeline_session.start_live()
+                    elif session_state.status.value != "running":
+                        raise RuntimeError("live session transition is already in progress")
+                self._start_autopilot_task()
+                return
+
+            await self._stop_autopilot_task()
+            if self.timeline_session is not None:
+                session_state = self.timeline_session.to_state()
+                if (
+                    session_state.mode == "autopilot"
+                    and session_state.status.value in ("running", "paused")
+                ):
+                    await self.timeline_session.pause()
+            logger.info("自动运行已停止")
+
+    async def finish_timeline_session(self):
+        """Stop automatic turns and normally finish the current live session."""
+        async with self._autopilot_transition_lock:
+            await self._stop_autopilot_task()
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            return await self.timeline_session.finish()
+
+    def _start_autopilot_task(self) -> None:
+        self.autopilot = True
+        if self.autopilot_task is None or self.autopilot_task.done():
             self.autopilot_stop = asyncio.Event()
             self.autopilot_task = asyncio.create_task(self._autopilot_loop())
-            logger.info("自动运行已开启：每 %.1fs 一个自主回合", self.autopilot_interval)
-        elif not self.autopilot:
-            self.autopilot_stop.set()
-            if self.autopilot_task:
-                self.autopilot_task.cancel()
-                self.autopilot_task = None
-            logger.info("自动运行已停止")
+            logger.info(
+                "自动运行已开启：每 %.1fs 一个自主回合",
+                self.autopilot_interval,
+            )
+
+    async def _stop_autopilot_task(self) -> None:
+        self.autopilot = False
+        self.autopilot_stop.set()
+        task = self.autopilot_task
+        self.autopilot_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _autopilot_loop(self) -> None:
         while not self.autopilot_stop.is_set():
@@ -358,8 +460,11 @@ class GameLoop:
                 logger.exception("自动回合模型调用失败: %s", exc)
                 return None
             self.turn_count += 1
-            executed, dropped = await self.execute_actions(actions)
-            await self._apply_channel_floor()
+            executed, dropped, timeline_managed = await self._execute_ai_actions(
+                actions
+            )
+            if not timeline_managed:
+                await self._apply_channel_floor()
         finally:
             self.turn_busy = False
         self.history.append({"role": "assistant", "content": line})
@@ -371,6 +476,25 @@ class GameLoop:
             except Exception:  # noqa: BLE001
                 logger.exception("自动回合推送失败")
         return result
+
+    async def _execute_ai_actions(
+        self, actions: list
+    ) -> tuple[list, list, bool]:
+        """Route live AI intent through the timeline; manual controls stay direct."""
+        session_state = (
+            self.timeline_session.to_state()
+            if self.timeline_session is not None
+            else None
+        )
+        if session_state is not None and session_state.mode is not None:
+            if (
+                session_state.mode == "autopilot"
+                and session_state.status.value == "running"
+            ):
+                await self.timeline_session.process_live_turn(actions)
+            return [], [], True
+        executed, dropped = await self.execute_actions(actions)
+        return executed, dropped, False
 
     # ---------- 动作执行（AI 与手动共用） ----------
     async def _ensure_default_wave(
@@ -784,17 +908,25 @@ class GameLoop:
             for cmd in cmds:
                 frames.extend(self._build_frames(cmd, client_id, slot_id))
             sent = all(await self._send_all(frames))
+        async with self._autopilot_transition_lock:
+            await self._stop_autopilot_task()
+            if self.timeline_session is not None:
+                await self.timeline_session.stop()
         return {"estop": True, "sent": sent}
 
     async def resume(self) -> dict:
         self.safety.resume()
         return {"estop": False}
 
-    def on_client_disconnected(self) -> None:
+    async def on_client_disconnected(self) -> None:
         """APP 断开：停止所有循环波形并清零跟踪。"""
         self._cancel_loops(None)
         self.patterns = {"A": None, "B": None}
         self.safety.record({"kind": "stop"})
+        async with self._autopilot_transition_lock:
+            await self._stop_autopilot_task()
+            if self.timeline_session is not None:
+                await self.timeline_session.on_disconnect()
 
     # ---------- 设备反馈 ----------
     async def handle_feedback(self, action: int, client_id: str) -> None:

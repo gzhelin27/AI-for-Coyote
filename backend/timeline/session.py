@@ -335,10 +335,14 @@ class SessionController:
             self._status = SessionStatus.FINISHING
             if not was_paused:
                 self._pause_started_at = self._clock()
-            await self._cancel_runner_watchers_locked()
+            # A cancellation can arrive while watcher teardown is still pending.
+            # Mark the clear before that first await so stop() can always retry it.
+            self._live_clear_required = True
             runners = tuple(self._runners.values())
             try:
+                await self._cancel_runner_watchers_locked()
                 await self._quiesce_runners(runners, reason="finish", clear=True)
+                self._require_estop_inactive()
             except BaseException:
                 self._status = SessionStatus.PAUSED
                 raise

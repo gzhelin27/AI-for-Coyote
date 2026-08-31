@@ -53,6 +53,7 @@ class RunnerState:
     failure: str | None
     disconnected: bool
     worker_active: bool
+    next_cycle_start_ms: int | None = None
 
 
 @dataclass
@@ -143,6 +144,7 @@ class ChannelCycleRunner:
         self._stopped = asyncio.Event()
         self._needs_activation = True
         self._effective_strength: int | None = None
+        self._next_cycle_start_ms: int | None = None
 
     def state(self) -> RunnerState:
         return RunnerState(
@@ -154,6 +156,11 @@ class ChannelCycleRunner:
             failure=self._failure,
             disconnected=self._disconnected,
             worker_active=self._worker is not None and not self._worker.done(),
+            next_cycle_start_ms=(
+                self._next_cycle_start_ms
+                if self._phase is RunnerPhase.GAP
+                else None
+            ),
         )
 
     def pending_records(self) -> tuple[CycleRecord, ...]:
@@ -346,6 +353,7 @@ class ChannelCycleRunner:
                 raw_duration_ms = self.policy.cycle_ms(len(frames))
                 self._cycle_index += 1
                 self._phase = RunnerPhase.CYCLE
+                self._next_cycle_start_ms = None
                 attempt = _CycleAttempt(
                     directive=directive,
                     cycle_index=self._cycle_index,
@@ -460,6 +468,9 @@ class ChannelCycleRunner:
 
                 self._phase = RunnerPhase.GAP
                 attempt.gap_started_ms = self._now_ms()
+                self._next_cycle_start_ms = (
+                    attempt.gap_started_ms + attempt.planned_gap_ms
+                )
                 gap_sleep = asyncio.create_task(
                     self._sleeper.sleep(attempt.planned_gap_ms),
                     name=f"timeline-gap-{self.channel}",
