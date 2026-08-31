@@ -404,3 +404,182 @@ repository's Windows LF-to-CRLF checkout warnings and no whitespace errors.
   a slow sensor driver can therefore delay another normal lifecycle request.
 - Real relay/device acceptance remains manual by project policy. All automated
   verification in this round used fakes and dry-run execution as required.
+
+## Fix round 2 — 2026-08-31
+
+### Status
+
+PASS. All three open findings are fixed with focused regressions, the impacted
+timeline/API matrix, the full non-probe suite, and asyncio debug verification
+green. No real network, device, or paid model call was made.
+
+### Files changed
+
+- `backend/game_loop.py`
+- `backend/main.py`
+- `backend/timeline/replay_store.py`
+- `tests/test_game_loop_timeline.py`
+- `tests/test_replay_store.py`
+- `tests/test_session_endpoints.py`
+
+### RED evidence
+
+The first focused run covered controller-teardown cancellation for automatic off
+and normal finish, opened-handle containment, deterministic download handle
+closure before response send, and authoritative profile reload:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_game_loop_timeline.GameLoopTimelineTests.test_cancelled_automatic_off_awaits_controller_teardown_and_clear tests.test_game_loop_timeline.GameLoopTimelineTests.test_cancelled_finish_awaits_controller_teardown_clear_and_archive tests.test_replay_store.ReplayStoreTests.test_open_validated_rejects_handle_redirected_outside_replay_root tests.test_session_endpoints.SessionEndpointTests.test_download_closes_validated_handle_before_response_send_can_fail tests.test_session_endpoints.SessionEndpointTests.test_profile_switch_reloads_authoritative_roles_before_validation
+```
+
+```text
+Ran 5 tests in 0.291s
+FAILED (failures=5)
+```
+
+The failures demonstrated each requested defect directly:
+
+- both lifecycle wrappers completed cancellation before the blocked watcher was
+  released, leaving controller cleanup unowned;
+- a handle redirected outside the replay root passed pathname and file-identity
+  validation;
+- the validated download handle was still open after route construction;
+- a role introduced by the authoritative character reload was rejected from the
+  stale in-memory snapshot.
+
+Self-review then added a repeated-cancellation variant while controller watcher
+teardown remained blocked. It failed against the first single-cancellation shield
+because the second cancellation propagated through the direct cleanup await:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_game_loop_timeline.GameLoopTimelineTests.test_cancelled_automatic_off_awaits_controller_teardown_and_clear
+```
+
+```text
+Ran 1 test in 0.079s
+FAILED (failures=1)
+```
+
+### Implementation
+
+- Added a GameLoop lifecycle owner that creates the controller operation as a
+  separate task, repeatedly shields it from caller cancellation, and propagates
+  cancellation only after pause, finish, stop, or disconnect lifecycle work has
+  completed. Automatic-task teardown remains in the existing `finally` path.
+  Automatic off therefore clears and stays paused without saving, while finish
+  clears, reaches idle, and saves exactly one completed archive. The same owner
+  also protects abnormal stop, e-stop bookkeeping, and disconnect cleanup.
+- Added opened-handle final-target validation in `ReplayStore`. Windows uses
+  `GetFinalPathNameByHandleW`; Linux uses `/proc/self/fd`. The normalized final
+  parent must equal the resolved replay root in addition to the existing
+  pathname, regular-file, and pre-open/opened identity checks.
+- Added `ReplayStore.read_validated()`, which reads at most 50 MiB plus one byte
+  from the already-open validated handle and closes it in `finally`. Downloads
+  now return immutable bytes in a normal `Response`, so no file handle survives
+  into ASGI response sending or client-disconnect error paths. Exact archive
+  bytes, safe filename, and `application/zip` are preserved.
+- Moved role/profile defaults and validation behind the application transition
+  lock and after `reload_character(cfg)`. For live sessions, finish and sensor
+  shutdown still precede reload, validation, and save, so a newly installed role,
+  profile, or DLC is accepted without opening a transition race.
+
+### GREEN and exact verification
+
+Exact RED set after the minimal production changes:
+
+```text
+Ran 5 tests in 0.396s
+OK
+```
+
+Focused changed suites:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_game_loop_timeline tests.test_replay_store tests.test_session_endpoints
+```
+
+```text
+Ran 62 tests in 4.886s
+OK
+```
+
+Impacted timeline/API suites:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_timeline_models tests.test_timeline_randomizer tests.test_cycle_runner tests.test_timeline_player tests.test_replay_store tests.test_timeline_session tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline tests.test_game_loop_cycle
+```
+
+```text
+Ran 168 tests in 13.357s
+OK
+```
+
+Full non-probe suite:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest discover -s tests -p test_*.py -v
+```
+
+```text
+Ran 173 tests in 13.256s
+OK
+```
+
+Safety/concurrency matrix with asyncio debug enabled:
+
+```powershell
+$env:PYTHONASYNCIODEBUG = '1'
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline tests.test_timeline_session tests.test_timeline_player tests.test_cycle_runner tests.test_game_loop_cycle tests.test_replay_store
+```
+
+```text
+Ran 153 tests in 13.436s
+OK
+```
+
+Compile and diff checks:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m compileall -q backend tests
+git diff --check
+```
+
+Both exited `0`. Compileall was silent. `git diff --check` reported only the
+repository's normal Windows LF-to-CRLF checkout warnings and no whitespace
+errors.
+
+### Commit
+
+- `7c63dad46b1afe13d04b64824b5932c11ee843aa` —
+  `fix: complete timeline integration hardening`
+
+### Self-review
+
+- Confirmed cancellation during real `SessionController` watcher teardown cannot
+  complete either wrapper early, including after repeated `Task.cancel()` calls.
+  Tests begin with active strength 20 and finish with both channels at zero,
+  cleared pattern state, the required controller state, and correct archive count.
+- Confirmed normal controller errors retain their prior behavior; only caller
+  cancellation is deferred until the owned lifecycle operation terminates.
+- Confirmed final-target containment is checked on the exact open file descriptor,
+  before archive validation and reading. All rejection paths close the handle.
+- Confirmed response sending has no live archive resource: the handle is closed
+  before the `Response` exists, and an injected send-side `OSError` cannot leak it.
+- Confirmed the transition lock spans live finish, sensor stop, authoritative
+  reload, refreshed validation, save, and payload snapshot. The existing
+  concurrent-start regression remains green.
+- Rechecked unchanged invariants: `autopilot_interval` is still the sole automatic
+  LLM wait; cycle progression does not invoke the LLM; plot/cycle RNG streams and
+  manual pulse bypass behavior were untouched and remain covered by the impacted
+  suite.
+
+### Concerns
+
+- Eager immutable download buffering is intentionally bounded to 50 MiB as
+  authorized. Multiple concurrent maximum-size downloads can therefore consume
+  proportionally more memory than the former streaming response.
+- Platforms without Windows handle APIs or Linux `/proc/self/fd` fail closed when
+  loading replay archives. The supported Windows runtime and Windows-specific
+  containment regression are green.
+- Real relay/device acceptance remains manual by project policy; all automated
+  tests used temporary replay roots, fakes, and dry-run output.
