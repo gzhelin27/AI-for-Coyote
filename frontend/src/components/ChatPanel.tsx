@@ -9,7 +9,7 @@ export default function ChatPanel() {
   const clearChat = useChat((st) => st.clear);
   const busy = useChat((st) => st.busy);
   const setBusy = useChat((st) => st.setBusy);
-  const autopilot = useApp((st) => st.state?.autopilot ?? false);
+  const timeline = useApp((st) => st.state?.timeline);
   const relay = useApp((st) => st.state?.relay);
   const paired = relay?.status === "paired";
   const enabled = useApp((st) => st.state?.enabled_channels);
@@ -46,13 +46,16 @@ export default function ChatPanel() {
       .catch(() => {});
   }, [paired]);
 
-  const toggle = async () => {
-    try {
-      await api.setAutopilot(!autopilot);
-    } catch {
-      /* 状态由 ws 推送刷新 */
-    }
-  };
+  const sessionLabel =
+    timeline?.mode === "replay"
+      ? timeline.status === "paused"
+        ? "重放已暂停"
+        : "重放中"
+      : timeline?.status === "running"
+        ? "自动运行中"
+        : timeline?.status === "paused"
+          ? "自动运行已暂停"
+          : "手动对话";
 
   const send = async () => {
     const message = input.trim();
@@ -79,7 +82,7 @@ export default function ChatPanel() {
   };
 
   return (
-    <aside className="flex min-h-0 flex-col border-l border-line bg-ink2">
+    <aside className="flex min-h-[340px] flex-col border-l border-line bg-ink2">
       <div className="flex flex-none items-center border-b border-line px-4 py-2">
         <div className="flex items-center gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-1">
           <span className="text-[11px] text-faint">当前主题</span>
@@ -91,20 +94,7 @@ export default function ChatPanel() {
           </span>
         </div>
         <div className="ml-auto flex items-center gap-2">
-          <span className="text-[11px] text-muted">自动运行</span>
-          <button
-            onClick={() => void toggle()}
-            title={autopilot ? "停止自动运行" : "开始自动运行（AI 自主回合，摄像头/麦克风跟随启停）"}
-            className={`relative h-5 w-9 flex-none rounded-full transition-colors ${
-              autopilot ? "bg-accent" : "bg-ink3 border border-line"
-            }`}
-          >
-            <span
-              className={`absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full transition-all ${
-                autopilot ? "left-[18px] bg-ink" : "left-[2px] bg-muted"
-              }`}
-            />
-          </button>
+          <span className="rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-muted">{sessionLabel}</span>
           <button
             onClick={() => {
               if (!window.confirm("清空对话历史？将清空聊天记录与 AI 的记忆上下文，设备强度不受影响。")) return;
