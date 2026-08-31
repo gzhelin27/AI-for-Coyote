@@ -583,3 +583,163 @@ errors.
   containment regression are green.
 - Real relay/device acceptance remains manual by project policy; all automated
   tests used temporary replay roots, fakes, and dry-run output.
+
+## Fix round 3 — 2026-08-31
+
+### Status
+
+PASS. Both remaining findings are fixed with strict RED/GREEN regressions. The
+focused, impacted, full non-probe, and asyncio-debug suites pass. No real network,
+device, or paid model call was made.
+
+### Files changed
+
+- `backend/main.py`
+- `backend/timeline/replay_store.py`
+- `tests/test_replay_store.py`
+- `tests/test_session_endpoints.py`
+
+### RED evidence
+
+The first focused run exercised immutable exact-byte validation, artificial
+short reads, invalid live role/profile/DLC requests, and the changed ordering of
+authoritative character reload relative to a valid live transition:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_replay_store.ReplayStoreTests.test_read_validated_returns_the_same_bytes_it_validated tests.test_replay_store.ReplayStoreTests.test_read_validated_accumulates_short_reads_until_eof tests.test_session_endpoints.SessionEndpointTests.test_invalid_role_does_not_finish_or_mutate_live_session tests.test_session_endpoints.SessionEndpointTests.test_invalid_profile_does_not_finish_or_mutate_live_session tests.test_session_endpoints.SessionEndpointTests.test_unavailable_dlc_does_not_finish_or_mutate_live_session tests.test_session_endpoints.SessionEndpointTests.test_profile_switch_reloads_authoritative_roles_before_validation tests.test_session_endpoints.SessionEndpointTests.test_profile_reload_finish_sensor_and_save_block_a_new_start
+```
+
+```text
+Ran 7 tests in 0.385s
+FAILED (failures=7)
+```
+
+The failures demonstrated the requested defects directly:
+
+- mutation after `_load_opened()` validation replaced the bytes returned by the
+  old two-phase reader with an unvalidated payload;
+- an artificial seven-byte short read was mistaken for EOF, returning only the
+  first seven bytes of a valid archive;
+- invalid role, profile, and unavailable-DLC requests finished the live session,
+  stopped automatic mode, and changed externally visible state before returning
+  `400`;
+- authoritative reload observed `IDLE`, proving the valid live transition was
+  destructively finished before candidate validation.
+
+### Implementation
+
+- Replay loading and download now first read the final-target-contained open
+  handle into bounded immutable bytes. The read loops until actual EOF, accepts
+  nonempty short reads, enforces the 50 MiB cap cumulatively, and deterministically
+  closes the source handle.
+- The schema, checksum, and requested replay ID are validated from a `BytesIO`
+  over that exact immutable snapshot. `read_validated()` returns those identical
+  bytes; `load()` returns the bundle parsed from them; and `open_validated()` now
+  exposes only an in-memory handle over the already validated snapshot.
+- The profile endpoint deep-copies current configuration under the transition
+  lock, reloads authoritative character data into that candidate, and resolves
+  and validates role, profile, and DLC availability before any live-session,
+  sensor, persistent-config, or broadcast mutation.
+- A valid selection still atomically finishes the live session, stops sensors,
+  saves the selection, snapshots the response, releases the lock, and broadcasts.
+  Invalid selections return `400` with the live state untouched.
+
+### GREEN and exact verification
+
+Exact RED set after the minimal production changes:
+
+```text
+Ran 7 tests in 0.413s
+OK
+```
+
+Focused changed suites:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_replay_store tests.test_session_endpoints
+```
+
+```text
+Ran 48 tests in 2.464s
+OK
+```
+
+Impacted timeline/API suites:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_timeline_models tests.test_timeline_randomizer tests.test_cycle_runner tests.test_timeline_player tests.test_replay_store tests.test_timeline_session tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline tests.test_game_loop_cycle
+```
+
+```text
+Ran 173 tests in 13.935s
+OK
+```
+
+Full non-probe suite:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest discover -s tests -p test_*.py -v
+```
+
+```text
+Ran 178 tests in 13.718s
+OK
+```
+
+Safety/concurrency matrix with asyncio debug enabled:
+
+```powershell
+$env:PYTHONASYNCIODEBUG = '1'
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest -v tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline tests.test_timeline_session tests.test_timeline_player tests.test_cycle_runner tests.test_game_loop_cycle tests.test_replay_store
+```
+
+```text
+Ran 158 tests in 14.013s
+OK
+```
+
+Compile and diff checks:
+
+```powershell
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m compileall -q backend tests
+git diff --check
+```
+
+Both exited `0`. Compileall was silent. `git diff --check` reported only the
+repository's normal Windows LF-to-CRLF checkout warnings and no whitespace
+errors.
+
+### Commit
+
+- `ab72399b45b7d97e9e0251421242530da578af7b` —
+  `fix: validate immutable replay downloads`
+
+### Self-review
+
+- Confirmed opened-handle final-target containment still runs before reading.
+  The snapshot loop treats only `b""` as EOF and enforces its cap even if a file
+  grows after the initial `fstat`.
+- Confirmed the filesystem handle is closed before validation and response
+  construction. No mutable file object survives into ASGI response sending.
+- Confirmed the exact bytes returned by the download are the exact bytes passed
+  through archive schema, checksum, and replay-ID validation. The deterministic
+  mutation regression fails the former validate-then-reread implementation.
+- Confirmed all invalid selection paths occur before session finish, sensor
+  shutdown, config save, runtime-file write, payload snapshot, or broadcast. The
+  regressions compare the complete HTTP/WS state payload and verify archive and
+  mock side-effect counts.
+- Confirmed valid refreshed role/profile selection remains atomic: candidate
+  reload observes `RUNNING`, while save observes `IDLE`, and a concurrent new
+  session cannot enter between them.
+- Rechecked unchanged cadence and safety invariants through the impacted matrix:
+  `autopilot_interval` remains the sole automatic LLM wait, cycle progression
+  does not invoke the LLM, plot and cycle RNG streams remain separated, and
+  manual pulse controls continue to bypass timeline scheduling.
+
+### Concerns
+
+- Eager immutable download buffering remains intentionally bounded to 50 MiB as
+  previously authorized. Building the joined immutable snapshot can transiently
+  retain chunk storage plus the final bytes object.
+- Real relay/device acceptance remains manual by project policy; all automated
+  verification used temporary replay roots, fakes, and dry-run output.
