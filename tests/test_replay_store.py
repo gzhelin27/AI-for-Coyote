@@ -124,6 +124,36 @@ class ReplayStoreTests(unittest.TestCase):
 
             self.assertTrue(swapped)
 
+    def test_open_validated_rejects_handle_redirected_outside_replay_root(self):
+        with (
+            tempfile.TemporaryDirectory() as replay_tmp,
+            tempfile.TemporaryDirectory() as outside_tmp,
+        ):
+            store = ReplayStore(Path(replay_tmp))
+            bundle = make_replay_bundle(gap_tenths=[7], status="completed")
+            archive_path = store.save(bundle.manifest, bundle.timeline)
+            outside_path = Path(outside_tmp, archive_path.name)
+            outside_path.write_bytes(archive_path.read_bytes())
+            real_path_stat = Path.stat
+            real_path_open = Path.open
+
+            def redirected_stat(path, *args, **kwargs):
+                if Path(path) == archive_path:
+                    return real_path_stat(outside_path, *args, **kwargs)
+                return real_path_stat(path, *args, **kwargs)
+
+            def redirected_open(path, *args, **kwargs):
+                if Path(path) == archive_path:
+                    return real_path_open(outside_path, *args, **kwargs)
+                return real_path_open(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "stat", new=redirected_stat),
+                patch.object(Path, "open", new=redirected_open),
+                self.assertRaisesRegex(ReplayStoreError, "unsafe"),
+            ):
+                store.open_validated(bundle.manifest.replay_id)
+
     def test_rejects_path_unsafe_archive_before_reading_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "evil.coyote-replay")

@@ -40,6 +40,51 @@ _MAX_ARCHIVE_SIZE = 50 * 1024 * 1024
 _ALLOWED_COMPRESSION_METHODS = frozenset((zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED))
 
 
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _opened_final_path(archive_file: BinaryIO) -> Path:
+    """Resolve the final target from the opened handle, not its pathname."""
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        get_final_path = ctypes.WinDLL(
+            "kernel32", use_last_error=True
+        ).GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        handle = msvcrt.get_osfhandle(archive_file.fileno())
+        capacity = 260
+        while True:
+            buffer = ctypes.create_unicode_buffer(capacity)
+            length = get_final_path(handle, buffer, capacity, 0)
+            if length == 0:
+                error_code = ctypes.get_last_error()
+                raise OSError(error_code, "could not resolve opened replay archive")
+            if length < capacity:
+                final_path = buffer.value
+                if final_path.startswith("\\\\?\\UNC\\"):
+                    final_path = "\\\\" + final_path[8:]
+                elif final_path.startswith("\\\\?\\"):
+                    final_path = final_path[4:]
+                return Path(final_path)
+            capacity = length + 1
+
+    descriptor_link = Path("/proc/self/fd", str(archive_file.fileno()))
+    try:
+        return Path(os.path.realpath(descriptor_link, strict=True))
+    except (OSError, TypeError) as exc:
+        raise OSError("opened-handle path validation is unavailable") from exc
+
+
 class ReplayStoreError(Exception):
     """A replay could not be safely persisted or loaded."""
 
@@ -180,6 +225,21 @@ class ReplayStore:
             archive_file.close()
             raise
 
+    def read_validated(self, replay_id: str) -> bytes:
+        """Read bounded immutable bytes from a validated handle, then close it."""
+        archive_file = self.open_validated(replay_id)
+        try:
+            payload = archive_file.read(_MAX_ARCHIVE_SIZE + 1)
+            if len(payload) > _MAX_ARCHIVE_SIZE:
+                raise ReplayStoreError("replay archive size exceeds limit")
+            return payload
+        except ReplayStoreError:
+            raise
+        except OSError as exc:
+            raise ReplayStoreError("could not load replay archive") from exc
+        finally:
+            archive_file.close()
+
     def _open_contained(self, replay_id: str) -> BinaryIO:
         self._validate_replay_id(replay_id)
         archive_path = self._path(replay_id)
@@ -192,6 +252,9 @@ class ReplayStore:
             before = resolved.stat()
             archive_file = resolved.open("rb")
             opened = os.fstat(archive_file.fileno())
+            opened_path = _opened_final_path(archive_file)
+            if _path_key(opened_path.parent) != _path_key(root):
+                raise ReplayStoreError("replay archive path is unsafe")
         except ReplayStoreError:
             if archive_file is not None:
                 archive_file.close()

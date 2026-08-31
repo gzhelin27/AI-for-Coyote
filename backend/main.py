@@ -26,10 +26,8 @@ from fastapi.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
-    StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 
 from .audio import AudioManager
 from .camera import Camera
@@ -138,8 +136,8 @@ def _timeline_error_response(exc: Exception) -> JSONResponse:
     return JSONResponse({"error": "timeline request failed"}, status_code=500)
 
 
-def _validated_replay_archive(store: ReplayStore, replay_id: str):
-    """Open and validate one contained archive without a path-reopen window."""
+def _validated_replay_archive(store: ReplayStore, replay_id: str) -> bytes:
+    """Read one contained archive through its validated opened handle."""
     store._validate_replay_id(replay_id)
     archive_path = store._path(replay_id)
     try:
@@ -149,15 +147,7 @@ def _validated_replay_archive(store: ReplayStore, replay_id: str):
     root = store.root.resolve()
     if resolved.parent != root:
         raise ReplayStoreError("replay archive path is unsafe")
-    return store.open_validated(replay_id)
-
-
-def _replay_archive_chunks(archive_file, chunk_size: int = 64 * 1024):
-    try:
-        while chunk := archive_file.read(chunk_size):
-            yield chunk
-    finally:
-        archive_file.close()
+    return store.read_validated(replay_id)
 
 
 class AppState:
@@ -565,20 +555,19 @@ def make_app() -> FastAPI:
     @app.get("/api/replays/{replay_id}/download")
     async def api_replay_download(replay_id: str) -> Response:
         try:
-            archive_file = _validated_replay_archive(
+            archive_bytes = _validated_replay_archive(
                 state.replay_store, replay_id
             )
         except (_ReplayNotFoundError, ReplayStoreError) as exc:
             return _timeline_error_response(exc)
-        return StreamingResponse(
-            _replay_archive_chunks(archive_file),
+        return Response(
+            content=archive_bytes,
             media_type="application/zip",
             headers={
                 "Content-Disposition": (
                     f'attachment; filename="{replay_id}.coyote-replay"'
                 )
             },
-            background=BackgroundTask(archive_file.close),
         )
 
     @app.get("/api/qrcode.png")
@@ -762,30 +751,8 @@ def make_app() -> FastAPI:
     @app.post("/api/character/profile")
     async def api_character_profile(body: dict) -> JSONResponse:
         """切换角色/风格：{role: "触手", profile: "调教"}，保存并热加载；目标 DLC 未安装时拒绝。"""
-        role = str(body.get("role") or "").strip()
-        profile = str(body.get("profile") or "").strip()
-        # Cheap validation against the current snapshot avoids finishing a session
-        # for an obviously invalid request. The authoritative reload happens only
-        # after an active live session has finished.
-        roles = {r["name"]: r for r in (cfg["character"].get("roles") or [])}
-        if not role:
-            role = str(cfg["character"].get("role") or "")
-        if role not in roles:
-            return JSONResponse({"error": f"未知角色，可用：{list(roles)}"}, status_code=400)
-        rmeta = roles[role]
-        avail = {p["name"]: p["available"] for p in rmeta["profiles"]}
-        if not profile:
-            profile = avail and next(iter(avail))
-        if profile not in avail:
-            return JSONResponse({"error": f"未知风格版本，可用：{list(avail)}"}, status_code=400)
-        if not avail.get(profile, True):
-            return JSONResponse(
-                {
-                    "error": f"「{rmeta['label']}·{profile}」的 DLC 未安装：请先在「角色设置」导入对应 DLC 包。",
-                    "detail": "dlc_missing",
-                },
-                status_code=400,
-            )
+        requested_role = str(body.get("role") or "").strip()
+        requested_profile = str(body.get("profile") or "").strip()
         try:
             async with state.timeline_transition_lock:
                 session_state = state.timeline_session.to_state()
@@ -796,23 +763,38 @@ def make_app() -> FastAPI:
                     await state.loop.finish_timeline_session()
                     await state.set_sensors(False)
                 reload_character(cfg)
-                refreshed_roles = {
+                roles = {
                     item["name"]: item
                     for item in (cfg["character"].get("roles") or [])
                 }
-                if role not in refreshed_roles:
-                    raise ValueError(f"未知角色，可用：{list(refreshed_roles)}")
-                refreshed_profiles = {
-                    item["name"]: item["available"]
-                    for item in refreshed_roles[role]["profiles"]
-                }
-                if profile not in refreshed_profiles:
-                    raise ValueError(
-                        f"未知风格版本，可用：{list(refreshed_profiles)}"
+                role = requested_role or str(
+                    cfg["character"].get("role") or ""
+                )
+                if role not in roles:
+                    return JSONResponse(
+                        {"error": f"未知角色，可用：{list(roles)}"},
+                        status_code=400,
                     )
-                if not refreshed_profiles.get(profile, True):
-                    raise ValueError(
-                        f"「{refreshed_roles[role]['label']}·{profile}」的 DLC 未安装"
+                profiles = {
+                    item["name"]: item["available"]
+                    for item in roles[role]["profiles"]
+                }
+                profile = requested_profile or next(iter(profiles), "")
+                if profile not in profiles:
+                    return JSONResponse(
+                        {"error": f"未知风格版本，可用：{list(profiles)}"},
+                        status_code=400,
+                    )
+                if not profiles.get(profile, True):
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"「{roles[role]['label']}·{profile}」的 DLC 未安装："
+                                "请先在「角色设置」导入对应 DLC 包。"
+                            ),
+                            "detail": "dlc_missing",
+                        },
+                        status_code=400,
                     )
                 save_character_runtime(cfg, role=role, profile=profile)
                 payload = {

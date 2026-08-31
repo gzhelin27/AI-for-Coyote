@@ -237,6 +237,10 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
                 archive_path.write_bytes(swapped_bytes)
                 return opened
 
+            def read_validated(self, value):
+                with self.open_validated(value) as opened:
+                    return opened.read()
+
         swapping_store = SwappingDownloadStore()
         swapping_store.harness = self.harness
         self.state.replay_store = swapping_store
@@ -248,6 +252,51 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(downloaded.status_code, 200)
         self.assertEqual(downloaded.content, original_bytes)
         self.assertEqual(archive_path.read_bytes(), swapped_bytes)
+
+    async def test_download_closes_validated_handle_before_response_send_can_fail(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        finished = await self.client.post("/api/session/finish")
+        replay_id = finished.json()["replay_id"]
+        archive_path = self.harness.store._path(replay_id)
+        archive_file = io.BytesIO(archive_path.read_bytes())
+        download_route = next(
+            route
+            for route in self.app.routes
+            if route.path == "/api/replays/{replay_id}/download"
+        )
+
+        try:
+            with patch.object(
+                self.harness.store,
+                "open_validated",
+                return_value=archive_file,
+            ):
+                response = await download_route.endpoint(replay_id)
+
+            self.assertTrue(archive_file.closed)
+
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            async def failing_send(_message):
+                raise OSError("client disconnected during response send")
+
+            with self.assertRaisesRegex(OSError, "client disconnected"):
+                await response(
+                    {
+                        "type": "http",
+                        "asgi": {"version": "3.0"},
+                        "method": "GET",
+                        "path": f"/api/replays/{replay_id}/download",
+                        "headers": [],
+                    },
+                    receive,
+                    failing_send,
+                )
+            self.assertTrue(archive_file.closed)
+        finally:
+            archive_file.close()
 
     async def test_http_and_websocket_state_redact_internal_timeline_data(self):
         started = await self.client.post("/api/session/start")
@@ -360,6 +409,46 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(switched.status_code, 200)
         self.assertEqual(save_observations, [(SessionStatus.IDLE, 1)])
         self.assertEqual(self.harness.cfg["character"]["role"], "装置")
+        self.state.set_sensors.assert_awaited_with(False)
+
+    async def test_profile_switch_reloads_authoritative_roles_before_validation(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        reload_states = []
+
+        def load_new_role(cfg):
+            reload_states.append(self.harness.controller.to_state().status)
+            cfg["character"]["roles"].append(
+                {
+                    "name": "新角色",
+                    "label": "新角色",
+                    "profiles": [{"name": "新风格", "available": True}],
+                }
+            )
+
+        def save_new_role(cfg, *, role=None, profile=None, **_values):
+            cfg["character"]["role"] = role
+            cfg["character"]["profile"] = profile
+
+        with (
+            patch.object(main_module, "reload_character", side_effect=load_new_role),
+            patch.object(
+                main_module,
+                "save_character_runtime",
+                side_effect=save_new_role,
+            ),
+        ):
+            switched = await self.client.post(
+                "/api/character/profile",
+                json={"role": "新角色", "profile": "新风格"},
+            )
+
+        self.assertEqual(switched.status_code, 200)
+        self.assertEqual(reload_states, [SessionStatus.IDLE])
+        self.assertEqual(self.harness.controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(len(self.harness.store.list()), 1)
+        self.assertEqual(self.harness.cfg["character"]["role"], "新角色")
+        self.assertEqual(self.harness.cfg["character"]["profile"], "新风格")
         self.state.set_sensors.assert_awaited_with(False)
 
     async def test_estop_aborts_live_session_without_archive_or_implicit_reset(self):

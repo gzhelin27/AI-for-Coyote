@@ -394,7 +394,9 @@ class GameLoop:
                     and session_state.status.value in ("running", "paused")
                 ):
                     try:
-                        await self.timeline_session.pause()
+                        await self._await_timeline_lifecycle(
+                            self.timeline_session.pause
+                        )
                     finally:
                         await self._stop_autopilot_task()
                     logger.info("自动运行已停止")
@@ -408,7 +410,9 @@ class GameLoop:
             if self.timeline_session is None:
                 raise RuntimeError("timeline session is unavailable")
             try:
-                return await self.timeline_session.finish()
+                return await self._await_timeline_lifecycle(
+                    self.timeline_session.finish
+                )
             finally:
                 await self._stop_autopilot_task()
 
@@ -418,9 +422,31 @@ class GameLoop:
             try:
                 if self.timeline_session is None:
                     raise RuntimeError("timeline session is unavailable")
-                return await self.timeline_session.stop()
+                return await self._await_timeline_lifecycle(
+                    self.timeline_session.stop
+                )
             finally:
                 await self._stop_autopilot_task()
+
+    async def _await_timeline_lifecycle(self, operation):
+        """Let controller cleanup reach a safe state before propagating cancellation."""
+        lifecycle = asyncio.create_task(
+            operation(), name="game-loop-timeline-lifecycle"
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(lifecycle)
+                break
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                if lifecycle.done():
+                    result = lifecycle.result()
+                    break
+        if cancellation is not None:
+            raise cancellation
+        return result
 
     def _start_autopilot_task(self) -> None:
         self.autopilot = True
@@ -969,7 +995,9 @@ class GameLoop:
         async with self._autopilot_transition_lock:
             try:
                 if self.timeline_session is not None:
-                    await self.timeline_session.stop()
+                    await self._await_timeline_lifecycle(
+                        self.timeline_session.stop
+                    )
             finally:
                 await self._stop_autopilot_task()
         return {"estop": True, "sent": sent}
@@ -986,7 +1014,9 @@ class GameLoop:
         async with self._autopilot_transition_lock:
             try:
                 if self.timeline_session is not None:
-                    await self.timeline_session.on_disconnect()
+                    await self._await_timeline_lifecycle(
+                        self.timeline_session.on_disconnect
+                    )
             finally:
                 await self._stop_autopilot_task()
 

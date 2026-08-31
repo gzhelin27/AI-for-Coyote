@@ -401,6 +401,26 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(started.wait(), timeout=0.2)
         return cancellation_seen, release
 
+    async def _install_blocked_runner_watcher_teardown(self):
+        original = self.harness.controller._runner_watchers.pop("A")
+        original.cancel()
+        await asyncio.gather(original, return_exceptions=True)
+        cancellation_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def watcher_blocked_during_teardown():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_started.set()
+                await release.wait()
+
+        self.harness.controller._runner_watchers["A"] = asyncio.create_task(
+            watcher_blocked_during_teardown()
+        )
+        await asyncio.sleep(0)
+        return cancellation_started, release
+
     async def test_cancelled_automatic_off_has_already_paused_and_cleared(self):
         await self.harness.controller.start_live()
         await self._automatic_turn()
@@ -433,6 +453,56 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result[0], asyncio.CancelledError)
         self.assertEqual(self.harness.controller.to_state().status.value, "idle")
         self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(len(self.harness.store.list()), 1)
+
+    async def test_cancelled_automatic_off_awaits_controller_teardown_and_clear(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        self.assertEqual(self.harness.safety.current["A"], 20)
+        teardown_started, release = (
+            await self._install_blocked_runner_watcher_teardown()
+        )
+
+        stopping = asyncio.create_task(self.harness.loop.set_autopilot(False))
+        await asyncio.wait_for(teardown_started.wait(), timeout=0.2)
+        stopping.cancel()
+        await asyncio.sleep(0)
+        stopping.cancel()
+        await asyncio.wait({stopping}, timeout=0.05)
+        completed_before_release = stopping.done()
+        release.set()
+        result = await asyncio.gather(stopping, return_exceptions=True)
+
+        self.assertFalse(completed_before_release)
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(self.harness.controller.to_state().status.value, "paused")
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(self.harness.loop.patterns, {"A": None, "B": None})
+        self.assertEqual(self.harness.store.list(), [])
+
+    async def test_cancelled_finish_awaits_controller_teardown_clear_and_archive(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        self.assertEqual(self.harness.safety.current["A"], 20)
+        teardown_started, release = (
+            await self._install_blocked_runner_watcher_teardown()
+        )
+
+        finishing = asyncio.create_task(
+            self.harness.loop.finish_timeline_session()
+        )
+        await asyncio.wait_for(teardown_started.wait(), timeout=0.2)
+        finishing.cancel()
+        await asyncio.wait({finishing}, timeout=0.05)
+        completed_before_release = finishing.done()
+        release.set()
+        result = await asyncio.gather(finishing, return_exceptions=True)
+
+        self.assertFalse(completed_before_release)
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(self.harness.loop.patterns, {"A": None, "B": None})
         self.assertEqual(len(self.harness.store.list()), 1)
 
     async def test_resume_transition_serializes_against_finish(self):
