@@ -7,6 +7,8 @@ export default function ChatPanel() {
   const messages = useChat((st) => st.messages);
   const pushMsg = useChat((st) => st.push);
   const clearChat = useChat((st) => st.clear);
+  const busy = useChat((st) => st.busy);
+  const setBusy = useChat((st) => st.setBusy);
   const autopilot = useApp((st) => st.state?.autopilot ?? false);
   const sensorsOn = useApp((st) => st.state?.sensors_on ?? false);
   const interval = useApp((st) => st.state?.autopilot_interval_s ?? 12);
@@ -26,6 +28,8 @@ export default function ChatPanel() {
         : `AI 每 ${interval} 秒自主观察、调整设备并发言（摄像头${camOn ? "开" : "关"} · 麦克风${micOn ? "开" : "关"}）`
       : `AI 每 ${interval} 秒自主观察、调整设备并发言（摄像头/麦克风已关闭）`;
   const [pairUrl, setPairUrl] = useState("");
+  const [input, setInput] = useState("");
+  const [sendError, setSendError] = useState("");
   const boxRef = useRef<HTMLDivElement>(null);
 
   // 切换角色/风格档时插一条系统分隔消息，防上下文串戏
@@ -58,6 +62,30 @@ export default function ChatPanel() {
       await api.setAutopilot(!autopilot);
     } catch {
       /* 状态由 ws 推送刷新 */
+    }
+  };
+
+  const send = async () => {
+    const message = input.trim();
+    if (!message || busy) return;
+    setInput("");
+    setSendError("");
+    pushMsg({ role: "user", text: message });
+    setBusy(true);
+    try {
+      const result = await api.chat(message);
+      const actions = (result.executed ?? []).map((item) => item.label).filter(Boolean);
+      pushMsg({
+        role: "ai",
+        text: result.line || "（AI 没有返回文字）",
+        actions: actions.join("\n"),
+      });
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "发送失败";
+      setSendError(text);
+      pushMsg({ role: "sys", text: `发送失败：${text}` });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -151,6 +179,34 @@ export default function ChatPanel() {
           ))}
         </div>
       )}
+      {paired && (
+        <div className="flex-none border-t border-line p-3">
+          <div className="flex items-end gap-2">
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+              placeholder="输入你想对 AI 说的话…（Enter 发送，Shift+Enter 换行）"
+              rows={2}
+              disabled={busy}
+              className="min-h-[58px] flex-1 resize-none rounded-lg border border-line bg-ink3 px-3 py-2 text-[13px] text-text outline-none placeholder:text-faint focus:border-accent disabled:opacity-60"
+            />
+            <button
+              onClick={() => void send()}
+              disabled={busy || !input.trim()}
+              className="h-[58px] rounded-lg bg-accent px-4 text-[13px] font-semibold text-ink transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {busy ? "生成中…" : "发送"}
+            </button>
+          </div>
+          {sendError && <div className="mt-1.5 text-[11px] text-bad">{sendError}</div>}
+        </div>
+      )}
       <div className="flex items-center justify-between gap-3 border-t border-line px-4 py-3">
         <div className="flex min-w-0 flex-col gap-0.5">
           <span className="text-[13px] font-semibold">自动运行</span>
@@ -159,15 +215,12 @@ export default function ChatPanel() {
         <button
           onClick={() => void toggle()}
           title={autopilot ? "停止自动运行" : "开始自动运行（AI 自主回合）"}
-          className={`relative h-6 w-11 flex-none rounded-full transition-colors ${
-            autopilot ? "bg-accent" : "bg-ink3 border border-line"
+          className={`flex flex-none items-center gap-2 rounded-lg border px-3 py-2 text-[12px] font-semibold transition-colors ${
+            autopilot ? "border-accent bg-accent/15 text-accent" : "border-line2 bg-panel2 text-text"
           }`}
         >
-          <span
-            className={`absolute top-1/2 h-5 w-5 -translate-y-1/2 rounded-full transition-all ${
-              autopilot ? "left-[22px] bg-ink" : "left-[2px] bg-muted"
-            }`}
-          />
+          <span className={`h-2.5 w-2.5 rounded-full ${autopilot ? "bg-accent" : "bg-faint"}`} />
+          {autopilot ? "停止自动运行" : "开始自动运行"}
         </button>
       </div>
     </aside>
