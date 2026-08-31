@@ -404,7 +404,9 @@ class SessionController:
                 self._set_status(SessionStatus.PAUSED)
                 raise
 
-            summary = self.store.summary(replay_id)
+            summary = ReplaySummary.from_manifest(
+                manifest, cycle_count=len(timeline.cycles)
+            )
             self._reset_idle()
             return summary
 

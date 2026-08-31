@@ -13,6 +13,11 @@ import type { BackendFullState } from "./types";
 import { useApp, useChat, useLayout } from "./store";
 import { doEstop } from "./commands";
 import { isTimelineStateActive } from "./timelineState";
+import {
+  applyRealtimeState,
+  invalidateStateRefresh,
+  refreshAppState,
+} from "./stateRefresh";
 
 /** 空格长按触发急停的时长（毫秒，与进度条动画同步） */
 const ESTOP_HOLD_MS = 1000;
@@ -84,9 +89,8 @@ export default function App() {
       if (canPoll()) pollTimer = window.setTimeout(pollState, ACTIVE_STATE_POLL_MS);
     };
     const refreshState = async () => {
-      const state = await api.state();
-      useApp.getState().setState(state);
-      if (state.config_info?.title) document.title = state.config_info.title;
+      const state = await refreshAppState();
+      if (state?.config_info?.title) document.title = state.config_info.title;
       return state;
     };
     const pollState = async () => {
@@ -108,7 +112,10 @@ export default function App() {
     };
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") void pollState();
-      else clearPollTimer();
+      else {
+        clearPollTimer();
+        invalidateStateRefresh();
+      }
     };
 
     // 初始状态
@@ -122,7 +129,7 @@ export default function App() {
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.type === "state") {
-          useApp.getState().setState(mapFullState(msg.data as BackendFullState));
+          applyRealtimeState(mapFullState(msg.data as BackendFullState));
           schedulePoll();
         } else if (msg.type === "chat") {
           const extra: string[] = [];
@@ -160,6 +167,7 @@ export default function App() {
       closed = true;
       ws?.close();
       clearPollTimer();
+      invalidateStateRefresh();
       document.removeEventListener("visibilitychange", onVisibilityChange);
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("keyup", onKeyUp);

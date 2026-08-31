@@ -4,5 +4,5 @@ import type { TimelineSessionState } from "./types";
 export function isTimelineStateActive(
   state: Pick<TimelineSessionState, "status"> | null | undefined,
 ): boolean {
-  return state?.status === "running" || state?.status === "paused" || state?.status === "replaying";
+  return state?.status === "running" || state?.status === "replaying";
 }

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from backend.timeline.models import SessionStatus
 from tests.timeline_fakes import SessionHarness, make_replay_bundle
@@ -202,6 +203,24 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
             [summary.replay_id],
         )
         self.assertEqual(controller.clear_calls, [None, None])
+
+    async def test_finish_returns_in_memory_summary_without_second_store_read(self):
+        controller = SessionHarness.create(seed=231)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.complete_next_cycle("A")
+
+        with patch.object(
+            controller.store,
+            "summary",
+            side_effect=AssertionError("finish must not reload the saved archive"),
+        ):
+            summary = await controller.finish()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        saved = controller.store.load(summary.replay_id)
+        self.assertEqual(summary.cycle_count, len(saved.timeline.cycles))
+        self.assertEqual(summary.title, "回放 " + summary.replay_id[:8])
 
     async def test_stop_retries_clear_after_failed_finish_before_idle(self):
         controller = SessionHarness.create(seed=24)

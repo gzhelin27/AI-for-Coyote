@@ -1,6 +1,7 @@
 import { Download, Pause, Play, Save, Square } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { invalidateStateRefresh, refreshAppState } from "../stateRefresh";
 import { useApp } from "../store";
 import type { ReplayHistoryItem, TimelineSessionState } from "../types";
 
@@ -42,7 +43,7 @@ export default function ReplayPanel({ historyOnly }: Props) {
   const [error, setError] = useState("");
 
   const refreshState = async () => {
-    useApp.getState().setState(await api.state());
+    await refreshAppState();
   };
 
   const refreshHistory = async () => {
@@ -66,6 +67,7 @@ export default function ReplayPanel({ historyOnly }: Props) {
     if (pending) return;
     setPending(true);
     setError("");
+    invalidateStateRefresh();
     try {
       await action();
       await refreshState();
