@@ -402,18 +402,8 @@ class ChannelCycleRunner:
                     raise
                 except Exception as exc:
                     self._resolve_startup(startup)
-                    record = None
-                    if not activating:
-                        record = self._record_from_attempt(
-                            attempt,
-                            completed=False,
-                            interruption_reason="executor_failure",
-                        )
                     attempt = None
-                    await self._stop_for_failure(
-                        exc,
-                        record=record,
-                    )
+                    await self._stop_for_failure(exc)
                     return
 
                 if not await self._generation_is_current(generation):
@@ -433,16 +423,10 @@ class ChannelCycleRunner:
                     self._action_was_executed(executed, action) for action in actions
                 ) or not self._action_was_executed(executed, pulse):
                     self._resolve_startup(startup)
-                    record = self._record_from_attempt(
-                        attempt,
-                        completed=False,
-                        interruption_reason="executor_rejected",
-                    )
                     attempt = None
                     await self._stop_for_failure(
                         self._format_rejection(dropped, "requested action was not executed"),
                         disconnected=self._is_disconnect(dropped),
-                        record=record,
                     )
                     return
 

@@ -340,7 +340,7 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(harness.sent_patterns[:2], ["呼吸", "律动"])
 
-    async def test_executor_rejection_stops_runner_and_records_failure(self):
+    async def test_executor_rejection_stops_without_archiving_unexecuted_cycle(self):
         harness = self.make_harness(
             frames={"呼吸": ["f"]}, fail_on_cycle=1
         )
@@ -351,7 +351,23 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         state = harness.runner.state()
         self.assertEqual(state.phase, RunnerPhase.STOPPED)
         self.assertIn("injected rejection", state.failure or "")
-        self.assertEqual(harness.records[0].interruption_reason, "executor_rejected")
+        self.assertEqual(harness.records, [])
+        self.assertEqual(harness.runner.pending_records(), ())
+
+    async def test_executor_exception_after_activation_does_not_archive_failed_cycle(self):
+        harness = self.make_harness(
+            frames={"呼吸": ["f"]}, gap_tenths=[0], raise_on_cycle=2
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        await harness.complete_cycle()
+
+        state = await harness.runner.wait_stopped()
+
+        self.assertEqual(state.phase, RunnerPhase.STOPPED)
+        self.assertIn("injected executor failure", state.failure or "")
+        self.assertEqual(len(harness.records), 1)
+        self.assertTrue(harness.records[0].completed)
+        self.assertEqual(harness.runner.pending_records(), ())
 
     async def test_stop_before_worker_first_step_releases_initial_submit(self):
         harness = self.make_harness(frames={"呼吸": ["f"]})

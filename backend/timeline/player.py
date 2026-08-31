@@ -52,10 +52,12 @@ class RecordedCyclePlayer:
         self._paused = False
         self._stopped = False
         self._cleared = False
+        self._clear_pending = False
         self._active_elapsed_ms = 0
         self._segment_started_at: float | None = None
         self._failure: ReplayPlaybackError | None = None
         self._started_cycles: dict[str, tuple[int, CycleRecord, int]] = {}
+        self._owner_generations: dict[str, int] | None = None
         self._lock = asyncio.Lock()
         self._clear_lock = asyncio.Lock()
 
@@ -83,12 +85,22 @@ class RecordedCyclePlayer:
     def failure(self) -> ReplayPlaybackError | None:
         return self._failure
 
+    @property
+    def cleared(self) -> bool:
+        return self._cleared
+
     def channel_states(self) -> dict[str, dict[str, Any]]:
         """Return redacted per-channel replay progress for public state."""
         states: dict[str, dict[str, Any]] = {}
         now_ms = self._active_now_ms()
         for channel in ("A", "B"):
-            phase = "paused" if self._paused else "idle"
+            phase = (
+                "stopped"
+                if self._clear_pending
+                else "paused"
+                if self._paused
+                else "idle"
+            )
             pattern: str | None = None
             strength = 0
             cycle_index = 0
@@ -129,6 +141,17 @@ class RecordedCyclePlayer:
         ):
             raise ValueError("cursor is outside the recorded cycle range")
 
+    def set_output_generations(
+        self, generations: Mapping[str, int]
+    ) -> None:
+        normalized = {
+            str(channel): int(generation)
+            for channel, generation in generations.items()
+        }
+        if set(normalized) != {"A", "B"}:
+            raise ValueError("replay output generations must provide A and B")
+        self._owner_generations = normalized
+
     def load(self, replay: Any) -> None:
         """Load one validated completed replay bundle or timeline while idle."""
         if self._task is not None and not self._task.done():
@@ -155,10 +178,12 @@ class RecordedCyclePlayer:
         self._paused = False
         self._stopped = False
         self._cleared = False
+        self._clear_pending = False
         self._active_elapsed_ms = 0
         self._segment_started_at = None
         self._failure = None
         self._started_cycles = {}
+        self._owner_generations = None
 
     async def start(self) -> None:
         async with self._lock:
@@ -171,6 +196,7 @@ class RecordedCyclePlayer:
             self._paused = False
             self._running = True
             self._cleared = False
+            self._clear_pending = False
             self._failure = None
             self._segment_started_at = self._clock()
             self._task = asyncio.create_task(
@@ -186,15 +212,15 @@ class RecordedCyclePlayer:
                 return self._cursor
             if task is None and not self._running:
                 return self._cursor
-            if not self._paused:
+            if self._running:
                 self._capture_active_elapsed()
                 self._rewind_interrupted_cycles()
-                self._paused = True
                 self._running = False
                 if task is not None and not task.done():
                     task.cancel()
             await self._await_terminal(task)
             await self._clear_once()
+            self._paused = True
             return self._cursor
 
     async def resume(self, cursor: int | None = None) -> None:
@@ -219,6 +245,7 @@ class RecordedCyclePlayer:
             self._paused = False
             self._running = True
             self._cleared = False
+            self._clear_pending = False
             self._failure = None
             self._started_cycles = {}
             self._segment_started_at = self._clock()
@@ -308,7 +335,15 @@ class RecordedCyclePlayer:
             },
         ]
         try:
-            executed, dropped = await self._executor.execute_actions(actions)
+            execute_timeline = getattr(
+                self._executor, "execute_timeline_actions", None
+            )
+            if callable(execute_timeline) and self._owner_generations is not None:
+                executed, dropped = await execute_timeline(
+                    actions, dict(self._owner_generations)
+                )
+            else:
+                executed, dropped = await self._executor.execute_actions(actions)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -348,8 +383,37 @@ class RecordedCyclePlayer:
         async with self._clear_lock:
             if self._cleared:
                 return
-            await self._executor.clear_output()
+            self._clear_pending = True
+            require_clear = getattr(
+                self._executor, "require_output_clear", None
+            )
+            if callable(require_clear):
+                require_clear(("A", "B"))
+            result = await self._executor.clear_output()
+            if not self._clear_was_executed(result):
+                raise ReplayPlaybackError("recorded playback clear was not confirmed")
             self._cleared = True
+            self._clear_pending = False
+
+    @staticmethod
+    def _clear_was_executed(result: object) -> bool:
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], Sequence)
+            or isinstance(result[0], (str, bytes))
+            or not isinstance(result[1], Sequence)
+            or isinstance(result[1], (str, bytes))
+            or result[1]
+        ):
+            return False
+        expected = {"op": "stop"}
+        return any(
+            isinstance(item, Mapping)
+            and isinstance(item.get("action"), Mapping)
+            and dict(item["action"]) == expected
+            for item in result[0]
+        )
 
     def _active_now_ms(self) -> int:
         if self._segment_started_at is None:

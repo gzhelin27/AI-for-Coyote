@@ -10,6 +10,7 @@ AddIntensity（相对增减）是最可靠的原语。因此所有强度命令�
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .config import reload_character
@@ -97,6 +98,10 @@ class GameLoop:
         self.autopilot_stop = asyncio.Event()
         self._autopilot_transition_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
+        self._execution_context = (
+            OutputIntentKind.MANUAL,
+            None,
+        )
         self.on_ai_turn = None                 # 由 AppState 注入：把 AI 主动回合推送到页面
         self.timeline_session = None            # 由 AppState 注入：确定性会话/重放控制器
 
@@ -428,14 +433,94 @@ class GameLoop:
                 if session_state.mode == "autopilot" and session_state.status.value in (
                     "running",
                     "paused",
+                    "finishing",
                 ):
                     try:
                         await self._await_timeline_lifecycle(controller.pause)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        if not self._global_clear_is_confirmed():
+                            raise DeviceOutputError(
+                                "manual prerequisite clear was not confirmed",
+                                status_code=503,
+                            ) from exc
+                        raise
                     finally:
                         await self._stop_autopilot_task()
                 elif session_state.mode == "replay":
-                    await self._await_timeline_lifecycle(controller.stop)
-            return await self.execute_actions([action])
+                    try:
+                        await self._await_timeline_lifecycle(controller.stop)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        if not self._global_clear_is_confirmed():
+                            raise DeviceOutputError(
+                                "manual prerequisite clear was not confirmed",
+                                status_code=503,
+                            ) from exc
+                        raise
+            if controller is not None and controller.to_state().mode is not None:
+                if not self._global_clear_is_confirmed():
+                    raise DeviceOutputError(
+                        "manual prerequisite clear was not confirmed",
+                        status_code=503,
+                    )
+            channels = self._action_channels((action,))
+            generations = {
+                channel: self.output_coordinator.invalidate(
+                    channel, OutputIntentKind.MANUAL
+                )
+                for channel in channels
+            }
+            return await self.execute_actions(
+                [action],
+                intent=OutputIntentKind.MANUAL,
+                owner_generations=generations,
+            )
+
+    def begin_timeline_output(
+        self, channels=("A", "B")
+    ) -> dict[str, int]:
+        """Claim fresh coordinator generations for live or replay output."""
+        normalized = self._normalize_output_channels(channels)
+        return {
+            channel: self.output_coordinator.invalidate(
+                channel, OutputIntentKind.TIMELINE_OR_REPLAY
+            )
+            for channel in normalized
+        }
+
+    def require_output_clear(self, channels=("A", "B")) -> None:
+        """Synchronously stale normal owners and block output until clear."""
+        for channel in self._normalize_output_channels(channels):
+            self.output_coordinator.require_clear(channel)
+
+    async def execute_timeline_actions(
+        self,
+        actions: list,
+        owner_generations: Mapping[str, int],
+    ) -> tuple[list, list]:
+        if not isinstance(owner_generations, Mapping):
+            raise TypeError("timeline output generations must be a mapping")
+        required = set(self._action_channels(actions))
+        provided = {
+            str(channel).strip().upper() for channel in owner_generations
+        }
+        if not required.issubset(provided):
+            return [], [
+                {
+                    "action": action,
+                    "reason": "timeline output owner generation is missing",
+                    "sent": False,
+                }
+                for action in actions
+            ]
+        return await self.execute_actions(
+            actions,
+            intent=OutputIntentKind.TIMELINE_OR_REPLAY,
+            owner_generations=owner_generations,
+        )
 
     async def set_autopilot(self, enabled: bool) -> None:
         """开启/关闭自动运行：AI 每 interval_s 秒自主观察、描写、调整设备并发言。"""
@@ -456,7 +541,8 @@ class GameLoop:
                 session_state = self.timeline_session.to_state()
                 if (
                     session_state.mode == "autopilot"
-                    and session_state.status.value in ("running", "paused")
+                    and session_state.status.value
+                    in ("running", "paused", "finishing")
                 ):
                     try:
                         await self._await_timeline_lifecycle(
@@ -646,33 +732,6 @@ class GameLoop:
         return executed, dropped, False
 
     # ---------- 动作执行（AI 与手动共用） ----------
-    async def _ensure_default_wave(
-        self, ch_name: str, client_id: str | None, slot_id: str | None,
-        ready: bool, dry_run: bool,
-    ) -> bool:
-        """给通道挂默认持续波形（强度没有波形承载时设备无输出）。"""
-        pattern = str(self.cfg["ui"].get("default_wave", "呼吸") or "呼吸")
-        meta = self.safety.presets.get(pattern)
-        if not meta and self.safety.presets:
-            pattern = next(iter(self.safety.presets))
-            meta = self.safety.presets[pattern]
-        if not meta:
-            return False
-        cmd = {
-            "kind": "pulse_hold", "channel": ch_name, "pattern": pattern,
-            "wave_key": meta["waveform"], "frames": meta["frames"],
-        }
-        if ready and not dry_run:
-            batch_expires_at = await self._start_pulse_loop(
-                client_id, slot_id, CHANNEL[ch_name], ch_name, cmd
-            )
-            if batch_expires_at is None:
-                return False
-        self.patterns[ch_name] = pattern
-        self.safety.record(cmd)
-        logger.info("自动挂载默认波形：%s 通道「%s」（强度需波形承载）", ch_name, pattern)
-        return True
-
     async def _apply_channel_floor(self) -> None:
         """双通道保底：两轮后 A/B 都必须有波形且强度≠0；每 2 轮内强度与波形至少各调一次。"""
         if not (self.safety.enabled.get("A") and self.safety.enabled.get("B")):
@@ -1406,15 +1465,64 @@ class GameLoop:
             enabled=bool(self.safety.enabled.get(channel, True)),
         )
 
-    async def execute_actions(self, actions: list) -> tuple[list, list]:
+    async def execute_actions(
+        self,
+        actions: list,
+        *,
+        intent: OutputIntentKind = OutputIntentKind.MANUAL,
+        owner_generations: Mapping[str, int] | None = None,
+    ) -> tuple[list, list]:
+        """Validate and execute actions through the single output coordinator.
+
+        ``_execute_actions_locked`` deliberately keeps its historical one-argument
+        shape because a few integration seams wrap it.  The surrounding action
+        lock makes this short-lived execution context task-safe.
+        """
+        if not isinstance(intent, OutputIntentKind):
+            raise ValueError("intent must be an OutputIntentKind")
+        effective_intent = intent
+        if (
+            intent is OutputIntentKind.MANUAL
+            and owner_generations is None
+            and self.timeline_session is not None
+            and self.timeline_session.to_state().mode is not None
+        ):
+            # Legacy low-level callers inside an active session are executor
+            # traffic, not the user-facing manual endpoint.  The endpoint
+            # always supplies an owned MANUAL generation after quiescing.
+            effective_intent = OutputIntentKind.TIMELINE_OR_REPLAY
+        generations = (
+            None
+            if owner_generations is None
+            else {
+                self.safety.norm_channel(channel): int(generation)
+                for channel, generation in owner_generations.items()
+            }
+        )
         async with self._action_lock:
-            return await self._execute_actions_locked(actions)
+            previous = self._execution_context
+            self._execution_context = (effective_intent, generations)
+            try:
+                return await self._execute_actions_locked(actions)
+            finally:
+                self._execution_context = previous
 
     async def _execute_actions_locked(self, actions: list) -> tuple[list, list]:
         """校验并执行动作列表，返回 (已执行说明列表, 被拒绝说明列表)。"""
         executed, dropped = [], []
         if not isinstance(actions, list):
             return executed, dropped
+
+        intent, owner_generations = self._execution_context
+
+        if owner_generations is None:
+            for channel in self._action_channels(actions):
+                pending = self.output_coordinator.pending(channel)
+                if (
+                    not pending.clear_required
+                    and pending.target_strength is None
+                ):
+                    self._sync_output_coordinator_channel(channel)
 
         client_id = self.relay.first_client_id()
         slot_id = self.relay.get_slot_id()
@@ -1433,6 +1541,26 @@ class GameLoop:
                 dropped.append({"action": action, "reason": "动作必须是 JSON 对象"})
                 continue
             ok, reason, cmd = self.safety.validate(action)
+            if (
+                not ok
+                and self.safety.estop_active
+                and action.get("op") in ("clear", "stop")
+            ):
+                channel = action.get("channel")
+                if action.get("op") == "stop" or channel is None:
+                    cmd = {
+                        "kind": "stop" if action.get("op") == "stop" else "clear",
+                        "channel": None,
+                    }
+                else:
+                    try:
+                        channel = self.safety.norm_channel(channel)
+                    except Exception:
+                        channel = None
+                    if channel is not None:
+                        cmd = {"kind": "clear", "channel": channel}
+                if cmd is not None:
+                    ok, reason = True, "急停期间安全清除"
             if not ok:
                 dropped.append({"action": action, "reason": reason})
                 logger.warning("动作被安全层拒绝: %s -> %s", action, reason)
@@ -1458,122 +1586,54 @@ class GameLoop:
                 dropped.append({"action": action, "reason": "设备未连接（无 clientId/slotId）"})
                 continue
 
-            # 强度类动作必须有波形承载才有输出（DG-LAB 特性）：通道无波形时自动挂默认波形
-            if cmd["kind"] in ("hold", "add", "temp") and cmd.get("channel") in ("A", "B"):
-                ch_name = cmd["channel"]
-                if (
-                    ch_name not in explicit_cycle_channels
-                    and ch_name not in self.loop_tasks
-                    and not self.safety.pulse_active().get(ch_name)
-                ):
-                    try:
-                        wave_ready = await self._ensure_default_wave(
-                            ch_name, client_id, slot_id, ready, dry_run
-                        )
-                    except Exception as exc:
-                        dropped.append(
-                            self._transport_failure(
-                                action,
-                                cmd,
-                                f"默认波形发送失败: {exc}",
-                                sent=False,
-                            )
-                        )
-                        continue
-                    if not wave_ready:
-                        dropped.append(
-                            self._transport_failure(
-                                action, cmd, "默认波形发送失败", sent=False
-                            )
-                        )
-                        continue
+            expected_generations = owner_generations or {}
+            expected_generation = (
+                expected_generations.get(channel)
+                if channel in ("A", "B")
+                else None
+            )
+            helper_required = (
+                cmd["kind"] in ("hold", "add", "temp")
+                and channel in ("A", "B")
+                and channel not in explicit_cycle_channels
+                and channel not in self.loop_tasks
+                and not self.safety.pulse_active().get(channel)
+            )
 
-            if cmd["kind"] == "pulse_hold":
-                # 循环波形：程序周期性重发（不依赖 App 的 d=0），直到清除/急停
-                sent = False
-                if ready and not dry_run:
-                    try:
-                        batch_expires_at = await self._start_pulse_loop(
-                            client_id, slot_id,
-                            CHANNEL[cmd["channel"]], cmd["channel"], cmd,
-                        )
-                        sent = batch_expires_at is not None
-                    except Exception as exc:
-                        dropped.append(
-                            self._transport_failure(
-                                action,
-                                cmd,
-                                f"设备发送失败: {exc}",
-                                sent=False,
-                            )
-                        )
-                        continue
-                if not dry_run and not sent:
-                    dropped.append(
-                        self._transport_failure(
-                            action, cmd, "设备发送失败", sent=False
-                        )
+            transaction = await self._run_action_transaction(
+                cmd=cmd,
+                intent=intent,
+                expected_generation=expected_generation,
+                helper_required=helper_required,
+                client_id=client_id,
+                slot_id=slot_id,
+                ready=ready,
+                dry_run=dry_run,
+            )
+            if not transaction["complete"]:
+                dropped.append(
+                    self._transport_failure(
+                        action,
+                        cmd,
+                        transaction["error"] or "设备发送失败",
+                        sent=False,
                     )
-                    continue
-                if cmd.get("channel") in ("A", "B"):
-                    self.patterns[cmd["channel"]] = cmd.get("pattern")
-                self.safety.record(cmd)
-                self._record_success_turn(cmd)
-                label = self._describe(cmd)
-                executed.append({
-                    "action": action,
-                    "effective": self._effective_result(action, cmd),
-                    "reason": reason,
-                    "sent": sent,
-                    "label": label,
-                })
-                logger.info("执行动作: %s（循环播放中）", label)
+                )
                 continue
 
-            clear_target = "unchanged"
-            if cmd["kind"] in ("clear", "stop"):
-                # 清除/停止先取消该通道（或全部）的循环波形
-                clear_target = (
-                    None
-                    if cmd["kind"] == "stop" or cmd["channel"] is None
-                    else cmd["channel"]
-                )
-                self._cancel_loops(clear_target)
-
-            frames = self._build_frames(cmd, client_id, slot_id)
-            sent = False
-            if ready and not dry_run:
-                try:
-                    sent = all(await self._send_all(frames))
-                except Exception as exc:  # transport exceptions are failed sends
-                    dropped.append(
-                        self._transport_failure(
-                            action, cmd, f"设备发送失败: {exc}", sent=False
-                        )
-                    )
-                    continue
-                if not sent:
-                    dropped.append(
-                        self._transport_failure(
-                            action, cmd, "设备发送失败", sent=False
-                        )
-                    )
-                    continue
-
-            if clear_target is None:
-                self.patterns = {"A": None, "B": None}
-            elif clear_target in ("A", "B"):
-                self.patterns[clear_target] = None
-            elif cmd["kind"] in ("pulse", "pulse_cycle") and cmd.get("channel") in ("A", "B"):
-                self.patterns[cmd["channel"]] = cmd.get("pattern")
             self.safety.record(cmd)
+            if transaction.get("helper_cmd") is not None:
+                self.safety.record(transaction["helper_cmd"])
             if cmd["kind"] == "temp" and ready and not dry_run:
                 self._schedule_temp_revert(
                     client_id,
                     slot_id,
-                    CHANNEL[cmd["channel"]],
-                    cmd["channel"],
+                    CHANNEL[channel],
+                    channel,
                     cmd["duration_s"],
+                    owner_generation=transaction["generation"],
+                    owner_revision=self.output_coordinator.revision(channel),
+                    owner_intent=intent,
                 )
             self._record_success_turn(cmd)
             label = self._describe(cmd)
@@ -1581,16 +1641,525 @@ class GameLoop:
                 "action": action,
                 "effective": self._effective_result(action, cmd),
                 "reason": reason,
-                "sent": sent,
+                "sent": transaction["sent"],
                 "label": label,
             })
             logger.info(
                 "%s执行动作: %s（%s）",
                 "DRY-RUN " if (dry_run or not ready) else "",
                 label,
-                "已发送" if sent else "模拟",
+                "已发送" if transaction["sent"] else "模拟",
             )
         return executed, dropped
+
+    async def _run_action_transaction(
+        self,
+        *,
+        cmd: dict,
+        intent: OutputIntentKind,
+        expected_generation: int | None,
+        helper_required: bool,
+        client_id: str | None,
+        slot_id: str | None,
+        ready: bool,
+        dry_run: bool,
+    ) -> dict:
+        """Run one complete high-level action and expose only committed success."""
+        if cmd["kind"] in ("clear", "stop"):
+            return await self._run_clear_transaction(
+                cmd=cmd,
+                intent=(
+                    OutputIntentKind.ESTOP
+                    if self.safety.estop_active
+                    else intent
+                    if intent >= OutputIntentKind.CLEAR_OR_DISABLE
+                    else OutputIntentKind.CLEAR_OR_DISABLE
+                ),
+                client_id=client_id,
+                slot_id=slot_id,
+                ready=ready,
+                dry_run=dry_run,
+            )
+
+        channel = cmd["channel"]
+        coordinator = self.output_coordinator
+        generation = (
+            coordinator.generation(channel)
+            if expected_generation is None
+            else expected_generation
+        )
+        state = {
+            "complete": False,
+            "sent": False,
+            "error": None,
+            "generation": generation,
+            "helper_cmd": None,
+            "helper_expiry": None,
+        }
+
+        async def transport(confirmed):
+            if not self._normal_output_is_current(channel, generation):
+                state["error"] = "stale output generation"
+                return TransportOutcome(sent=False, error=state["error"])
+            helper_cmd = self._default_wave_command(channel) if helper_required else None
+            if helper_required and helper_cmd is None:
+                state["error"] = "默认波形不可用"
+                return TransportOutcome(sent=False, error=state["error"])
+            helper_sent = False
+            if helper_cmd is not None:
+                state["helper_cmd"] = helper_cmd
+                if dry_run:
+                    helper_sent = True
+                else:
+                    try:
+                        expiry = await self._start_pulse_loop(
+                            client_id,
+                            slot_id,
+                            CHANNEL[channel],
+                            channel,
+                            helper_cmd,
+                            owner_generation=generation,
+                            owner_intent=intent,
+                        )
+                    except Exception as exc:
+                        state["error"] = f"默认波形发送失败: {exc}"
+                        return TransportOutcome(sent=False, error=state["error"])
+                    helper_sent = expiry is not None
+                    state["helper_expiry"] = expiry
+                if not helper_sent:
+                    state["error"] = "默认波形发送失败"
+                    return TransportOutcome(sent=False, error=state["error"])
+                if not self._normal_output_is_current(channel, generation):
+                    return await self._rollback_helper_transport(
+                        channel, confirmed, helper_cmd, state
+                    )
+
+            effective = self._coordinator_effective_for_command(cmd, confirmed)
+            if cmd["kind"] == "pulse_hold":
+                if dry_run:
+                    state["complete"] = True
+                    return TransportOutcome(
+                        sent=True, simulated=True, effective=effective
+                    )
+                try:
+                    expiry = await self._start_pulse_loop(
+                        client_id,
+                        slot_id,
+                        CHANNEL[channel],
+                        channel,
+                        cmd,
+                        owner_generation=generation,
+                        owner_intent=intent,
+                    )
+                except Exception as exc:
+                    state["error"] = f"设备发送失败: {exc}"
+                    return TransportOutcome(sent=False, error=state["error"])
+                if expiry is None:
+                    state["error"] = "设备发送失败"
+                    return TransportOutcome(sent=False, error=state["error"])
+                state["complete"] = True
+                state["sent"] = True
+                state["helper_expiry"] = expiry
+                return TransportOutcome(sent=True, effective=effective)
+            if dry_run:
+                if helper_cmd is not None:
+                    effective.update(
+                        waveform=helper_cmd["pattern"], waveform_mode="loop"
+                    )
+                state["complete"] = True
+                return TransportOutcome(
+                    sent=True, simulated=True, effective=effective
+                )
+
+            frames = self._build_frames_from_confirmed(
+                cmd, client_id, slot_id, confirmed
+            )
+            if not frames:
+                primary_sent, primary_error = True, None
+                simulated = True
+            else:
+                primary_sent, primary_error = await self._send_frames_complete(frames)
+                simulated = False
+            if not primary_sent:
+                state["error"] = (
+                    f"设备发送失败: {primary_error}"
+                    if primary_error
+                    else "设备发送失败"
+                )
+                if helper_cmd is not None:
+                    return await self._rollback_helper_transport(
+                        channel, confirmed, helper_cmd, state
+                    )
+                return TransportOutcome(sent=False, error=state["error"])
+
+            if cmd["kind"] in ("pulse", "pulse_cycle"):
+                self._cancel_loops(channel, reset_pulse=False)
+            if helper_cmd is not None:
+                effective.update(
+                    waveform=helper_cmd["pattern"], waveform_mode="loop"
+                )
+            state["complete"] = True
+            state["sent"] = not simulated or helper_sent
+            return TransportOutcome(
+                sent=True,
+                simulated=simulated and not helper_sent,
+                effective=effective,
+            )
+
+        try:
+            outcome = await coordinator.run(channel, intent, transport)
+        finally:
+            self._publish_coordinator_confirmed(channel)
+        if not outcome.sent and state["error"] is None:
+            state["error"] = outcome.error or "设备发送失败"
+        return state
+
+    async def _rollback_helper_transport(
+        self, channel: str, confirmed, helper_cmd: dict, state: dict
+    ) -> TransportOutcome:
+        """Clean a sent helper before reporting its parent action as dropped."""
+        self._cancel_loops(channel, reset_pulse=False)
+        frames = self._channel_clear_frames(
+            channel,
+            self.relay.first_client_id(),
+            self.relay.get_slot_id(),
+            int(confirmed.strength or 0),
+        )
+        cleanup_sent, cleanup_error = await self._send_frames_complete(frames)
+        if cleanup_sent:
+            return TransportOutcome(
+                sent=True,
+                effective={
+                    "strength": 0,
+                    "waveform": None,
+                    "waveform_mode": None,
+                    "enabled": confirmed.enabled,
+                },
+                error=state["error"],
+            )
+        # This callback runs inside the coordinator-owned, cancellation-shielded
+        # task.  Publish the conservative physical helper effect and block every
+        # lower-priority owner here, before caller cancellation can be re-raised.
+        self.output_coordinator.require_clear(channel)
+        expiry = state.get("helper_expiry")
+        if isinstance(expiry, (int, float)):
+            self.safety.pulse_until[channel] = float(expiry)
+        if cleanup_error:
+            state["error"] = f"{state['error']}; helper clear failed: {cleanup_error}"
+        return TransportOutcome(
+            sent=True,
+            effective={
+                "strength": int(confirmed.strength or 0),
+                "waveform": helper_cmd["pattern"],
+                "waveform_mode": "finite",
+                "enabled": confirmed.enabled,
+            },
+            error=state["error"],
+        )
+
+    async def _run_clear_transaction(
+        self,
+        *,
+        cmd: dict,
+        intent: OutputIntentKind,
+        client_id: str | None,
+        slot_id: str | None,
+        ready: bool,
+        dry_run: bool,
+    ) -> dict:
+        channel = cmd.get("channel")
+        global_clear = cmd["kind"] == "stop" or channel is None
+        target = None if global_clear else channel
+        self._cancel_loops(target, reset_pulse=False)
+        state = {
+            "complete": False,
+            "sent": False,
+            "error": None,
+            "generation": None,
+            "helper_cmd": None,
+        }
+
+        if global_clear:
+            async def transport(snapshots):
+                effective = {
+                    name: {
+                        "strength": 0,
+                        "waveform": None,
+                        "waveform_mode": None,
+                        "enabled": snapshots[name].enabled,
+                    }
+                    for name in ("A", "B")
+                }
+                if dry_run:
+                    state["complete"] = True
+                    return TransportOutcome(
+                        sent=True, simulated=True, effective=effective
+                    )
+                if intent is OutputIntentKind.ESTOP and all(
+                    snapshots[name].strength in (None, 0)
+                    and snapshots[name].waveform is None
+                    and snapshots[name].waveform_mode is None
+                    for name in ("A", "B")
+                ):
+                    state["complete"] = True
+                    return TransportOutcome(
+                        sent=True, simulated=True, effective=effective
+                    )
+                if not ready:
+                    state["error"] = "设备未连接（无 clientId/slotId）"
+                    return TransportOutcome(sent=False, error=state["error"])
+                frames = self._global_clear_frames(
+                    client_id, slot_id, snapshots
+                )
+                sent, error = await self._send_frames_complete(frames)
+                if sent:
+                    state["complete"] = True
+                    state["sent"] = True
+                else:
+                    state["error"] = (
+                        f"设备发送失败: {error}" if error else "设备发送失败"
+                    )
+                return TransportOutcome(
+                    sent=sent,
+                    effective=effective if sent else None,
+                    error=state["error"],
+                )
+
+            try:
+                outcome = await self.output_coordinator.run_global(intent, transport)
+            finally:
+                for name in ("A", "B"):
+                    self._publish_coordinator_confirmed(name)
+        else:
+            async def transport(confirmed):
+                effective = {
+                    "strength": 0,
+                    "waveform": None,
+                    "waveform_mode": None,
+                    "enabled": confirmed.enabled,
+                }
+                if dry_run:
+                    state["complete"] = True
+                    return TransportOutcome(
+                        sent=True, simulated=True, effective=effective
+                    )
+                if not ready:
+                    state["error"] = "设备未连接（无 clientId/slotId）"
+                    return TransportOutcome(sent=False, error=state["error"])
+                frames = self._channel_clear_frames(
+                    channel,
+                    client_id,
+                    slot_id,
+                    int(confirmed.strength or 0),
+                )
+                sent, error = await self._send_frames_complete(frames)
+                if sent:
+                    state["complete"] = True
+                    state["sent"] = True
+                else:
+                    state["error"] = (
+                        f"设备发送失败: {error}" if error else "设备发送失败"
+                    )
+                return TransportOutcome(
+                    sent=sent,
+                    effective=effective if sent else None,
+                    error=state["error"],
+                )
+
+            try:
+                outcome = await self.output_coordinator.run(
+                    channel, intent, transport
+                )
+            finally:
+                self._publish_coordinator_confirmed(channel)
+
+        if not outcome.sent and state["error"] is None:
+            state["error"] = outcome.error or "设备发送失败"
+        return state
+
+    def _default_wave_command(self, channel: str) -> dict | None:
+        pattern = str(self.cfg["ui"].get("default_wave", "呼吸") or "呼吸")
+        meta = self.safety.presets.get(pattern)
+        if not meta and self.safety.presets:
+            pattern = next(iter(self.safety.presets))
+            meta = self.safety.presets[pattern]
+        if not meta:
+            return None
+        return {
+            "kind": "pulse_hold",
+            "channel": channel,
+            "pattern": pattern,
+            "wave_key": meta["waveform"],
+            "frames": meta["frames"],
+        }
+
+    def _normal_output_is_current(self, channel: str, generation: int) -> bool:
+        pending = self.output_coordinator.pending(channel)
+        confirmed = self.output_coordinator.confirmed(channel)
+        return (
+            self.output_coordinator.is_current(channel, generation)
+            and not pending.clear_required
+            and pending.target_strength is None
+            and confirmed.enabled
+            and self.safety.desired_enabled.get(channel, False)
+            and not self.safety.estop_active
+        )
+
+    @staticmethod
+    def _coordinator_effective_for_command(cmd: dict, confirmed) -> dict:
+        kind = cmd["kind"]
+        if kind in ("hold", "add", "temp"):
+            return {"strength": int(cmd["value"])}
+        if kind in ("pulse", "pulse_cycle"):
+            return {
+                "strength": int(confirmed.strength or 0),
+                "waveform": cmd["pattern"],
+                "waveform_mode": "finite",
+            }
+        if kind == "pulse_hold":
+            return {
+                "strength": int(confirmed.strength or 0),
+                "waveform": cmd["pattern"],
+                "waveform_mode": "loop",
+            }
+        raise ValueError(f"unsupported coordinated command: {kind}")
+
+    def _build_frames_from_confirmed(
+        self,
+        cmd: dict,
+        client_id: str | None,
+        slot_id: str | None,
+        confirmed,
+    ) -> list[dict]:
+        if client_id is None or slot_id is None:
+            return []
+        kind = cmd["kind"]
+        channel = cmd["channel"]
+        if kind in ("hold", "add", "temp"):
+            delta = int(cmd["value"]) - int(confirmed.strength or 0)
+            return (
+                [
+                    self.ops.add_strength(
+                        client_id, slot_id, CHANNEL[channel], delta
+                    )
+                ]
+                if delta
+                else []
+            )
+        return self._build_frames(cmd, client_id, slot_id)
+
+    def _channel_clear_frames(
+        self,
+        channel: str,
+        client_id: str | None,
+        slot_id: str | None,
+        strength: int,
+    ) -> list[dict]:
+        if client_id is None or slot_id is None:
+            return []
+        numeric = CHANNEL[channel]
+        frames = [self.ops.clear(client_id, slot_id, numeric)]
+        if strength:
+            frames.append(
+                self.ops.add_strength(
+                    client_id, slot_id, numeric, -int(strength)
+                )
+            )
+        frames.append(self.ops.reset_intensity(client_id, slot_id, numeric))
+        return frames
+
+    def _global_clear_frames(
+        self,
+        client_id: str | None,
+        slot_id: str | None,
+        snapshots: Mapping[str, object],
+    ) -> list[dict]:
+        if client_id is None or slot_id is None:
+            return []
+        frames = [self.ops.clear(client_id, slot_id)]
+        for channel in ("A", "B"):
+            strength = int(getattr(snapshots[channel], "strength", 0) or 0)
+            if strength:
+                frames.append(
+                    self.ops.add_strength(
+                        client_id,
+                        slot_id,
+                        CHANNEL[channel],
+                        -strength,
+                    )
+                )
+            frames.append(
+                self.ops.reset_intensity(
+                    client_id, slot_id, CHANNEL[channel]
+                )
+            )
+        return frames
+
+    async def _send_frames_complete(
+        self, frames: list[dict]
+    ) -> tuple[bool, str | None]:
+        """Attempt every frame so safety cleanup is not truncated by one error."""
+        sent = True
+        errors: list[str] = []
+        for frame in frames:
+            try:
+                if not await self.relay.send_frame(frame):
+                    sent = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                sent = False
+                errors.append(str(exc) or type(exc).__name__)
+        return sent, "; ".join(errors) or None
+
+    @staticmethod
+    def _normalize_output_channels(channels) -> tuple[str, ...]:
+        if isinstance(channels, str):
+            channels = (channels,)
+        normalized: list[str] = []
+        for channel in channels:
+            value = str(channel).strip().upper()
+            if value not in ("A", "B"):
+                raise ValueError("channel must be A or B")
+            if value not in normalized:
+                normalized.append(value)
+        if not normalized:
+            raise ValueError("at least one output channel is required")
+        return tuple(normalized)
+
+    def _action_channels(self, actions) -> tuple[str, ...]:
+        channels: list[str] = []
+        for action in actions:
+            if not isinstance(action, Mapping):
+                continue
+            if action.get("op") == "stop" or (
+                action.get("op") == "clear" and action.get("channel") is None
+            ):
+                return ("A", "B")
+            raw = action.get("channel")
+            if raw is None:
+                continue
+            try:
+                channel = self.safety.norm_channel(raw)
+            except Exception:
+                continue
+            if channel not in channels:
+                channels.append(channel)
+        return tuple(channels)
+
+    def _global_clear_is_confirmed(self) -> bool:
+        for channel in ("A", "B"):
+            confirmed = self.output_coordinator.confirmed(channel)
+            pending = self.output_coordinator.pending(channel)
+            if (
+                confirmed.strength not in (None, 0)
+                or confirmed.waveform is not None
+                or confirmed.waveform_mode is not None
+                or pending.clear_required
+                or pending.target_strength is not None
+            ):
+                return False
+        return True
 
     def _record_success_turn(self, cmd: dict) -> None:
         channel = cmd.get("channel")
@@ -1649,6 +2218,18 @@ class GameLoop:
             effective["duration_ms"] = int(cmd["duration_s"] * 1000)
         elif cmd["kind"] == "pulse_cycle":
             effective["duration_ms"] = cmd["duration_ms"]
+        elif cmd["kind"] in ("clear", "stop"):
+            cleared = {
+                "effective_strength": 0,
+                "pattern": None,
+                "waveform_mode": None,
+            }
+            if ch in ("A", "B"):
+                effective.update(cleared)
+            else:
+                effective["channels"] = {
+                    channel: dict(cleared) for channel in ("A", "B")
+                }
         return effective
 
     def _build_frames(self, cmd: dict, client_id: str | None, slot_id: str | None) -> list[dict]:
@@ -1724,23 +2305,70 @@ class GameLoop:
         return frames
 
     def _schedule_temp_revert(
-        self, client_id: str, slot_id: str, ch: int, ch_name: str, duration_s: float
+        self,
+        client_id: str,
+        slot_id: str,
+        ch: int,
+        ch_name: str,
+        duration_s: float,
+        *,
+        owner_generation: int,
+        owner_revision: int,
+        owner_intent: OutputIntentKind,
     ) -> None:
         """爆发时长结束后自动归零（AddIntensity 负值 + reset 兜底）。"""
 
         async def revert() -> None:
             await asyncio.sleep(duration_s)
-            if self.safety.estop_active:
-                return
-            value = self.safety.current[ch_name]
-            frames = []
-            if value:
-                frames.append(
-                    self.ops.add_strength(client_id, slot_id, ch, -value)
+            if (
+                not self._normal_output_is_current(
+                    ch_name, owner_generation
                 )
-            frames.append(self.ops.reset_intensity(client_id, slot_id, ch))
-            sent = all(await self._send_all(frames))
-            if sent:
+                or self.output_coordinator.revision(ch_name) != owner_revision
+            ):
+                return
+
+            async def transport(confirmed):
+                if (
+                    not self._normal_output_is_current(
+                        ch_name, owner_generation
+                    )
+                    or self.output_coordinator.revision(ch_name)
+                    != owner_revision
+                ):
+                    return TransportOutcome(
+                        sent=False, error="stale output generation"
+                    )
+                value = int(confirmed.strength or 0)
+                frames = []
+                if value:
+                    frames.append(
+                        self.ops.add_strength(
+                            client_id, slot_id, ch, -value
+                        )
+                    )
+                frames.append(
+                    self.ops.reset_intensity(client_id, slot_id, ch)
+                )
+                sent, error = await self._send_frames_complete(frames)
+                if not sent:
+                    # The coordinator owns this callback past caller
+                    # cancellation, so establish the retryable safety block
+                    # before cancellation can resume the outer task.
+                    self.output_coordinator.require_clear(ch_name)
+                return TransportOutcome(
+                    sent=sent,
+                    effective={"strength": 0} if sent else None,
+                    error=error or (None if sent else "temp revert failed"),
+                )
+
+            try:
+                outcome = await self.output_coordinator.run(
+                    ch_name, owner_intent, transport
+                )
+            finally:
+                self._publish_coordinator_confirmed(ch_name)
+            if outcome.sent:
                 self.safety.record({"kind": "zero", "channel": ch_name})
                 logger.info("爆发结束，%s 通道自动归零", ch_name)
 
@@ -1756,6 +2384,7 @@ class GameLoop:
         cmd: dict,
         *,
         owner_generation: int | None = None,
+        owner_intent: OutputIntentKind = OutputIntentKind.MANUAL,
     ) -> float | None:
         """分批下发波形实现无限循环，批间提前覆盖消除真空期。
 
@@ -1764,7 +2393,8 @@ class GameLoop:
           设备全程无「停止-重启」的空档
         - 不依赖 App 的 d=0（实测不可靠），只用普通波形帧
         """
-        self._cancel_loops(ch_name)
+        if owner_generation is None:
+            owner_generation = self.output_coordinator.generation(ch_name)
         base = cmd["frames"]
         playback = self.cfg["playback"]
         frame_s = float(playback["frame_ms"]) / 1000.0
@@ -1783,9 +2413,20 @@ class GameLoop:
             )
         wait_s = max(0.1, batch_s - overlap)
 
-        if not all(await self._send_all([next_frame()])):
+        if not self._normal_output_is_current(ch_name, owner_generation):
+            return None
+        initial_sent, initial_error = await self._send_frames_complete(
+            [next_frame()]
+        )
+        if not initial_sent:
+            if initial_error:
+                raise RuntimeError(initial_error)
             return None
         last_batch_expires_at = time.monotonic() + batch_s
+
+        # The replacement frame is now confirmed, so the old resend owner can
+        # be retired without turning a failed replacement into an output gap.
+        self._cancel_loops(ch_name, reset_pulse=False)
 
         stop_event = asyncio.Event()
         self.loop_events[ch_name] = stop_event
@@ -1806,18 +2447,44 @@ class GameLoop:
                         break
                     except asyncio.TimeoutError:
                         pass
-                    if self.safety.estop_active:
-                        break
-                    if (
-                        owner_generation is not None
-                        and not self._floor_generation_is_current(
-                            ch_name, owner_generation
-                        )
+                    if not self._normal_output_is_current(
+                        ch_name, owner_generation
                     ):
                         break
-                    sent = all(await self._send_all([next_frame()]))
-                    if sent:
+                    async def resend(confirmed):
+                        if not self._normal_output_is_current(
+                            ch_name, owner_generation
+                        ):
+                            return TransportOutcome(
+                                sent=False,
+                                error="stale output generation",
+                            )
+                        sent, error = await self._send_frames_complete(
+                            [next_frame()]
+                        )
+                        return TransportOutcome(
+                            sent=sent,
+                            effective={
+                                "waveform": cmd["pattern"],
+                                "waveform_mode": "loop",
+                            }
+                            if sent
+                            else None,
+                            error=error or (
+                                None if sent else "waveform resend failed"
+                            ),
+                        )
+
+                    try:
+                        outcome = await self.output_coordinator.run(
+                            ch_name, owner_intent, resend
+                        )
+                    finally:
+                        self._publish_coordinator_confirmed(ch_name)
+                    if outcome.sent:
                         last_batch_expires_at = time.monotonic() + batch_s
+                    else:
+                        break
             finally:
                 reset_requested = current_task in self._loop_reset_requests
                 self._loop_reset_requests.discard(current_task)
@@ -1828,8 +2495,7 @@ class GameLoop:
                 if owns_event:
                     self.loop_events.pop(ch_name, None)
                 if (
-                    owner_generation is not None
-                    and owns_task
+                    owns_task
                     and owns_event
                     and not reset_requested
                 ):
@@ -1940,17 +2606,25 @@ class GameLoop:
 
     # ---------- 急停 / 恢复 ----------
     async def estop(self) -> dict:
-        self._cancel_loops(None)  # 停掉所有循环波形
-        self.patterns = {"A": None, "B": None}
-        cmds = self.safety.estop()
+        # Latch policy and coordinator priority synchronously, before waiting on
+        # any active normal-output callback.
+        self.safety.estop()
+        for channel in ("A", "B"):
+            self._publish_coordinator_confirmed(channel)
+            self.output_coordinator.invalidate(
+                channel, OutputIntentKind.ESTOP
+            )
+        self._cancel_loops(None, reset_pulse=False)
         client_id = self.relay.first_client_id()
         slot_id = self.relay.get_slot_id()
-        sent = False
-        if client_id and slot_id and not self.safety.dry_run:
-            frames: list[dict] = []
-            for cmd in cmds:
-                frames.extend(self._build_frames(cmd, client_id, slot_id))
-            sent = all(await self._send_all(frames))
+        transaction = await self._run_clear_transaction(
+            cmd={"kind": "stop", "channel": None},
+            intent=OutputIntentKind.ESTOP,
+            client_id=client_id,
+            slot_id=slot_id,
+            ready=bool(client_id and slot_id),
+            dry_run=self.safety.dry_run,
+        )
         async with self._autopilot_transition_lock:
             try:
                 if self.timeline_session is not None:
@@ -1959,6 +2633,13 @@ class GameLoop:
                     )
             finally:
                 await self._stop_autopilot_task()
+        sent = bool(transaction["sent"])
+        if (
+            not sent
+            and not self.safety.dry_run
+            and self._global_clear_is_confirmed()
+        ):
+            sent = True
         return {"estop": True, "sent": sent}
 
     async def resume(self) -> dict:
@@ -1966,16 +2647,21 @@ class GameLoop:
         return {"estop": False}
 
     async def on_client_disconnected(self) -> None:
-        """APP 断开：停止所有循环波形并清零跟踪。"""
-        self._cancel_loops(None)
-        self.patterns = {"A": None, "B": None}
-        self.safety.record({"kind": "stop"})
+        """APP 断开：stale owners now; publish clear only after transport."""
+        self.require_output_clear(("A", "B"))
+        self._cancel_loops(None, reset_pulse=False)
         async with self._autopilot_transition_lock:
             try:
+                session_active = False
                 if self.timeline_session is not None:
+                    session_active = (
+                        self.timeline_session.to_state().status.value != "idle"
+                    )
                     await self._await_timeline_lifecycle(
                         self.timeline_session.on_disconnect
                     )
+                if not session_active:
+                    await self.clear_output()
             finally:
                 await self._stop_autopilot_task()
 

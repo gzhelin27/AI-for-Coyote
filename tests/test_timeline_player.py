@@ -258,6 +258,41 @@ class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(harness.executor.clear_calls, [None, None])
 
+    async def test_false_pause_clear_result_is_retryable_and_not_published_paused(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if harness.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+        clear_output = harness.executor.clear_output
+        clear_attempts = 0
+
+        async def false_once(channel=None):
+            nonlocal clear_attempts
+            clear_attempts += 1
+            if clear_attempts == 1:
+                harness.executor.clear_calls.append(channel)
+                return [], [
+                    {
+                        "action": {"op": "stop"},
+                        "reason": "injected false clear",
+                        "sent": False,
+                    }
+                ]
+            return await clear_output(channel)
+
+        harness.executor.clear_output = false_once
+
+        with self.assertRaisesRegex(ReplayPlaybackError, "clear"):
+            await harness.player.pause()
+
+        self.assertEqual(harness.player.channel_states()["A"]["phase"], "stopped")
+        await harness.player.pause()
+        self.assertTrue(harness.player.paused)
+        self.assertEqual(harness.executor.clear_calls, [None, None])
+
     async def test_failed_stop_clear_is_retryable_by_stop(self):
         harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
         self.addAsyncCleanup(harness.close)

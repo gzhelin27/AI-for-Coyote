@@ -51,13 +51,47 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "clear"):
             await controller.pause()
 
-        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
         with self.assertRaisesRegex(RuntimeError, "clear"):
             await controller.resume()
         await controller.pause()
         await controller.resume()
         self.assertEqual(controller.clear_calls, [None, None])
         self.assertEqual(controller.to_state().status, SessionStatus.RUNNING)
+
+    async def test_false_live_clear_result_keeps_transition_pending(self):
+        controller = SessionHarness.create(seed=221)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        clear_output = controller.game_loop.clear_output
+        clear_attempts = 0
+
+        async def false_once(channel=None):
+            nonlocal clear_attempts
+            clear_attempts += 1
+            if clear_attempts == 1:
+                controller.game_loop.clear_calls.append(channel)
+                return [], [
+                    {
+                        "action": {"op": "stop"},
+                        "reason": "injected false clear",
+                        "sent": False,
+                    }
+                ]
+            return await clear_output(channel)
+
+        controller.game_loop.clear_output = false_once
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.pause()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
+        await controller.pause()
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.clear_calls, [None, None])
 
     async def test_cancelled_pause_before_quiesce_is_retryable(self):
         controller = SessionHarness.create(seed=33)
@@ -76,7 +110,7 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         result = await asyncio.gather(pause, return_exceptions=True)
 
         self.assertIsInstance(result[0], asyncio.CancelledError)
-        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
         self.assertEqual(controller.clear_calls, [])
         cycle_count = len(controller.game_loop.requested_cycle_actions)
 
@@ -177,7 +211,7 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         result = await asyncio.gather(replacement, return_exceptions=True)
 
         self.assertIsInstance(result[0], asyncio.CancelledError)
-        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
         self.assertEqual(controller.clear_calls, [])
 
         await controller.stop()
@@ -194,7 +228,7 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "clear"):
             await controller.finish()
 
-        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
         self.assertEqual(controller.store.list(), [])
         summary = await controller.finish()
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
@@ -232,7 +266,7 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "clear"):
             await controller.stop()
-        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
         await controller.stop()
 
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
@@ -688,13 +722,13 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         controller.game_loop.clear_failures_remaining = 2
         await controller.start_replay(bundle.manifest.replay_id)
         for _ in range(20):
-            if controller.to_state().status is SessionStatus.PAUSED:
+            if controller.to_state().status is SessionStatus.FINISHING:
                 break
             await asyncio.sleep(0)
 
         with self.assertRaisesRegex(RuntimeError, "clear"):
             await controller.stop()
-        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.to_state().status, SessionStatus.FINISHING)
         await controller.stop()
 
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)

@@ -42,10 +42,28 @@ class _RunnerExecutor:
 
     def __init__(self, game_loop: Any) -> None:
         self._game_loop = game_loop
+        self._owner_generations: dict[str, int] = {}
+
+    def update_owner_generations(
+        self, generations: Mapping[str, int]
+    ) -> None:
+        self._owner_generations.update(
+            {str(channel): int(value) for channel, value in generations.items()}
+        )
+
+    def clear_owner_generations(self) -> None:
+        self._owner_generations.clear()
 
     async def execute(
         self, actions: list[dict[str, Any]]
     ) -> tuple[list[Any], list[Any]]:
+        execute_timeline = getattr(
+            self._game_loop, "execute_timeline_actions", None
+        )
+        if callable(execute_timeline):
+            return await execute_timeline(
+                actions, dict(self._owner_generations)
+            )
         return await self._game_loop.execute_actions(actions)
 
 
@@ -159,6 +177,7 @@ class SessionController:
         self._paused_total_ms = 0
         self._safety_caps: dict[str, int] = {}
         self._live_clear_required = False
+        self._output_generations: dict[str, int] = {}
 
     @property
     def runners(self) -> Mapping[str, ChannelCycleRunner]:
@@ -266,6 +285,14 @@ class SessionController:
                 self._plot_events.append(resolved)
                 self._current_event_id = resolved.event_id
 
+                requested_stops = tuple(
+                    channel
+                    for channel, directive in resolved.channels.items()
+                    if directive.mode is DirectiveMode.STOP
+                )
+                if requested_stops:
+                    self._require_output_clear(requested_stops)
+
                 stopped_channels: list[str] = []
                 for channel, directive in resolved.channels.items():
                     if directive.mode is DirectiveMode.KEEP:
@@ -299,10 +326,12 @@ class SessionController:
 
                 if stopped_channels:
                     if set(stopped_channels) == set(_CHANNELS):
-                        await self.game_loop.clear_output()
+                        result = await self.game_loop.clear_output()
+                        self._require_clear_result(result)
                     else:
                         for channel in stopped_channels:
-                            await self.game_loop.clear_output(channel)
+                            result = await self.game_loop.clear_output(channel)
+                            self._require_clear_result(result, channel)
 
             for channel, runner, directive in submissions:
                 async with self._lock:
@@ -370,11 +399,21 @@ class SessionController:
                 elif self._mode == "autopilot" and self._live_clear_required:
                     await self._pause_live_locked("operator_pause_retry")
                 return self.to_state()
+            if self._status is SessionStatus.FINISHING:
+                if self._mode == "replay" and self._player is not None:
+                    await self._player.pause()
+                    self._set_status(SessionStatus.PAUSED)
+                elif self._mode == "autopilot" and self._live_clear_required:
+                    await self._pause_live_locked("operator_pause_retry")
+                else:
+                    raise RuntimeError("session cleanup is still pending")
+                return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
-                self._set_status(SessionStatus.PAUSED)
+                self._set_status(SessionStatus.FINISHING)
                 await self._player.pause()
+                self._set_status(SessionStatus.PAUSED)
                 return self.to_state()
             if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
                 raise RuntimeError("no running session to pause")
@@ -393,12 +432,15 @@ class SessionController:
                 if cursor is not None:
                     self._player.validate_cursor(cursor)
                 return self.to_state()
+            if self._status is SessionStatus.FINISHING:
+                raise RuntimeError("output clear is still pending")
             if self._status is not SessionStatus.PAUSED:
                 raise RuntimeError("no paused session to resume")
             self._require_estop_inactive()
             if self._mode == "replay":
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
+                self._set_player_output_generations(self._player)
                 await self._player.resume(cursor)
                 self._set_status(SessionStatus.REPLAYING)
                 self._start_player_watcher_locked(self._player)
@@ -413,22 +455,25 @@ class SessionController:
             if self._mode != "autopilot" or self._status not in (
                 SessionStatus.RUNNING,
                 SessionStatus.PAUSED,
+                SessionStatus.FINISHING,
             ):
                 raise RuntimeError("no live session to finish")
             was_paused = self._status is SessionStatus.PAUSED
             self._set_status(SessionStatus.FINISHING)
-            if not was_paused:
+            if not was_paused and self._pause_started_at is None:
                 self._pause_started_at = self._clock()
             # A cancellation can arrive while watcher teardown is still pending.
             # Mark the clear before that first await so stop() can always retry it.
             self._live_clear_required = True
+            self._require_output_clear(_CHANNELS)
             runners = tuple(self._runners.values())
             try:
                 await self._cancel_runner_watchers_locked()
                 await self._quiesce_runners(runners, reason="finish", clear=True)
                 self._require_estop_inactive()
             except BaseException:
-                self._set_status(SessionStatus.PAUSED)
+                if not self._live_clear_required:
+                    self._set_status(SessionStatus.PAUSED)
                 raise
 
             session_id = self._session_id
@@ -466,10 +511,18 @@ class SessionController:
                 elif self._mode == "autopilot" and self._live_clear_required:
                     await self._pause_live_locked("disconnect_retry")
                 return self.to_state()
+            if self._status is SessionStatus.FINISHING:
+                if self._mode == "replay" and self._player is not None:
+                    await self._player.pause()
+                    self._set_status(SessionStatus.PAUSED)
+                elif self._mode == "autopilot" and self._live_clear_required:
+                    await self._pause_live_locked("disconnect_retry")
+                return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is not None:
-                    self._set_status(SessionStatus.PAUSED)
+                    self._set_status(SessionStatus.FINISHING)
                     await self._player.pause()
+                    self._set_status(SessionStatus.PAUSED)
                 return self.to_state()
             if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
                 return self.to_state()
@@ -491,6 +544,7 @@ class SessionController:
             )
             player.load(bundle)
             player.validate_cursor(cursor)
+            self._set_player_output_generations(player)
             self._player = player
             self._mode = "replay"
             self._set_status(SessionStatus.REPLAYING)
@@ -510,6 +564,7 @@ class SessionController:
             if self._status is SessionStatus.IDLE:
                 return self.to_state()
             if self._mode == "replay":
+                self._require_output_clear(_CHANNELS)
                 if self._player_watcher is not None:
                     self._player_watcher.cancel()
                     if self._player_watcher is not asyncio.current_task():
@@ -517,14 +572,17 @@ class SessionController:
                             self._player_watcher, return_exceptions=True
                         )
                 if self._player is not None:
-                    self._set_status(SessionStatus.PAUSED)
+                    self._set_status(SessionStatus.FINISHING)
                     await self._player.stop()
                 self._reset_idle()
                 return self.to_state()
 
             if self._status is SessionStatus.RUNNING:
                 await self._pause_live_locked("stop")
-            elif self._status is SessionStatus.PAUSED and self._live_clear_required:
+            elif self._status in (
+                SessionStatus.PAUSED,
+                SessionStatus.FINISHING,
+            ) and self._live_clear_required:
                 await self._pause_live_locked("stop")
             await self._cancel_runner_watchers_locked()
             await asyncio.gather(
@@ -602,13 +660,16 @@ class SessionController:
         if self._pause_started_at is None:
             self._pause_started_at = self._clock()
         self._live_clear_required = True
+        self._set_status(SessionStatus.FINISHING)
+        self._require_output_clear(_CHANNELS)
+        await self._cancel_runner_watchers_locked()
         try:
-            await self._cancel_runner_watchers_locked()
             await self._quiesce_runners(
                 tuple(self._runners.values()), reason=reason, clear=True
             )
         except BaseException:
-            self._set_status(SessionStatus.PAUSED)
+            if not self._live_clear_required:
+                self._set_status(SessionStatus.PAUSED)
             raise
         self._set_status(SessionStatus.PAUSED)
 
@@ -635,6 +696,7 @@ class SessionController:
         if previous is not None and not previous.done():
             raise RuntimeError("runner cleanup must finish before replacement")
         self._runner_watchers.pop(channel, None)
+        self._claim_output_generations((channel,))
         base_index = max(
             (
                 record.cycle_index
@@ -764,7 +826,11 @@ class SessionController:
         except Exception:
             async with self._lock:
                 if self._player is player and self._status is SessionStatus.REPLAYING:
-                    self._set_status(SessionStatus.PAUSED)
+                    self._set_status(
+                        SessionStatus.PAUSED
+                        if player.cleared
+                        else SessionStatus.FINISHING
+                    )
             return
         async with self._lock:
             if self._player is player and self._status is SessionStatus.REPLAYING:
@@ -809,7 +875,8 @@ class SessionController:
             return
         if state.failure is not None:
             try:
-                await self.game_loop.clear_output(channel)
+                result = await self.game_loop.clear_output(channel)
+                self._require_clear_result(result, channel)
             except Exception:
                 await self._pause_live_locked("runner_clear_failure")
                 return
@@ -829,8 +896,70 @@ class SessionController:
 
     async def _clear_live_output_locked(self) -> None:
         self._live_clear_required = True
-        await self.game_loop.clear_output()
+        self._require_output_clear(_CHANNELS)
+        result = await self.game_loop.clear_output()
+        self._require_clear_result(result)
         self._live_clear_required = False
+
+    def _claim_output_generations(
+        self, channels: Sequence[str]
+    ) -> dict[str, int]:
+        begin = getattr(self.game_loop, "begin_timeline_output", None)
+        if not callable(begin):
+            return {}
+        generations = begin(tuple(channels))
+        if not isinstance(generations, Mapping):
+            raise TypeError("timeline output owner must be a mapping")
+        claimed = {
+            str(channel): int(generation)
+            for channel, generation in generations.items()
+        }
+        expected = {str(channel) for channel in channels}
+        if set(claimed) != expected:
+            raise ValueError(
+                "timeline output owner must provide every requested channel"
+            )
+        self._output_generations.update(claimed)
+        self._runner_executor.update_owner_generations(claimed)
+        return claimed
+
+    def _set_player_output_generations(
+        self, player: RecordedCyclePlayer
+    ) -> None:
+        generations = self._claim_output_generations(_CHANNELS)
+        setter = getattr(player, "set_output_generations", None)
+        if callable(setter) and generations:
+            setter(generations)
+
+    def _require_output_clear(self, channels: Sequence[str]) -> None:
+        require_clear = getattr(self.game_loop, "require_output_clear", None)
+        if callable(require_clear):
+            require_clear(tuple(channels))
+
+    @staticmethod
+    def _require_clear_result(result: object, channel: str | None = None) -> None:
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], Sequence)
+            or isinstance(result[0], (str, bytes))
+            or not isinstance(result[1], Sequence)
+            or isinstance(result[1], (str, bytes))
+            or result[1]
+        ):
+            raise RuntimeError("output clear was not confirmed")
+        expected = (
+            {"op": "stop"}
+            if channel is None
+            else {"op": "clear", "channel": channel}
+        )
+        if not any(
+            isinstance(item, Mapping)
+            and isinstance(item.get("action"), Mapping)
+            and dict(item["action"]) == expected
+            for item in result[0]
+        ):
+            raise RuntimeError("output clear was not confirmed")
 
     def _completed_cycle_records(self) -> tuple[CycleRecord, ...]:
         records = [record for record in self._cycle_records.values() if record.completed]
@@ -971,6 +1100,8 @@ class SessionController:
         self._paused_total_ms = 0
         self._safety_caps = {}
         self._live_clear_required = False
+        self._output_generations = {}
+        self._runner_executor.clear_owner_generations()
 
     def _set_status(self, status: SessionStatus) -> None:
         if self._status is not status:
