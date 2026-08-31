@@ -244,14 +244,23 @@ class ReplayStoreTests(unittest.TestCase):
             path = Path(tmp, "evil.coyote-replay")
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr("../escape.txt", "bad")
-            with self.assertRaises(ReplayStoreError):
+            with (
+                patch.object(
+                    zipfile.ZipFile,
+                    "read",
+                    side_effect=AssertionError("unsafe member payload was read"),
+                ),
+                self.assertRaises(ReplayStoreError),
+            ):
                 ReplayStore(Path(tmp)).load("evil")
 
     def test_incomplete_session_is_not_saved(self):
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
             with self.assertRaisesRegex(ReplayStoreError, "completed"):
                 bundle = make_replay_bundle(gap_tenths=[], status="paused")
-                ReplayStore(Path(tmp)).save(bundle.manifest, bundle.timeline)
+                ReplayStore(root).save(bundle.manifest, bundle.timeline)
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_rejects_unexpected_archive_member(self):
         with tempfile.TemporaryDirectory() as tmp:

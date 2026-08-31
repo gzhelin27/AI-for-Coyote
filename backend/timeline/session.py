@@ -14,6 +14,7 @@ from typing import Any
 from .cycle_runner import ChannelCycleRunner, CycleDirective, RunnerPhase
 from .models import (
     SCHEMA_VERSION,
+    ChannelPlaybackState,
     CycleGapPolicy,
     CycleRecord,
     DirectiveMode,
@@ -60,6 +61,7 @@ class SessionController:
         seed_factory: Callable[[], int] | None = None,
         frames: Mapping[str, Sequence[str]] | None = None,
         strength_jitter: int = 4,
+        waveform_policy: str = "all_allowed",
         cycle_gap_policy: CycleGapPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Any | None = None,
@@ -94,6 +96,8 @@ class SessionController:
             or strength_jitter < 0
         ):
             raise ValueError("strength_jitter must be a non-negative integer")
+        if waveform_policy != "all_allowed":
+            raise ValueError("waveform_policy must be all_allowed for MVP1")
         if not callable(clock):
             raise TypeError("clock must be callable")
         sleeper = _AsyncioSleeper() if sleeper is None else sleeper
@@ -105,6 +109,7 @@ class SessionController:
         self.seed = 0 if seed is None else seed
         self._seed_factory = seed_factory
         self.strength_jitter = strength_jitter
+        self.waveform_policy = waveform_policy
         self.policy = cycle_gap_policy or CycleGapPolicy()
         self._clock = clock
         self._sleeper = sleeper
@@ -314,6 +319,49 @@ class SessionController:
                     raise
             return resolved
 
+    async def suspend_channel_for_safety(
+        self, channel: str, *, reason: str
+    ) -> bool:
+        """Quiesce one live runner before an authoritative safety transition.
+
+        The return value says whether the retained directive may be restarted
+        after the physical reduction/clear has succeeded.
+        """
+        if channel not in _CHANNELS:
+            raise ValueError("channel must be A or B")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be a non-empty string")
+        async with self._turn_lock:
+            async with self._lock:
+                if (
+                    self._status is not SessionStatus.RUNNING
+                    or self._mode != "autopilot"
+                ):
+                    return False
+                if channel in self._runners:
+                    await self._retire_runner_locked(channel, reason)
+                return channel in self._retained
+
+    async def resume_channel_after_safety(self, channel: str) -> None:
+        """Restart a retained live directive only after safety is enforced."""
+        if channel not in _CHANNELS:
+            raise ValueError("channel must be A or B")
+        async with self._turn_lock:
+            async with self._lock:
+                if (
+                    self._status is not SessionStatus.RUNNING
+                    or self._mode != "autopilot"
+                    or not self._enabled_channels().get(channel, False)
+                ):
+                    return
+                directive = self._retained.get(channel)
+                if directive is None:
+                    return
+                runner = self._runners.get(channel)
+                if runner is None:
+                    runner = self._install_runner(channel)
+                await runner.submit(directive)
+
     async def pause(self) -> SessionState:
         async with self._lock:
             if self._status is SessionStatus.PAUSED:
@@ -508,7 +556,47 @@ class SessionController:
             cursor=cursor,
             current_event_id=self._current_event_id,
             adjusted=adjusted,
+            channels=self.channel_states(),
         )
+
+    def channel_states(self) -> dict[str, ChannelPlaybackState]:
+        """Expose only operator-safe live/replay scheduling state."""
+        if self._mode == "replay" and self._player is not None:
+            return {
+                channel: ChannelPlaybackState.from_dict(value)
+                for channel, value in self._player.channel_states().items()
+            }
+        if self._mode != "autopilot" or self._status is SessionStatus.IDLE:
+            return {channel: ChannelPlaybackState() for channel in _CHANNELS}
+
+        channels: dict[str, ChannelPlaybackState] = {}
+        for channel in _CHANNELS:
+            runner = self._runners.get(channel)
+            runner_state = runner.state() if runner is not None else None
+            if self._status is SessionStatus.PAUSED:
+                channels[channel] = ChannelPlaybackState(
+                    phase="paused",
+                    cycle_index=(runner_state.cycle_index if runner_state else 0),
+                )
+                continue
+            if runner_state is None:
+                channels[channel] = ChannelPlaybackState()
+                continue
+            phase = runner_state.phase.value
+            directive = runner_state.directive
+            active = phase in ("cycle", "gap") and directive is not None
+            channels[channel] = ChannelPlaybackState(
+                phase=phase,
+                pattern=directive.pattern if active else None,
+                strength=(
+                    int(self.game_loop.safety.current.get(channel, 0))
+                    if active and hasattr(self.game_loop, "safety")
+                    else 0
+                ),
+                cycle_index=runner_state.cycle_index,
+                next_cycle_start_ms=runner_state.next_cycle_start_ms,
+            )
+        return channels
 
     async def _pause_live_locked(self, reason: str) -> None:
         if self._pause_started_at is None:
@@ -778,6 +866,7 @@ class SessionController:
             mode="autopilot",
             random_profile={
                 "strength_jitter": self.strength_jitter,
+                "waveform_policy": self.waveform_policy,
                 "cycle_gap": self.policy.to_dict(),
             },
             safety_caps=dict(self._safety_caps),

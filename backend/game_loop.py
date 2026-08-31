@@ -58,6 +58,7 @@ class GameLoop:
         self.autopilot_task: asyncio.Task | None = None
         self.autopilot_stop = asyncio.Event()
         self._autopilot_transition_lock = asyncio.Lock()
+        self._action_lock = asyncio.Lock()
         self.on_ai_turn = None                 # 由 AppState 注入：把 AI 主动回合推送到页面
         self.timeline_session = None            # 由 AppState 注入：确定性会话/重放控制器
 
@@ -141,34 +142,9 @@ class GameLoop:
             for preset in state.get("presets", [])
         ]
         if self.timeline_session is not None:
-            state["session"] = self.timeline_session.to_state().to_dict()
-            runners = self.timeline_session.runners
-            state["runners"] = {}
-            for channel in ("A", "B"):
-                runner = runners.get(channel)
-                if runner is None:
-                    state["runners"][channel] = {
-                        "phase": "idle",
-                        "pattern": None,
-                        "strength": 0,
-                        "cycle_index": 0,
-                        "next_cycle_start_ms": None,
-                    }
-                    continue
-                runner_state = runner.state()
-                directive = runner_state.directive
-                state["runners"][channel] = {
-                    "phase": runner_state.phase.value,
-                    "pattern": (
-                        directive.pattern
-                        if directive is not None
-                        and runner_state.phase.value in ("cycle", "gap")
-                        else None
-                    ),
-                    "strength": int(self.safety.current.get(channel, 0)),
-                    "cycle_index": runner_state.cycle_index,
-                    "next_cycle_start_ms": runner_state.next_cycle_start_ms,
-                }
+            session_state = self.timeline_session.to_state().to_dict()
+            state["session"] = session_state
+            state["runners"] = dict(session_state["channels"])
         return state
 
     # ---------- 用户回合 ----------
@@ -371,6 +347,57 @@ class GameLoop:
             session_state = await self.timeline_session.resume(cursor)
             self._start_autopilot_task()
             return session_state
+
+    async def start_replay_session(self, replay_id: str, cursor: int = 0):
+        """Start replay through the same cancellation-safe lifecycle boundary."""
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            return await self._await_timeline_lifecycle(
+                lambda: self.timeline_session.start_replay(
+                    replay_id, cursor=cursor
+                )
+            )
+
+    async def pause_replay_session(self):
+        """Pause replay without allowing request cancellation to skip clear."""
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            if self.timeline_session.to_state().mode != "replay":
+                raise RuntimeError("no replay playback to pause")
+            return await self._await_timeline_lifecycle(
+                self.timeline_session.pause
+            )
+
+    async def resume_replay_session(self):
+        """Resume replay through the owned lifecycle task."""
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            if self.timeline_session.to_state().mode != "replay":
+                raise RuntimeError("no replay playback to resume")
+            return await self._await_timeline_lifecycle(
+                self.timeline_session.resume
+            )
+
+    async def execute_manual_action(self, action: dict) -> tuple[list, list]:
+        """Quiesce recorded playback before issuing unrecorded manual output."""
+        async with self._autopilot_transition_lock:
+            controller = self.timeline_session
+            if controller is not None:
+                session_state = controller.to_state()
+                if session_state.mode == "autopilot" and session_state.status.value in (
+                    "running",
+                    "paused",
+                ):
+                    try:
+                        await self._await_timeline_lifecycle(controller.pause)
+                    finally:
+                        await self._stop_autopilot_task()
+                elif session_state.mode == "replay":
+                    await self._await_timeline_lifecycle(controller.stop)
+            return await self.execute_actions([action])
 
     async def set_autopilot(self, enabled: bool) -> None:
         """开启/关闭自动运行：AI 每 interval_s 秒自主观察、描写、调整设备并发言。"""
@@ -584,7 +611,7 @@ class GameLoop:
     async def _ensure_default_wave(
         self, ch_name: str, client_id: str | None, slot_id: str | None,
         ready: bool, dry_run: bool,
-    ) -> None:
+    ) -> bool:
         """给通道挂默认持续波形（强度没有波形承载时设备无输出）。"""
         pattern = str(self.cfg["ui"].get("default_wave", "呼吸") or "呼吸")
         meta = self.safety.presets.get(pattern)
@@ -592,16 +619,21 @@ class GameLoop:
             pattern = next(iter(self.safety.presets))
             meta = self.safety.presets[pattern]
         if not meta:
-            return
+            return False
         cmd = {
             "kind": "pulse_hold", "channel": ch_name, "pattern": pattern,
             "wave_key": meta["waveform"], "frames": meta["frames"],
         }
         if ready and not dry_run:
-            await self._start_pulse_loop(client_id, slot_id, CHANNEL[ch_name], ch_name, cmd)
+            sent = await self._start_pulse_loop(
+                client_id, slot_id, CHANNEL[ch_name], ch_name, cmd
+            )
+            if not sent:
+                return False
         self.patterns[ch_name] = pattern
         self.safety.record(cmd)
         logger.info("自动挂载默认波形：%s 通道「%s」（强度需波形承载）", ch_name, pattern)
+        return True
 
     async def _apply_channel_floor(self) -> None:
         """双通道保底：两轮后 A/B 都必须有波形且强度≠0；每 2 轮内强度与波形至少各调一次。"""
@@ -658,7 +690,132 @@ class GameLoop:
             if fixed:
                 logger.info("通道保底：%s 通道强度/波形已自动补齐（第 %d 轮）", ch, self.turn_count)
 
+    async def set_runtime_cap(self, channel: str, value: int) -> dict:
+        """Atomically lower a runtime cap, physically enforce it, then reconcile live output."""
+        channel = self.safety.norm_channel(channel)
+        requested_cap = max(1, min(self.safety.caps[channel], int(value)))
+        old_effective_cap = self.safety.cap_for(channel)
+        new_effective_cap = min(old_effective_cap, requested_cap)
+        should_reconcile = new_effective_cap < old_effective_cap
+        restart = False
+        controller = self.timeline_session
+        if should_reconcile and controller is not None:
+            restart = await controller.suspend_channel_for_safety(
+                channel, reason="runtime_cap"
+            )
+
+        executed: list = []
+        dropped: list = []
+        async with self._action_lock:
+            physical_before = int(self.safety.current.get(channel, 0))
+            applied = self.safety.set_user_cap(channel, requested_cap)
+            effective_cap = self.safety.cap_for(channel)
+            if physical_before > effective_cap:
+                executed, dropped = await self._execute_actions_locked(
+                    [
+                        {
+                            "op": "hold_strength",
+                            "channel": channel,
+                            "value": effective_cap,
+                        }
+                    ]
+                )
+
+        if restart and not dropped:
+            await controller.resume_channel_after_safety(channel)
+        return {
+            "value": applied,
+            "effective_cap": self.safety.cap_for(channel),
+            "executed": executed,
+            "dropped": dropped,
+        }
+
+    async def set_channel_enabled(self, channel: str, enabled: bool) -> dict:
+        """Quiesce a live runner before disabling and physically clearing a channel."""
+        channel = self.safety.norm_channel(channel)
+        controller = self.timeline_session
+        restart = False
+        if not enabled and controller is not None:
+            restart = await controller.suspend_channel_for_safety(
+                channel, reason="channel_disabled"
+            )
+
+        executed: list = []
+        dropped: list = []
+        async with self._action_lock:
+            self.safety.set_channel_enabled(channel, enabled)
+            if not enabled:
+                executed, dropped = await self._execute_actions_locked(
+                    [{"op": "clear", "channel": channel}]
+                )
+
+        if enabled and controller is not None:
+            await controller.resume_channel_after_safety(channel)
+        return {
+            "enabled": bool(enabled),
+            "executed": executed,
+            "dropped": dropped,
+            "runner_was_active": restart,
+        }
+
+    async def update_device_state(
+        self, props: dict | None, slot_state: dict | None
+    ) -> dict[str, dict]:
+        """Apply device feedback and enforce newly lowered overheat caps."""
+        slot_state = slot_state if isinstance(slot_state, dict) else {}
+        lowering: list[str] = []
+        for channel, key in (("A", "channelA"), ("B", "channelB")):
+            channel_state = slot_state.get(key)
+            comfort = (
+                channel_state.get("comfortLimit")
+                if isinstance(channel_state, dict)
+                else None
+            )
+            if not isinstance(comfort, dict) or "overheat" not in comfort:
+                continue
+            old_cap = self.safety.cap_for(channel)
+            overheat = bool(comfort["overheat"])
+            new_cap = min(
+                self.safety.caps[channel],
+                self.safety.user_caps.get(channel, self.safety.caps[channel]),
+            )
+            if overheat:
+                new_cap = min(new_cap, self.safety.overheat_reduce_to)
+            if new_cap < old_cap:
+                lowering.append(channel)
+
+        controller = self.timeline_session
+        restart: dict[str, bool] = {}
+        if controller is not None:
+            for channel in lowering:
+                restart[channel] = await controller.suspend_channel_for_safety(
+                    channel, reason="overheat"
+                )
+
+        results: dict[str, dict] = {}
+        async with self._action_lock:
+            self.safety.update_device_state(props, slot_state)
+            for channel in lowering:
+                cap = self.safety.cap_for(channel)
+                if self.safety.current[channel] <= cap:
+                    results[channel] = {"executed": [], "dropped": []}
+                    continue
+                executed, dropped = await self._execute_actions_locked(
+                    [{"op": "hold_strength", "channel": channel, "value": cap}]
+                )
+                results[channel] = {"executed": executed, "dropped": dropped}
+
+        if controller is not None:
+            for channel in lowering:
+                if restart.get(channel) and not results[channel]["dropped"]:
+                    await controller.resume_channel_after_safety(channel)
+        return results
+
     async def execute_actions(self, actions: list) -> tuple[list, list]:
+        async with self._action_lock:
+            return await self._execute_actions_locked(actions)
+
+    async def _execute_actions_locked(self, actions: list) -> tuple[list, list]:
         """校验并执行动作列表，返回 (已执行说明列表, 被拒绝说明列表)。"""
         executed, dropped = [], []
         if not isinstance(actions, list):
@@ -690,12 +847,6 @@ class GameLoop:
                 dropped.append({"action": action, "reason": "设备未连接（无 clientId/slotId）"})
                 continue
 
-            # 记录每通道最近一次强度/波形调整轮次（保底规则用）
-            if cmd["kind"] in ("hold", "add", "temp") and cmd.get("channel") in ("A", "B"):
-                self.last_strength[cmd["channel"]] = self.turn_count
-            if cmd["kind"] in ("pulse", "pulse_hold", "pulse_cycle") and cmd.get("channel") in ("A", "B"):
-                self.last_wave[cmd["channel"]] = self.turn_count
-
             # 强度类动作必须有波形承载才有输出（DG-LAB 特性）：通道无波形时自动挂默认波形
             if cmd["kind"] in ("hold", "add", "temp") and cmd.get("channel") in ("A", "B"):
                 ch_name = cmd["channel"]
@@ -704,19 +855,58 @@ class GameLoop:
                     and ch_name not in self.loop_tasks
                     and not self.safety.pulse_active().get(ch_name)
                 ):
-                    await self._ensure_default_wave(ch_name, client_id, slot_id, ready, dry_run)
+                    try:
+                        wave_ready = await self._ensure_default_wave(
+                            ch_name, client_id, slot_id, ready, dry_run
+                        )
+                    except Exception as exc:
+                        dropped.append(
+                            self._transport_failure(
+                                action,
+                                cmd,
+                                f"默认波形发送失败: {exc}",
+                                sent=False,
+                            )
+                        )
+                        continue
+                    if not wave_ready:
+                        dropped.append(
+                            self._transport_failure(
+                                action, cmd, "默认波形发送失败", sent=False
+                            )
+                        )
+                        continue
 
             if cmd["kind"] == "pulse_hold":
                 # 循环波形：程序周期性重发（不依赖 App 的 d=0），直到清除/急停
                 sent = False
                 if ready and not dry_run:
-                    sent = await self._start_pulse_loop(
-                        client_id, slot_id,
-                        CHANNEL[cmd["channel"]], cmd["channel"], cmd,
+                    try:
+                        sent = await self._start_pulse_loop(
+                            client_id, slot_id,
+                            CHANNEL[cmd["channel"]], cmd["channel"], cmd,
+                        )
+                    except Exception as exc:
+                        dropped.append(
+                            self._transport_failure(
+                                action,
+                                cmd,
+                                f"设备发送失败: {exc}",
+                                sent=False,
+                            )
+                        )
+                        continue
+                if not dry_run and not sent:
+                    dropped.append(
+                        self._transport_failure(
+                            action, cmd, "设备发送失败", sent=False
+                        )
                     )
+                    continue
                 if cmd.get("channel") in ("A", "B"):
                     self.patterns[cmd["channel"]] = cmd.get("pattern")
                 self.safety.record(cmd)
+                self._record_success_turn(cmd)
                 label = self._describe(cmd)
                 executed.append({
                     "action": action,
@@ -728,22 +918,52 @@ class GameLoop:
                 logger.info("执行动作: %s（循环播放中）", label)
                 continue
 
+            clear_target = "unchanged"
             if cmd["kind"] in ("clear", "stop"):
                 # 清除/停止先取消该通道（或全部）的循环波形
-                self._cancel_loops(None if cmd["kind"] == "stop" or cmd["channel"] is None else cmd["channel"])
-                if cmd["kind"] == "stop" or cmd["channel"] is None:
-                    self.patterns = {"A": None, "B": None}
-                elif cmd["channel"] in ("A", "B"):
-                    self.patterns[cmd["channel"]] = None
-
-            if cmd["kind"] in ("pulse", "pulse_cycle") and cmd.get("channel") in ("A", "B"):
-                self.patterns[cmd["channel"]] = cmd.get("pattern")
+                clear_target = (
+                    None
+                    if cmd["kind"] == "stop" or cmd["channel"] is None
+                    else cmd["channel"]
+                )
+                self._cancel_loops(clear_target)
 
             frames = self._build_frames(cmd, client_id, slot_id)
             sent = False
             if ready and not dry_run:
-                sent = all(await self._send_all(frames))
+                try:
+                    sent = all(await self._send_all(frames))
+                except Exception as exc:  # transport exceptions are failed sends
+                    dropped.append(
+                        self._transport_failure(
+                            action, cmd, f"设备发送失败: {exc}", sent=False
+                        )
+                    )
+                    continue
+                if not sent:
+                    dropped.append(
+                        self._transport_failure(
+                            action, cmd, "设备发送失败", sent=False
+                        )
+                    )
+                    continue
+
+            if clear_target is None:
+                self.patterns = {"A": None, "B": None}
+            elif clear_target in ("A", "B"):
+                self.patterns[clear_target] = None
+            elif cmd["kind"] in ("pulse", "pulse_cycle") and cmd.get("channel") in ("A", "B"):
+                self.patterns[cmd["channel"]] = cmd.get("pattern")
             self.safety.record(cmd)
+            if cmd["kind"] == "temp" and ready and not dry_run:
+                self._schedule_temp_revert(
+                    client_id,
+                    slot_id,
+                    CHANNEL[cmd["channel"]],
+                    cmd["channel"],
+                    cmd["duration_s"],
+                )
+            self._record_success_turn(cmd)
             label = self._describe(cmd)
             executed.append({
                 "action": action,
@@ -759,6 +979,33 @@ class GameLoop:
                 "已发送" if sent else "模拟",
             )
         return executed, dropped
+
+    def _record_success_turn(self, cmd: dict) -> None:
+        channel = cmd.get("channel")
+        if channel not in ("A", "B"):
+            return
+        if cmd["kind"] in ("hold", "add", "temp"):
+            self.last_strength[channel] = self.turn_count
+        if cmd["kind"] in ("pulse", "pulse_hold", "pulse_cycle"):
+            self.last_wave[channel] = self.turn_count
+
+    def _transport_failure(
+        self, action: dict, cmd: dict, reason: str, *, sent: bool
+    ) -> dict:
+        effective = self._effective_result(action, cmd)
+        channel = cmd.get("channel")
+        if channel in ("A", "B") and "effective_strength" in effective:
+            effective["effective_strength"] = int(
+                self.safety.current.get(channel, 0)
+            )
+        if cmd["kind"] == "add":
+            effective["effective_delta"] = 0
+        return {
+            "action": action,
+            "effective": effective,
+            "reason": reason,
+            "sent": sent,
+        }
 
     async def clear_output(self, channel=None) -> tuple[list, list]:
         """物理清除输出，不触发或改变急停状态。"""
@@ -805,7 +1052,6 @@ class GameLoop:
             delta = cmd["value"] - self.safety.current[ch_name]
             if delta:
                 frames.append(self.ops.add_strength(client_id, slot_id, ch, delta))
-            self._schedule_temp_revert(client_id, slot_id, ch, ch_name, cmd["duration_s"])
         elif kind == "hold":
             # 持续强度：加差值到目标（AddIntensity 是实测可靠的原语）
             delta = cmd["value"] - self.safety.current[ch_name]
@@ -918,13 +1164,13 @@ class GameLoop:
             )
         wait_s = max(0.1, batch_s - overlap)
 
+        if not all(await self._send_all([next_frame()])):
+            return False
+
         stop_event = asyncio.Event()
         self.loop_events[ch_name] = stop_event
 
         async def worker() -> None:
-            ok = await self._send_all([next_frame()])
-            if not ok:
-                return
             logger.info(
                 "%s 通道循环波形开始：%s（批次 %.1fs，提前 %.2fs 覆盖）",
                 ch_name, cmd["pattern"], batch_s, overlap,

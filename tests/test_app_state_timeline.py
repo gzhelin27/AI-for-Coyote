@@ -143,6 +143,35 @@ class ProductionAppStateTimelineTests(unittest.IsolatedAsyncioTestCase):
             ("model-two", "role-two", "profile-two", "dlc-two"),
         )
 
+    async def test_manifest_uses_nonempty_app_dlc_and_waveform_policy_provenance(self):
+        self.cfg["character"].pop("dlc_version")
+        with (
+            self._fake_external_dependencies(),
+            patch.object(main_module, "_app_version", return_value="commit-provenance"),
+        ):
+            state = main_module.AppState(self.cfg)
+            await state.loop.start_timeline_session()
+            summary = await state.loop.finish_timeline_session()
+
+        manifest = state.replay_store.load(summary.replay_id).manifest
+        self.assertEqual(manifest.app_commit, "commit-provenance")
+        self.assertRegex(manifest.dlc_version, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(
+            manifest.random_profile["waveform_policy"], "all_allowed"
+        )
+
+    def test_source_app_version_fallback_is_a_fingerprint_not_dev(self):
+        source_root = self.root / "source"
+        source_root.mkdir()
+        (source_root / "version.txt").unlink(missing_ok=True)
+        with (
+            patch.object(main_module, "PROJECT_ROOT", source_root),
+            patch.object(main_module.subprocess, "run", side_effect=OSError("no git")),
+        ):
+            version = main_module._app_version()
+
+        self.assertRegex(version, r"^source-sha256:[0-9a-f]{64}$")
+
     async def test_real_app_lifespan_stops_active_replay_without_archive_when_auto_clear_off(self):
         self.cfg["safety"]["auto_clear_on_disconnect"] = False
         with self._fake_external_dependencies():

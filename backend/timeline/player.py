@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -54,6 +55,7 @@ class RecordedCyclePlayer:
         self._active_elapsed_ms = 0
         self._segment_started_at: float | None = None
         self._failure: ReplayPlaybackError | None = None
+        self._started_cycles: dict[str, tuple[int, CycleRecord, int]] = {}
         self._lock = asyncio.Lock()
         self._clear_lock = asyncio.Lock()
 
@@ -80,6 +82,44 @@ class RecordedCyclePlayer:
     @property
     def failure(self) -> ReplayPlaybackError | None:
         return self._failure
+
+    def channel_states(self) -> dict[str, dict[str, Any]]:
+        """Return redacted per-channel replay progress for public state."""
+        states: dict[str, dict[str, Any]] = {}
+        now_ms = self._active_now_ms()
+        for channel in ("A", "B"):
+            phase = "paused" if self._paused else "idle"
+            pattern: str | None = None
+            strength = 0
+            cycle_index = 0
+            next_cycle_start_ms: int | None = None
+            started = self._started_cycles.get(channel)
+            if self._running and started is not None:
+                ordered_index, record, effective_strength = started
+                raw_end = record.active_start_offset_ms + record.raw_duration_ms
+                gap_end = raw_end + record.actual_gap_ms
+                if now_ms < raw_end:
+                    phase = "cycle"
+                elif now_ms < gap_end:
+                    phase = "gap"
+                pattern = record.pattern if phase in ("cycle", "gap") else None
+                strength = effective_strength if pattern is not None else 0
+                cycle_index = record.cycle_index
+                next_cycle_start_ms = self._next_channel_start(
+                    channel, ordered_index
+                )
+            elif self._running:
+                next_cycle_start_ms = self._next_channel_start(
+                    channel, self._cursor - 1
+                )
+            states[channel] = {
+                "phase": phase,
+                "pattern": pattern,
+                "strength": strength,
+                "cycle_index": cycle_index,
+                "next_cycle_start_ms": next_cycle_start_ms,
+            }
+        return states
 
     def validate_cursor(self, cursor: int) -> None:
         if (
@@ -118,6 +158,7 @@ class RecordedCyclePlayer:
         self._active_elapsed_ms = 0
         self._segment_started_at = None
         self._failure = None
+        self._started_cycles = {}
 
     async def start(self) -> None:
         async with self._lock:
@@ -147,6 +188,7 @@ class RecordedCyclePlayer:
                 return self._cursor
             if not self._paused:
                 self._capture_active_elapsed()
+                self._rewind_interrupted_cycles()
                 self._paused = True
                 self._running = False
                 if task is not None and not task.done():
@@ -178,6 +220,7 @@ class RecordedCyclePlayer:
             self._running = True
             self._cleared = False
             self._failure = None
+            self._started_cycles = {}
             self._segment_started_at = self._clock()
             self._task = asyncio.create_task(
                 self._run(), name="timeline-recorded-cycle-player"
@@ -206,11 +249,17 @@ class RecordedCyclePlayer:
     async def _run(self) -> None:
         try:
             while self._cursor < len(self._ordered_cycles):
+                ordered_index = self._cursor
                 record = self._ordered_cycles[self._cursor]
                 remaining_ms = record.active_start_offset_ms - self._active_now_ms()
                 if remaining_ms > 0:
                     await self._sleeper.sleep(remaining_ms)
-                await self._play_cycle(record)
+                effective_strength = await self._play_cycle(record)
+                self._started_cycles[record.channel] = (
+                    ordered_index,
+                    record,
+                    effective_strength,
+                )
                 self._cursor += 1
             final_remaining_ms = self._playback_end_offset_ms() - self._active_now_ms()
             if final_remaining_ms > 0:
@@ -238,7 +287,14 @@ class RecordedCyclePlayer:
                 raise
             raise self._failure from exc
 
-    async def _play_cycle(self, record: CycleRecord) -> None:
+    async def _play_cycle(self, record: CycleRecord) -> int:
+        authoritative_hash = self._authoritative_waveform_hash(record.pattern)
+        if authoritative_hash is None:
+            raise ReplayPlaybackError(
+                f"authoritative waveform is unavailable: {record.pattern}"
+            )
+        if authoritative_hash != record.waveform_hash:
+            self._adjusted = True
         actions = [
             {
                 "op": "hold_strength",
@@ -285,6 +341,8 @@ class RecordedCyclePlayer:
             self._adjusted = True
         if any(cycle_result.get(key) != value for key, value in expected_cycle.items()):
             self._adjusted = True
+        value = cycle_result.get("effective_strength")
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
     async def _clear_once(self) -> None:
         async with self._clear_lock:
@@ -307,11 +365,57 @@ class RecordedCyclePlayer:
     def _playback_end_offset_ms(self) -> int:
         return max(
             (
-                cycle.active_start_offset_ms + cycle.raw_duration_ms
+                cycle.active_start_offset_ms
+                + cycle.raw_duration_ms
+                + cycle.actual_gap_ms
                 for cycle in self._ordered_cycles
             ),
             default=0,
         )
+
+    def _rewind_interrupted_cycles(self) -> None:
+        interrupted = [
+            (ordered_index, record)
+            for ordered_index, record, _strength in self._started_cycles.values()
+            if (
+                record.active_start_offset_ms
+                <= self._active_elapsed_ms
+                < record.active_start_offset_ms + record.raw_duration_ms
+            )
+        ]
+        if interrupted:
+            ordered_index, record = min(interrupted, key=lambda value: value[0])
+            self._cursor = min(self._cursor, ordered_index)
+            self._active_elapsed_ms = min(
+                self._active_elapsed_ms, record.active_start_offset_ms
+            )
+        self._started_cycles = {}
+
+    def _next_channel_start(
+        self, channel: str, after_ordered_index: int
+    ) -> int | None:
+        for index, record in enumerate(self._ordered_cycles):
+            if index > after_ordered_index and record.channel == channel:
+                return record.active_start_offset_ms
+        return None
+
+    def _authoritative_waveform_hash(self, pattern: str) -> str | None:
+        safety = getattr(self._executor, "safety", None)
+        presets = getattr(safety, "presets", None)
+        if not isinstance(presets, Mapping):
+            return None
+        metadata = presets.get(pattern)
+        if not isinstance(metadata, Mapping):
+            return None
+        frames = metadata.get("frames")
+        if (
+            not isinstance(frames, Sequence)
+            or isinstance(frames, (str, bytes))
+            or not frames
+            or not all(isinstance(frame, str) and frame for frame in frames)
+        ):
+            return None
+        return hashlib.sha256("\0".join(frames).encode("utf-8")).hexdigest()
 
     @staticmethod
     def _effective_for(

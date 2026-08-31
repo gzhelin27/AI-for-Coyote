@@ -2,6 +2,7 @@
 
 from .models import (
     ChannelDirective,
+    ChannelPlaybackState,
     CycleGapPolicy,
     CycleRecord,
     DirectiveMode,
@@ -14,6 +15,7 @@ from .models import (
 
 __all__ = [
     "ChannelDirective",
+    "ChannelPlaybackState",
     "CycleGapPolicy",
     "CycleRecord",
     "DirectiveMode",

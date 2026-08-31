@@ -1,7 +1,7 @@
 import asyncio
 from copy import deepcopy
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from backend.config import DEFAULTS
 from backend.game_loop import GameLoop
@@ -57,6 +57,18 @@ class YieldingConnectedRelay(ConnectedRelay):
         return await super().send_frame(frame)
 
 
+class RejectingConnectedRelay(ConnectedRelay):
+    async def send_frame(self, frame):
+        self.sent_frames.append(frame)
+        return False
+
+
+class RaisingConnectedRelay(ConnectedRelay):
+    async def send_frame(self, frame):
+        self.sent_frames.append(frame)
+        raise OSError("relay write failed")
+
+
 def make_game_loop_for_test(*, pattern="呼吸", frames=None):
     cfg = deepcopy(DEFAULTS)
     cfg["app"]["dry_run"] = False
@@ -73,6 +85,76 @@ def make_game_loop_for_test(*, pattern="呼吸", frames=None):
 
 
 class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hold_strength_send_false_is_dropped_without_state_mutation(self):
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a"])
+        loop.relay = RejectingConnectedRelay()
+        # Keep the test focused on the strength transport rather than the legacy
+        # automatic-wave fallback.
+        loop.safety.pulse_until["A"] = float("inf")
+
+        executed, dropped = await loop.execute_actions(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertFalse(dropped[0]["sent"])
+        self.assertEqual(dropped[0]["effective"]["effective_strength"], 0)
+        self.assertEqual(loop.safety.current["A"], 0)
+        self.assertEqual(loop.last_strength["A"], 0)
+
+    async def test_hold_strength_transport_exception_is_a_safe_drop(self):
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a"])
+        loop.relay = RaisingConnectedRelay()
+
+        executed, dropped = await loop.execute_actions(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertFalse(dropped[0]["sent"])
+        self.assertIn("relay write failed", dropped[0]["reason"])
+        self.assertEqual(loop.safety.current["A"], 0)
+        self.assertIsNone(loop.patterns["A"])
+
+    async def test_pulse_cycle_send_false_is_dropped_without_playback_state(self):
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a", "b"])
+        loop.relay = RejectingConnectedRelay()
+        loop.safety.current["A"] = 12
+
+        executed, dropped = await loop.execute_actions(
+            [{"op": "pulse_cycle", "channel": "A", "pattern": "呼吸"}]
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertFalse(dropped[0]["sent"])
+        self.assertEqual(dropped[0]["effective"]["effective_strength"], 12)
+        self.assertEqual(loop.patterns["A"], None)
+        self.assertFalse(loop.safety.pulse_active()["A"])
+
+    async def test_failed_temp_strength_does_not_schedule_a_later_revert(self):
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a"])
+        loop.relay = RejectingConnectedRelay()
+        loop.safety.pulse_until["A"] = float("inf")
+        loop._schedule_temp_revert = Mock()
+
+        executed, dropped = await loop.execute_actions(
+            [
+                {
+                    "op": "temp_strength",
+                    "channel": "A",
+                    "value": 20,
+                    "duration_s": 1,
+                }
+            ]
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(dropped), 1)
+        loop._schedule_temp_revert.assert_not_called()
+
     async def test_pulse_cycle_sends_one_unrepeated_frame_sequence(self):
         loop = make_game_loop_for_test(pattern="呼吸", frames=["a", "b", "c"])
         executed, dropped = await loop.execute_actions([

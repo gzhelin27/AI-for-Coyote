@@ -1,6 +1,7 @@
 import unittest
 
 from backend.timeline.models import (
+    ChannelPlaybackState,
     ChannelDirective, CycleGapPolicy, CycleRecord, DirectiveMode, PlotEvent,
     ReplayManifest, SessionState, SessionStatus, Timeline,
 )
@@ -118,6 +119,16 @@ class TimelineModelTests(unittest.TestCase):
             cursor=2,
             current_event_id="evt-000002",
             adjusted=True,
+            channels={
+                "A": ChannelPlaybackState(
+                    phase="cycle",
+                    pattern="呼吸",
+                    strength=17,
+                    cycle_index=3,
+                    next_cycle_start_ms=900,
+                ),
+                "B": ChannelPlaybackState(),
+            },
         )
         self.assertEqual(ReplayManifest.from_dict(manifest.to_dict()), manifest)
         self.assertEqual(SessionState.from_dict(state.to_dict()), state)

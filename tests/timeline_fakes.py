@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import tempfile
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +25,7 @@ from backend.timeline.models import (
     Timeline,
 )
 from backend.timeline.player import RecordedCyclePlayer
-from backend.timeline.replay_store import ReplayStore
+from backend.timeline.replay_store import ReplayStore, ReplaySummary
 
 
 @dataclass
@@ -695,6 +696,204 @@ class SessionHarness:
         self._temporary.cleanup()
 
 
+class _CountingCycleRandom:
+    """Count policy samples while retaining the real seeded Random behavior."""
+
+    def __init__(self, seed: int) -> None:
+        self._random = random.Random(seed)
+        self.calls = 0
+
+    def randrange(self, *args: Any) -> int:
+        self.calls += 1
+        return self._random.randrange(*args)
+
+    def randint(self, start: int, stop: int) -> int:
+        return self._random.randint(start, stop)
+
+
+class _TimelineRelay:
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+
+    def first_client_id(self) -> str:
+        return "integration-client"
+
+    def get_slot_id(self, _client_id: str | None = None) -> str:
+        return "integration-slot"
+
+    async def send_frame(self, frame: dict[str, Any]) -> bool:
+        self.frames.append(frame)
+        return True
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "status": "paired",
+            "controller_id": "integration-controller",
+            "url": "ws://integration.invalid",
+            "clients": [],
+            "last_error": "",
+        }
+
+
+class TimelineHarness:
+    """Real MVP1 composition with only time, relay, and storage controlled."""
+
+    def __init__(self) -> None:
+        raise RuntimeError("use TimelineHarness.create")
+
+    @classmethod
+    async def create(cls, seed: int, dry_run: bool) -> "TimelineHarness":
+        from backend.config import DEFAULTS
+        from backend.game_loop import GameLoop
+        from backend.safety import SafetyManager
+        from backend.timeline.models import CycleGapPolicy
+        from backend.timeline.randomizer import derive_stream_seed
+        from backend.timeline.session import SessionController
+
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
+        if not isinstance(dry_run, bool):
+            raise ValueError("dry_run must be a boolean")
+
+        self = object.__new__(cls)
+        self._temporary = tempfile.TemporaryDirectory()
+        self.clock = ControlledSleeper()
+        self.relay = _TimelineRelay()
+        cfg = deepcopy(DEFAULTS)
+        cfg["app"]["dry_run"] = dry_run
+        cfg["autopilot"] = {"enabled": False, "interval_s": 12}
+        cfg["character"] = {
+            "name": "MVP1 Integration",
+            "role": "integration",
+            "role_title": "operator",
+            "roles": [],
+            "profile": "dry-run",
+            "profiles": ["dry-run"],
+            "profile_available": {"dry-run": True},
+            "profile_level": "test",
+            "rage_baseline": 0,
+            "player_nick": "tester",
+        }
+        frames = {
+            "呼吸": ("integration-frame-0", "integration-frame-1"),
+            "潮汐": ("integration-frame-2",),
+        }
+        cfg["presets"] = {
+            name: {
+                "waveform": f"integration-{index}",
+                "label": name,
+                "category": "integration",
+                "frames": list(values),
+                "default_duration_s": 1,
+                "max_duration_s": 10,
+            }
+            for index, (name, values) in enumerate(frames.items())
+        }
+
+        async def unexpected_chat(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("integration harness must not call an LLM")
+
+        self.safety = SafetyManager(cfg)
+        self.loop = GameLoop(
+            cfg,
+            SimpleNamespace(chat=unexpected_chat),
+            self.safety,
+            self.relay,
+        )
+        self.store = ReplayStore(Path(self._temporary.name))
+        self._cycle_rngs = {
+            channel: _CountingCycleRandom(
+                derive_stream_seed(seed, f"cycle:{channel}")
+            )
+            for channel in ("A", "B")
+        }
+        self.controller = SessionController(
+            game_loop=self.loop,
+            store=self.store,
+            seed=seed,
+            frames=frames,
+            strength_jitter=4,
+            waveform_policy="all_allowed",
+            cycle_gap_policy=CycleGapPolicy(),
+            clock=lambda: self.clock.now_ms / 1000,
+            sleeper=self.clock,
+            cycle_rngs=self._cycle_rngs,
+            session_id_factory=lambda: f"integration-session-{seed}",
+            replay_id_factory=lambda: f"integration-replay-{seed}",
+            timestamp_factory=lambda: "2026-08-31T00:00:00+00:00",
+            manifest_metadata={
+                "app_commit": "integration-build",
+                "model": "no-llm",
+                "dlc_role": "integration",
+                "dlc_profile": "dry-run",
+                "dlc_version": "integration-v1",
+            },
+        )
+        self.loop.timeline_session = self.controller
+        return self
+
+    @property
+    def rng_calls(self) -> int:
+        return sum(rng.calls for rng in self._cycle_rngs.values())
+
+    async def start(self) -> Any:
+        return await self.controller.start_live()
+
+    async def turn(self, actions: Sequence[Mapping[str, Any]]) -> Any:
+        return await self.controller.process_live_turn(actions)
+
+    async def complete_cycles(self, channel: str, *, count: int) -> None:
+        if channel not in ("A", "B"):
+            raise ValueError("channel must be A or B")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("count must be a non-negative integer")
+        initial = sum(
+            record.channel == channel and record.completed
+            for record in self.controller.recorded_cycles
+        )
+        target = initial + count
+        for _ in range(max(1, count) * 100):
+            completed = sum(
+                record.channel == channel and record.completed
+                for record in self.controller.recorded_cycles
+            )
+            if completed >= target:
+                return
+            remaining = self.clock.next_remaining_ms
+            if remaining is not None:
+                self.clock.advance(remaining)
+            await asyncio.sleep(0)
+        raise AssertionError(f"{channel} did not complete {count} cycles")
+
+    async def finish(self) -> ReplaySummary:
+        return await self.controller.finish()
+
+    async def replay(self, replay: Any) -> SimpleNamespace:
+        before = self.rng_calls
+        await self.controller.start_replay(replay.manifest.replay_id)
+        player = self.controller.player
+        if player is None:
+            raise AssertionError("replay player was not installed")
+        requested_cycles = player.ordered_cycles
+        for _ in range(max(1, len(requested_cycles)) * 100):
+            if self.controller.to_state().status is SessionStatus.IDLE:
+                break
+            remaining = self.clock.next_remaining_ms
+            if remaining is not None:
+                self.clock.advance(remaining)
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("recorded replay did not finish")
+        return SimpleNamespace(
+            requested_cycles=requested_cycles,
+            rng_calls=self.rng_calls - before,
+        )
+
+    async def close(self) -> None:
+        await self.controller.stop()
+        self._temporary.cleanup()
+
+
 class ReplayHarness:
     """Compose exact playback with a GameLoop-shaped recording executor."""
 
@@ -702,6 +901,7 @@ class ReplayHarness:
         self,
         cycles: Sequence[CycleRecord],
         *,
+        frames: Mapping[str, Sequence[str]] | None = None,
         caps: Mapping[str, int] | None = None,
         controlled: bool = False,
         fail_on_cycle: int | None = None,
@@ -726,7 +926,7 @@ class ReplayHarness:
         )
         self.sleeper = ControlledSleeper() if controlled else AdvancingSleeper()
         self.executor = FakeTimelineGameLoop(
-            frames={"呼吸": ("f0", "f1")},
+            frames=frames or {"呼吸": ("f0", "f1")},
             caps=caps,
             fail_on_cycle=fail_on_cycle,
             decoy_strength_result=decoy_strength_result,
@@ -761,7 +961,7 @@ class ReplayHarness:
             cycle_index=cycle_index,
             plot_event_id="evt-1",
             pattern="呼吸",
-            waveform_hash="wave-hash",
+            waveform_hash="936b1d3d04551d6c7755f3850bc453c7245f048ff1824cb8ce3ecf710a0fa2c2",
             requested_strength=requested_strength,
             effective_strength=effective_strength,
             active_start_offset_ms=offset_ms,

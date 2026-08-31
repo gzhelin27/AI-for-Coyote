@@ -1,6 +1,8 @@
 import unittest
 
-from backend.timeline.models import DirectiveMode
+import random
+
+from backend.timeline.models import CycleGapPolicy, DirectiveMode
 from backend.timeline.randomizer import TimelineResolver, derive_stream_seed
 
 
@@ -81,6 +83,63 @@ class TimelineResolverTests(unittest.TestCase):
             event_id="evt-000005", scene_id="live-turn-5", offset_ms=48000,
         )
         self.assertEqual(event.channels, {"A": expected.channels["A"]})
+
+    def test_disabled_channel_preserves_its_own_future_plot_rng(self):
+        resolver = self.resolver(13)
+        resolver.resolve_plot_event(
+            actions=[{"op": "hold_strength", "channel": "B", "value": 20}],
+            current={"A": 0, "B": 0}, caps={"A": 40, "B": 40},
+            enabled={"A": True, "B": False}, presets=("呼吸", "潮汐"),
+            event_id="evt-disabled", scene_id="disabled", offset_ms=0,
+        )
+        actual = resolver.resolve_plot_event(
+            actions=[{"op": "hold_strength", "channel": "B", "value": 20}],
+            current={"A": 0, "B": 0}, caps={"A": 40, "B": 40},
+            enabled={"A": True, "B": True}, presets=("呼吸", "潮汐"),
+            event_id="evt-enabled", scene_id="enabled", offset_ms=1,
+        )
+        expected = self.resolver(13).resolve_plot_event(
+            actions=[{"op": "hold_strength", "channel": "B", "value": 20}],
+            current={"A": 0, "B": 0}, caps={"A": 40, "B": 40},
+            enabled={"A": True, "B": True}, presets=("呼吸", "潮汐"),
+            event_id="evt-enabled", scene_id="enabled", offset_ms=1,
+        )
+
+        self.assertEqual(actual.channels["B"], expected.channels["B"])
+
+    def test_global_stop_and_temp_strength_are_normalized_before_randomization(self):
+        temp = self.resolver(14).resolve_plot_event(
+            actions=[{"op": "temp_strength", "channel": "A", "value": "12.9"}],
+            current={"A": 3, "B": 4}, caps={"A": 40, "B": 40},
+            enabled={"A": True, "B": True}, presets=("呼吸",),
+            event_id="evt-temp", scene_id="temp", offset_ms=0,
+        )
+        stopped = self.resolver(14).resolve_plot_event(
+            actions=[
+                {"op": "temp_strength", "channel": "A", "value": 20},
+                {"op": "stop"},
+            ],
+            current={"A": 3, "B": 4}, caps={"A": 40, "B": 40},
+            enabled={"A": True, "B": True}, presets=("呼吸",),
+            event_id="evt-stop", scene_id="stop", offset_ms=0,
+        )
+
+        self.assertEqual(temp.channels["A"].base_strength, 12)
+        self.assertTrue(
+            all(item.mode is DirectiveMode.STOP for item in stopped.channels.values())
+        )
+
+    def test_plot_resolution_is_unchanged_by_cycle_stream_consumption(self):
+        seed = 15
+        cycle_rng = random.Random(derive_stream_seed(seed, "cycle:A"))
+        policy = CycleGapPolicy()
+        for _ in range(25):
+            policy.sample_tenths(cycle_rng)
+
+        actual = self.resolver(seed).resolve_plot_event(**self.event_args)
+        expected = self.resolver(seed).resolve_plot_event(**self.event_args)
+
+        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

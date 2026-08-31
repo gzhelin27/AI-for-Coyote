@@ -273,8 +273,10 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
                 "cursor",
                 "current_event_id",
                 "adjusted",
+                "channels",
             },
         )
+        self.assertEqual(state["session"]["channels"], state["runners"])
         self.assertEqual(
             state["runners"]["A"],
             {

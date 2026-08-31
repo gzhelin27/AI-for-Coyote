@@ -73,14 +73,10 @@ class SafetyManager:
         return cap
 
     def set_user_cap(self, ch: str, value: int) -> int:
-        """设置通道运行时强度上限（1~硬上限），并就地钳制当前/请求值。返回生效值。"""
+        """设置通道运行时强度上限，保留设备跟踪值供物理降档使用。"""
         ch = self.norm_channel(ch)
         v = max(1, min(self.caps[ch], int(value)))
         self.user_caps[ch] = v
-        if self.current[ch] > v:
-            self.current[ch] = v
-        if self.requested[ch] is not None and self.requested[ch] > v:
-            self.requested[ch] = v
         return v
 
     # ---------- 校验入口 ----------
@@ -120,13 +116,9 @@ class SafetyManager:
         return False, "未知错误", None
 
     def set_channel_enabled(self, ch: str, on: bool) -> None:
-        """手动开关通道；关闭时清零该通道。"""
+        """手动开关通道；物理清零及成功后的状态记录由 GameLoop 负责。"""
         ch = self.norm_channel(ch)
         self.enabled[ch] = bool(on)
-        if not on:
-            self.current[ch] = 0
-            self.pulse_until[ch] = 0.0
-            self.requested[ch] = None
 
     def _check_enabled(self, ch: str) -> str | None:
         if not self.enabled.get(ch, True):

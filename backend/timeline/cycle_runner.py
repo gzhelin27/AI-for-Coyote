@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import inspect
 from collections.abc import Callable, Mapping, Sequence
@@ -127,6 +128,17 @@ class ChannelCycleRunner:
 
         self._lock = asyncio.Lock()
         self._delivery_lock = asyncio.Lock()
+        self._delivery_owner: asyncio.Task[Any] | None = None
+        self._delivery_idle = asyncio.Event()
+        self._delivery_idle.set()
+        self._delivery_callback_owner: contextvars.ContextVar[
+            asyncio.Task[Any] | None
+        ] = (
+            contextvars.ContextVar(
+                f"cycle-delivery-callback-owner-{channel}-{id(self)}",
+                default=None,
+            )
+        )
         self._pending_records: dict[tuple[str, int], CycleRecord] = {}
         self._worker: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
@@ -625,25 +637,58 @@ class ChannelCycleRunner:
     async def _deliver_record(self, record: CycleRecord) -> None:
         key = (record.channel, record.cycle_index)
         self._pending_records.setdefault(key, record)
-        async with self._delivery_lock:
-            pending = self._pending_records.get(key)
-            if pending is None:
-                return
-            cancelled_after_delivery = await self._invoke_callback(pending)
-            self._pending_records.pop(key, None)
-            if cancelled_after_delivery:
-                raise asyncio.CancelledError
+        callback_owner = self._delivery_callback_owner.get()
+        if callback_owner is not None and self._delivery_owner is callback_owner:
+            # The active callback already has ownership of the ordered drain.
+            # Its outer delivery will pick up any newly queued records.
+            return
+
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("cycle record delivery requires an asyncio task")
+        while True:
+            async with self._delivery_lock:
+                if self._delivery_owner is current:
+                    return
+                if self._delivery_owner is None:
+                    self._delivery_owner = current
+                    self._delivery_idle.clear()
+                    break
+                idle = self._delivery_idle
+            await idle.wait()
+
+        try:
+            while True:
+                async with self._delivery_lock:
+                    if not self._pending_records:
+                        break
+                    pending_key, pending = next(iter(self._pending_records.items()))
+                cancelled_after_delivery = await self._invoke_callback(pending)
+                async with self._delivery_lock:
+                    if self._pending_records.get(pending_key) is pending:
+                        self._pending_records.pop(pending_key, None)
+                if cancelled_after_delivery:
+                    raise asyncio.CancelledError
+        finally:
+            async with self._delivery_lock:
+                if self._delivery_owner is current:
+                    self._delivery_owner = None
+                    self._delivery_idle.set()
 
     async def _invoke_callback(self, record: CycleRecord) -> bool:
+        token = self._delivery_callback_owner.set(self._delivery_owner)
         try:
-            result = self._on_cycle(record)
-        except asyncio.CancelledError as exc:
-            raise _CycleCallbackError("cycle callback cancelled") from exc
-        except Exception as exc:
-            raise _CycleCallbackError(f"cycle callback failed: {exc}") from exc
-        if inspect.isawaitable(result):
-            return await self._await_callback(result)
-        return False
+            try:
+                result = self._on_cycle(record)
+            except asyncio.CancelledError as exc:
+                raise _CycleCallbackError("cycle callback cancelled") from exc
+            except Exception as exc:
+                raise _CycleCallbackError(f"cycle callback failed: {exc}") from exc
+            if inspect.isawaitable(result):
+                return await self._await_callback(result)
+            return False
+        finally:
+            self._delivery_callback_owner.reset(token)
 
     async def _await_callback(self, result: Any) -> bool:
         delivery = asyncio.ensure_future(result)

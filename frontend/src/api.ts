@@ -86,8 +86,8 @@ export function mapTimelineState(
     cursor: typeof session?.cursor === "number" ? session.cursor : 0,
     adjusted: session?.adjusted === true,
     channels: {
-      A: mapChannel(runners?.A, status),
-      B: mapChannel(runners?.B, status),
+      A: mapChannel(session?.channels?.A ?? runners?.A, status),
+      B: mapChannel(session?.channels?.B ?? runners?.B, status),
     },
   };
 }

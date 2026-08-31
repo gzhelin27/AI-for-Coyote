@@ -6,6 +6,27 @@ from tests.timeline_fakes import ReplayHarness
 
 
 class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_name_and_frame_count_with_changed_frames_marks_adjusted(self):
+        cycle = ReplayHarness._cycle(
+            channel="A", cycle_index=1, offset_ms=0, gap_tenths=0
+        )
+        harness = ReplayHarness([cycle], frames={"呼吸": ("x0", "x1")})
+        self.addAsyncCleanup(harness.close)
+
+        await harness.player.start()
+        await harness.player.wait()
+
+        self.assertTrue(harness.player.adjusted)
+
+    async def test_matching_identity_and_safety_stays_exact(self):
+        harness = ReplayHarness.from_strength(original=20, current_cap=40)
+        self.addAsyncCleanup(harness.close)
+
+        await harness.player.start()
+        await harness.player.wait()
+
+        self.assertFalse(harness.player.adjusted)
+
     async def test_empty_replay_runs_terminal_clear(self):
         harness = ReplayHarness([])
         self.addAsyncCleanup(harness.close)
@@ -25,7 +46,7 @@ class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(harness.requested_gap_tenths, [0, 7, 20])
         self.assertEqual(harness.rng_calls, 0)
-        self.assertEqual(harness.sleeper.sleep_calls, [200, 340, 200])
+        self.assertEqual(harness.sleeper.sleep_calls, [200, 340, 600])
 
     async def test_normal_completion_waits_for_last_raw_cycle_before_clear(self):
         harness = ReplayHarness.from_cycles(gap_tenths=[0])
@@ -35,6 +56,16 @@ class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
         await harness.player.wait()
 
         self.assertEqual(harness.sleeper.sleep_calls, [200])
+        self.assertEqual(harness.executor.clear_calls, [None])
+
+    async def test_terminal_actual_gap_is_preserved_before_completion_clear(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[10])
+        self.addAsyncCleanup(harness.close)
+
+        await harness.player.start()
+        await harness.player.wait()
+
+        self.assertEqual(harness.sleeper.sleep_calls, [400])
         self.assertEqual(harness.executor.clear_calls, [None])
 
     async def test_monotonic_schedule_accounts_for_executor_elapsed_time(self):
@@ -97,11 +128,63 @@ class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         await harness.player.wait()
 
-        self.assertEqual(paused_cursor, 1)
+        self.assertEqual(paused_cursor, 0)
         self.assertEqual(
             [action["channel"] for action in harness.executor.requested_cycle_actions],
-            ["A", "A"],
+            ["A", "A", "A"],
         )
+
+    async def test_pause_mid_raw_cycle_resumes_same_cycle_from_frame_zero_immediately(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[10], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if len(harness.executor.requested_cycle_actions) == 1:
+                break
+            await asyncio.sleep(0)
+        harness.sleeper.advance(50)
+
+        await harness.player.pause()
+        paused_cursor = harness.player.cursor
+        await harness.player.resume()
+        for _ in range(20):
+            if len(harness.executor.requested_cycle_actions) == 2:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(paused_cursor, 0)
+        self.assertEqual(len(harness.executor.requested_cycle_actions), 2)
+        self.assertEqual(harness.executor.cycle_start_frames, [0, 0])
+
+    async def test_public_channel_state_tracks_replay_cycle_gap_and_next_start(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[10, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if len(harness.executor.requested_cycle_actions) == 1:
+                break
+            await asyncio.sleep(0)
+
+        cycle_state = harness.player.channel_states()["A"]
+        self.assertEqual(
+            cycle_state,
+            {
+                "phase": "cycle",
+                "pattern": "呼吸",
+                "strength": 20,
+                "cycle_index": 1,
+                "next_cycle_start_ms": 400,
+            },
+        )
+        harness.sleeper.advance(200)
+        gap_state = harness.player.channel_states()["A"]
+        self.assertEqual(gap_state["phase"], "gap")
+        self.assertEqual(gap_state["pattern"], "呼吸")
+
+        await harness.player.pause()
+
+        self.assertEqual(harness.player.channel_states()["A"]["phase"], "paused")
+        self.assertIsNone(harness.player.channel_states()["A"]["pattern"])
 
     async def test_resume_at_end_creates_terminal_clear_task(self):
         harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)

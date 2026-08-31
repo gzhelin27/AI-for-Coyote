@@ -177,6 +177,92 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("recorder failed", state.failure or "")
         self.assertEqual(len(harness.runner.pending_records()), 1)
 
+    async def test_record_callback_can_reenter_pending_retry_without_deadlock(self):
+        callback_entered = asyncio.Event()
+        callback_returned = asyncio.Event()
+        delivered = []
+        harness = None
+
+        async def reentrant_callback(record):
+            delivered.append(record)
+            harness.records.append(record)
+            callback_entered.set()
+            await harness.runner.retry_pending_records()
+            callback_returned.set()
+
+        harness = self.make_harness(
+            frames={"呼吸": ["f"]},
+            gap_tenths=[0],
+            on_cycle=reentrant_callback,
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+
+        completion = asyncio.create_task(harness.complete_cycle())
+        await asyncio.wait_for(callback_entered.wait(), timeout=0.2)
+        await asyncio.wait_for(completion, timeout=0.2)
+        await asyncio.wait_for(callback_returned.wait(), timeout=0.2)
+        for _ in range(10):
+            if not harness.runner.pending_records():
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(harness.runner.pending_records(), ())
+
+    async def test_callback_child_can_retry_after_delivery_owner_releases(self):
+        release_late_retry = asyncio.Event()
+        late_retry_done = asyncio.Event()
+        callback_attempts: dict[int, int] = {}
+        late_retry_task = None
+        harness = None
+
+        async def callback(record):
+            nonlocal late_retry_task
+            callback_attempts[record.cycle_index] = (
+                callback_attempts.get(record.cycle_index, 0) + 1
+            )
+            if record.cycle_index == 1:
+                harness.records.append(record)
+
+                async def retry_after_callback_returns():
+                    await release_late_retry.wait()
+                    await harness.runner.retry_pending_records()
+                    late_retry_done.set()
+
+                late_retry_task = asyncio.create_task(
+                    retry_after_callback_returns()
+                )
+                return
+            if callback_attempts[record.cycle_index] == 1:
+                raise RuntimeError("retry after owner release")
+            harness.records.append(record)
+
+        harness = self.make_harness(
+            frames={"呼吸": ["f"]},
+            gap_tenths=[0, 0],
+            on_cycle=callback,
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        await harness.complete_cycle()
+        for _ in range(20):
+            if harness.runner.state().phase is RunnerPhase.STOPPED:
+                break
+            remaining = harness.sleeper.next_remaining_ms
+            if remaining is not None:
+                harness.sleeper.advance(remaining)
+            await asyncio.sleep(0)
+
+        await asyncio.wait_for(harness.runner.wait_stopped(), timeout=0.2)
+        self.assertEqual(len(harness.runner.pending_records()), 1)
+
+        release_late_retry.set()
+        await asyncio.wait_for(late_retry_done.wait(), timeout=0.2)
+        if late_retry_task is not None:
+            await asyncio.wait_for(late_retry_task, timeout=0.2)
+
+        self.assertEqual(callback_attempts[2], 2)
+        self.assertEqual(harness.runner.pending_records(), ())
+
     async def test_failed_record_delivery_is_durable_and_recoverable(self):
         for failure in ("raise", "cancel"):
             with self.subTest(failure=failure):

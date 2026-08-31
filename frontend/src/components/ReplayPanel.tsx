@@ -206,6 +206,12 @@ export default function ReplayPanel({ historyOnly }: Props) {
                 <span>波形：{state.pattern ?? "—"}</span>
                 <span>强度：{state.strength}</span>
                 <span>循环：{state.cycleIndex}</span>
+                <span>
+                  会话内下次起点：
+                  {state.nextCycleAtMs === null
+                    ? "—"
+                    : `${(state.nextCycleAtMs / 1000).toFixed(1)}s`}
+                </span>
               </div>
             </div>
           );

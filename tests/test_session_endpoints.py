@@ -120,6 +120,36 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         with patch("backend.game_loop.reload_character"):
             return await self.harness.loop._autopilot_turn()
 
+    async def _start_physical_live(self, strength: int) -> None:
+        self.harness.safety.dry_run = False
+        self.harness.llm.chat.return_value = (
+            "timeline line",
+            [{"op": "hold_strength", "channel": "A", "value": strength}],
+        )
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        await self._automatic_turn()
+        self.assertEqual(self.harness.safety.current["A"], strength)
+
+    async def _complete_active_cycle(self, channel: str) -> None:
+        initial = sum(
+            record.channel == channel and record.completed
+            for record in self.harness.controller.recorded_cycles
+        )
+        for _ in range(60):
+            completed = [
+                record
+                for record in self.harness.controller.recorded_cycles
+                if record.channel == channel and record.completed
+            ]
+            if len(completed) > initial:
+                return
+            remaining = self.harness.clock.next_remaining_ms
+            if remaining is not None:
+                self.harness.clock.advance(remaining)
+            await asyncio.sleep(0)
+        self.fail("active cycle did not complete")
+
     async def _complete_one_cycle(self):
         await self._automatic_turn()
         for _ in range(40):
@@ -138,6 +168,18 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         finished = await self.client.post("/api/session/finish")
         self.assertEqual(finished.status_code, 200)
         return finished.json()
+
+    async def _start_active_replay(self):
+        summary = await self._finish_replay_with_cycle()
+        playing = await self.client.post(
+            f"/api/replays/{summary['replay_id']}/play", json={"cursor": 0}
+        )
+        self.assertEqual(playing.status_code, 200)
+        for _ in range(40):
+            if self.harness.safety.current["A"]:
+                return summary
+            await asyncio.sleep(0)
+        self.fail("replay did not produce active output")
 
     async def test_live_session_routes_pause_resume_finish_and_list(self):
         started = await self.client.post("/api/session/start")
@@ -158,6 +200,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished.json()["status"], "completed")
         self.assertIn("title", finished.json())
         self.assertEqual(finished.json()["cycle_count"], 0)
+        self.assertNotIn("seed", finished.json())
         self.assertFalse(self.harness.loop.autopilot)
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(
@@ -166,10 +209,75 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(listed.json()[0]["title"], finished.json()["title"])
         self.assertEqual(listed.json()[0]["cycle_count"], finished.json()["cycle_count"])
+        self.assertNotIn("seed", listed.json()[0])
         self.assertEqual(
             self.state.set_sensors.await_args_list,
             [call(True), call(False), call(True), call(False)],
         )
+
+    async def test_lowering_cap_reduces_active_runner_and_records_current_strength(self):
+        await self._start_physical_live(30)
+        frames_before = len(self.harness.relay.sent_frames)
+
+        response = await self.client.post(
+            "/api/device/channels/cap", json={"channel": "A", "value": 10}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.harness.safety.current["A"], 10)
+        self.assertGreater(len(self.harness.relay.sent_frames), frames_before)
+        await self._complete_active_cycle("A")
+        completed = [
+            record
+            for record in self.harness.controller.recorded_cycles
+            if record.channel == "A" and record.completed
+        ]
+        self.assertEqual(completed[-1].effective_strength, 10)
+
+    async def test_overheat_reduces_active_runner_through_physical_game_loop_path(self):
+        await self._start_physical_live(35)
+        frames_before = len(self.harness.relay.sent_frames)
+        self.harness.relay.clients = {
+            "client-test": {
+                "props": {},
+                "slotState": {
+                    "channelA": {"comfortLimit": {"overheat": True}}
+                },
+            }
+        }
+
+        await self.state.on_relay_event("slots_patch", {})
+
+        self.assertTrue(self.harness.safety.overheat["A"])
+        self.assertEqual(self.harness.safety.current["A"], 20)
+        self.assertGreater(len(self.harness.relay.sent_frames), frames_before)
+        await self._complete_active_cycle("A")
+        completed = [
+            record
+            for record in self.harness.controller.recorded_cycles
+            if record.channel == "A" and record.completed
+        ]
+        self.assertEqual(completed[-1].effective_strength, 20)
+
+    async def test_disabling_active_channel_physically_clears_and_never_outputs_later(self):
+        await self._start_physical_live(25)
+
+        response = await self.client.post(
+            "/api/device/channels/enabled",
+            json={"channel": "A", "enabled": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.harness.safety.enabled["A"])
+        self.assertEqual(self.harness.safety.current["A"], 0)
+        frames_after_clear = len(self.harness.relay.sent_frames)
+        for _ in range(20):
+            remaining = self.harness.clock.next_remaining_ms
+            if remaining is not None:
+                self.harness.clock.advance(remaining)
+            await asyncio.sleep(0)
+        self.assertEqual(len(self.harness.relay.sent_frames), frames_after_clear)
+        self.assertNotIn("A", self.harness.controller.runners)
 
     async def test_replay_playback_routes_pause_resume_and_stop(self):
         summary = await self._finish_replay_with_cycle()
@@ -189,6 +297,180 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.json()["status"], "replaying")
         self.assertEqual(stopped.status_code, 200)
         self.assertEqual(stopped.json()["status"], "idle")
+
+    async def test_cancelled_replay_pause_endpoint_finishes_physical_clear(self):
+        await self._start_active_replay()
+        clear_started = asyncio.Event()
+        release_clear = asyncio.Event()
+        original_clear = self.harness.loop.clear_output
+
+        async def blocked_clear(channel=None):
+            clear_started.set()
+            await release_clear.wait()
+            return await original_clear(channel)
+
+        route = next(
+            item
+            for item in self.app.routes
+            if item.path == "/api/replays/playback/pause"
+        )
+        with patch.object(
+            self.harness.loop, "clear_output", side_effect=blocked_clear
+        ):
+            request = asyncio.create_task(route.endpoint())
+            await asyncio.wait_for(clear_started.wait(), timeout=0.2)
+            request.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(request.done())
+            self.assertGreater(self.harness.safety.current["A"], 0)
+            release_clear.set()
+            result = await asyncio.gather(request, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.PAUSED
+        )
+        resumed = await self.client.post("/api/replays/playback/resume")
+        self.assertEqual(resumed.status_code, 200)
+
+    async def test_cancelled_replay_stop_endpoint_finishes_clear_before_idle(self):
+        await self._start_active_replay()
+        clear_started = asyncio.Event()
+        release_clear = asyncio.Event()
+        original_clear = self.harness.loop.clear_output
+
+        async def blocked_clear(channel=None):
+            clear_started.set()
+            await release_clear.wait()
+            return await original_clear(channel)
+
+        route = next(
+            item
+            for item in self.app.routes
+            if item.path == "/api/replays/playback/stop"
+        )
+        with patch.object(
+            self.harness.loop, "clear_output", side_effect=blocked_clear
+        ):
+            request = asyncio.create_task(route.endpoint())
+            await asyncio.wait_for(clear_started.wait(), timeout=0.2)
+            request.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(request.done())
+            release_clear.set()
+            result = await asyncio.gather(request, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.IDLE
+        )
+
+    async def test_cancelled_replay_resume_endpoint_owns_transition_to_completion(self):
+        await self._start_active_replay()
+        paused = await self.client.post("/api/replays/playback/pause")
+        self.assertEqual(paused.status_code, 200)
+        resume_started = asyncio.Event()
+        release_resume = asyncio.Event()
+        original_resume = self.harness.controller.resume
+
+        async def blocked_resume(cursor=None):
+            result = await original_resume(cursor)
+            resume_started.set()
+            await release_resume.wait()
+            return result
+
+        route = next(
+            item
+            for item in self.app.routes
+            if item.path == "/api/replays/playback/resume"
+        )
+        with patch.object(
+            self.harness.controller, "resume", side_effect=blocked_resume
+        ):
+            request = asyncio.create_task(route.endpoint())
+            await asyncio.wait_for(resume_started.wait(), timeout=0.2)
+            request.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(request.done())
+            release_resume.set()
+            result = await asyncio.gather(request, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.REPLAYING
+        )
+
+    async def test_manual_action_pauses_live_before_unrecorded_output(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        await self._automatic_turn()
+        event_cursor = self.harness.controller.to_state().cursor
+        operations = []
+        original_execute = self.harness.loop._execute_actions_locked
+
+        async def record_actions(actions):
+            operations.append([dict(action) for action in actions])
+            return await original_execute(actions)
+
+        with patch.object(
+            self.harness.loop,
+            "_execute_actions_locked",
+            side_effect=record_actions,
+        ):
+            response = await self.client.post(
+                "/api/manual",
+                json={"op": "hold_strength", "channel": "A", "value": 7},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.PAUSED
+        )
+        self.assertEqual(self.harness.controller.to_state().cursor, event_cursor)
+        self.assertEqual(self.harness.safety.current["A"], 7)
+        self.assertEqual(operations[-1][0]["op"], "hold_strength")
+        self.assertTrue(
+            any(batch[0].get("op") == "stop" for batch in operations[:-1])
+        )
+
+    async def test_manual_action_stops_replay_before_output_and_keeps_archive_exact(self):
+        summary = await self._start_active_replay()
+        replay_id = summary["replay_id"]
+
+        response = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 6},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.IDLE
+        )
+        self.assertEqual(self.harness.safety.current["A"], 6)
+        before = len(self.harness.relay.sent_frames)
+        self.harness.clock.advance(10000)
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.harness.relay.sent_frames), before)
+        stored = self.harness.store.load(replay_id)
+        self.assertFalse(stored.manifest.adjusted)
+
+    async def test_idle_manual_action_remains_available(self):
+        response = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 5},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["dropped"])
+        self.assertEqual(self.harness.safety.current["A"], 5)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.IDLE
+        )
 
     async def test_download_uses_safe_name_and_rejects_missing_or_traversal_ids(self):
         started = await self.client.post("/api/session/start")
@@ -328,8 +610,10 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "cursor",
                 "current_event_id",
                 "adjusted",
+                "channels",
             },
         )
+        self.assertEqual(state["session"]["channels"], state["runners"])
         self.assertEqual(
             set(state["runners"]["A"]),
             {

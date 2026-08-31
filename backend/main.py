@@ -9,11 +9,14 @@
 import asyncio
 import contextlib
 from copy import deepcopy
+import hashlib
 import io
+import json
 import os
 import re
 import secrets
 import socket
+import subprocess
 import sys
 import urllib.parse
 import zipfile
@@ -58,13 +61,58 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
 
 def _app_version() -> str:
-    """版本号：打包时写入 version.txt；源码运行时显示 dev。"""
+    """Return packaged version, source commit, or a deterministic source fingerprint."""
     f = PROJECT_ROOT / "version.txt"
     if f.exists():
         v = f.read_text(encoding="utf-8").strip().lstrip("\ufeff")
         if v:
             return v
-    return "dev"
+    configured = str(os.environ.get("AI_COYOTE_APP_COMMIT") or "").strip()
+    if configured:
+        return configured
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        commit = result.stdout.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
+            return commit.lower()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    source = Path(__file__).read_bytes()
+    return f"source-sha256:{hashlib.sha256(source).hexdigest()}"
+
+
+def _dlc_provenance(cfg: dict) -> str:
+    character = cfg.get("character") or {}
+    configured = str(character.get("dlc_version") or "").strip()
+    if configured:
+        return configured
+    identity = {
+        "name": str(character.get("name") or "default"),
+        "role": str(character.get("role") or "default"),
+        "profile": str(character.get("profile") or "default"),
+        "profile_level": str(character.get("profile_level") or "default"),
+        "prompt_file": str(character.get("prompt_file") or ""),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    )
+    prompt_path = Path(identity["prompt_file"])
+    if identity["prompt_file"] and not prompt_path.is_absolute():
+        prompt_path = PROJECT_ROOT / prompt_path
+    try:
+        digest.update(prompt_path.read_bytes())
+    except (OSError, ValueError):
+        pass
+    return f"sha256:{digest.hexdigest()}"
 
 
 def get_lan_ip() -> str:
@@ -113,7 +161,6 @@ def _replay_summary_payload(summary: ReplaySummary) -> dict:
     return {
         "replay_id": summary.replay_id,
         "session_id": summary.session_id,
-        "seed": summary.seed,
         "status": summary.status.value,
         "mode": summary.mode,
         "created_at": summary.created_at,
@@ -185,6 +232,7 @@ class AppState:
             seed_factory=lambda: secrets.randbits(63),
             strength_jitter=int(timeline_cfg["strength_jitter"]),
             cycle_gap_policy=CycleGapPolicy.from_dict(timeline_cfg["cycle_gap"]),
+            waveform_policy=str(timeline_cfg["waveform_policy"]),
             manifest_metadata_factory=self._timeline_manifest_metadata,
         )
         self.loop.timeline_session = self.timeline_session
@@ -206,12 +254,12 @@ class AppState:
         """Snapshot provenance when a new live session actually begins."""
         return {
             "app_commit": _app_version(),
-            "model": str(self.cfg["llm"].get("model") or ""),
-            "dlc_role": str(self.cfg["character"].get("role") or ""),
-            "dlc_profile": str(self.cfg["character"].get("profile") or ""),
-            "dlc_version": str(
-                self.cfg["character"].get("dlc_version") or ""
+            "model": str(self.cfg["llm"].get("model") or "unconfigured"),
+            "dlc_role": str(self.cfg["character"].get("role") or "default"),
+            "dlc_profile": str(
+                self.cfg["character"].get("profile") or "default"
             ),
+            "dlc_version": _dlc_provenance(self.cfg),
         }
 
     # ---------- 麦克风转写回调 ----------
@@ -239,7 +287,7 @@ class AppState:
             # 取第一台设备的 props/slotState 同步给安全层
             client = self.relay.clients.get(self.relay.first_client_id() or "")
             if client:
-                self.safety.update_device_state(
+                await self.loop.update_device_state(
                     client.get("props"), client.get("slotState")
                 )
         elif event == "client_attached" and not self.auto_opened:
@@ -507,9 +555,7 @@ def make_app() -> FastAPI:
     async def api_replay_pause() -> JSONResponse:
         try:
             async with state.timeline_transition_lock:
-                if state.timeline_session.to_state().mode != "replay":
-                    raise RuntimeError("no replay playback to pause")
-                await state.timeline_session.pause()
+                await state.loop.pause_replay_session()
                 payload = _session_payload(state.timeline_session)
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
@@ -520,9 +566,7 @@ def make_app() -> FastAPI:
     async def api_replay_resume() -> JSONResponse:
         try:
             async with state.timeline_transition_lock:
-                if state.timeline_session.to_state().mode != "replay":
-                    raise RuntimeError("no replay playback to resume")
-                await state.timeline_session.resume()
+                await state.loop.resume_replay_session()
                 payload = _session_payload(state.timeline_session)
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
@@ -535,7 +579,7 @@ def make_app() -> FastAPI:
             async with state.timeline_transition_lock:
                 if state.timeline_session.to_state().mode != "replay":
                     raise RuntimeError("no replay playback to stop")
-                await state.timeline_session.stop()
+                await state.loop.stop_timeline_session()
                 payload = _session_payload(state.timeline_session)
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
@@ -546,8 +590,8 @@ def make_app() -> FastAPI:
     async def api_replay_play(replay_id: str, body: dict) -> JSONResponse:
         try:
             async with state.timeline_transition_lock:
-                session_state = await state.timeline_session.start_replay(
-                    replay_id, cursor=body.get("cursor", 0)
+                session_state = await state.loop.start_replay_session(
+                    replay_id, body.get("cursor", 0)
                 )
                 payload = session_state.to_dict()
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
@@ -649,7 +693,14 @@ def make_app() -> FastAPI:
         """手动控制：与 AI 指令走完全相同的安全链路。"""
         if not isinstance(body, dict) or "op" not in body:
             return JSONResponse({"error": "缺少 op"}, status_code=400)
-        executed, dropped = await state.loop.execute_actions([body])
+        try:
+            async with state.timeline_transition_lock:
+                was_active = state.timeline_session.to_state().status.value != "idle"
+                executed, dropped = await state.loop.execute_manual_action(body)
+                if was_active:
+                    await state.set_sensors(False)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
         await state.broadcast()
         return JSONResponse({"executed": executed, "dropped": dropped})
 
@@ -670,11 +721,20 @@ def make_app() -> FastAPI:
         if ch not in ("A", "B"):
             return JSONResponse({"error": "channel 只能是 A 或 B"}, status_code=400)
         enabled = bool(body.get("enabled"))
-        state.safety.set_channel_enabled(ch, enabled)
         try:
-            save_device_channels(cfg, {ch: {"enabled": enabled}})
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            async with state.timeline_transition_lock:
+                result = await state.loop.set_channel_enabled(ch, enabled)
+                save_device_channels(cfg, {ch: {"enabled": enabled}})
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        if result["dropped"]:
+            return JSONResponse(
+                {
+                    "error": "通道物理清除失败",
+                    "dropped": result["dropped"],
+                },
+                status_code=503,
+            )
         await state.broadcast()
         return JSONResponse({"ok": True, "enabled_channels": state.safety.enabled})
 
@@ -736,11 +796,18 @@ def make_app() -> FastAPI:
             value = int(body.get("value", 100))
         except (TypeError, ValueError):
             return JSONResponse({"error": "value 必须是整数"}, status_code=400)
-        v = state.safety.set_user_cap(ch, value)
-        # 上限低于当前强度时，立即把设备强度降下来
-        if state.safety.current[ch] > v:
-            await state.loop.execute_actions(
-                [{"op": "hold_strength", "channel": ch, "value": v}]
+        try:
+            async with state.timeline_transition_lock:
+                result = await state.loop.set_runtime_cap(ch, value)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        if result["dropped"]:
+            return JSONResponse(
+                {
+                    "error": "运行时上限物理降档失败",
+                    "dropped": result["dropped"],
+                },
+                status_code=503,
             )
         await state.broadcast()
         return JSONResponse(

@@ -25,7 +25,7 @@ export interface PresetInfo {
   default_duration_s: number;
   max_duration_s: number;
   category: string;
-  frames: string[];
+  frames?: string[];
 }
 export interface ChannelDevice {
   name: string;
@@ -175,6 +175,7 @@ export interface BackendSessionState {
   mode?: string | null;
   cursor?: number;
   adjusted?: boolean;
+  channels?: Partial<Record<"A" | "B", BackendRunnerState>>;
 }
 
 export interface BackendRunnerState {

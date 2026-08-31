@@ -256,6 +256,23 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
 
+    async def test_archive_offsets_exclude_pause_time_exactly(self):
+        controller = SessionHarness.create(seed=42)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.complete_cycles("A", gap_tenths=[0, 7])
+        await controller.pause(manual_elapsed_ms=600000)
+        await controller.resume()
+        await controller.complete_next_cycle("A")
+
+        summary = await controller.finish()
+        cycles = controller.store.load(summary.replay_id).timeline.cycles
+
+        self.assertEqual(
+            [cycle.active_start_offset_ms for cycle in cycles],
+            [0, 200, 540],
+        )
+
     async def test_disconnect_pauses_and_resume_starts_complete_cycle(self):
         controller = SessionHarness.create(seed=10)
         self.addAsyncCleanup(controller.close)
@@ -511,6 +528,33 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
         self.assertEqual(len(controller.store.list()), 1)
+
+    async def test_replay_state_exposes_redacted_channel_playback(self):
+        controller = SessionHarness.create(seed=41)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([5], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+
+        state = await controller.start_replay(bundle.manifest.replay_id)
+        for _ in range(20):
+            state = controller.to_state()
+            if state.channels["A"].phase == "cycle":
+                break
+            await asyncio.sleep(0)
+
+        channel = state.channels["A"]
+        self.assertEqual(channel.phase, "cycle")
+        self.assertEqual(channel.pattern, "呼吸")
+        self.assertEqual(channel.strength, 20)
+        self.assertEqual(channel.cycle_index, bundle.timeline.cycles[0].cycle_index)
+        self.assertIsNone(channel.next_cycle_start_ms)
+        self.assertNotIn("waveform_hash", state.to_dict()["channels"]["A"])
+
+        await controller.pause()
+        paused = controller.to_state().channels["A"]
+        self.assertEqual(paused.phase, "paused")
+        self.assertIsNone(paused.pattern)
+        self.assertEqual(paused.strength, 0)
 
     async def test_empty_replay_clears_then_returns_controller_to_idle(self):
         controller = SessionHarness.create(seed=27)

@@ -435,6 +435,59 @@ class ReplayManifest:
 
 
 @dataclass(frozen=True)
+class ChannelPlaybackState:
+    """Public, redacted progress for one live or replay channel."""
+
+    phase: str = "idle"
+    pattern: str | None = None
+    strength: int = 0
+    cycle_index: int = 0
+    next_cycle_start_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.phase not in ("idle", "cycle", "gap", "paused", "stopped"):
+            raise ValueError("channel phase is invalid")
+        if self.pattern is not None and (
+            not isinstance(self.pattern, str) or not self.pattern.strip()
+        ):
+            raise ValueError("channel pattern must be a non-empty string or None")
+        _required_strength(self.strength, "channel strength")
+        _require_non_negative_int(self.cycle_index, "channel cycle_index")
+        if self.next_cycle_start_ms is not None:
+            _require_non_negative_int(
+                self.next_cycle_start_ms, "channel next_cycle_start_ms"
+            )
+        if self.phase not in ("cycle", "gap") and (
+            self.pattern is not None or self.strength != 0
+        ):
+            raise ValueError("inactive channel state must redact output")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "pattern": self.pattern,
+            "strength": self.strength,
+            "cycle_index": self.cycle_index,
+            "next_cycle_start_ms": self.next_cycle_start_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ChannelPlaybackState:
+        data = _require_mapping(data, "channel playback state")
+        return cls(
+            phase=data.get("phase", "idle"),
+            pattern=data.get("pattern"),
+            strength=data.get("strength", 0),
+            cycle_index=data.get("cycle_index", 0),
+            next_cycle_start_ms=data.get("next_cycle_start_ms"),
+        )
+
+
+def _idle_channel_states() -> dict[str, ChannelPlaybackState]:
+    return {channel: ChannelPlaybackState() for channel in _CHANNELS}
+
+
+@dataclass(frozen=True)
 class SessionState:
     status: SessionStatus
     mode: str | None = None
@@ -443,6 +496,7 @@ class SessionState:
     cursor: int = 0
     current_event_id: str | None = None
     adjusted: bool = False
+    channels: Mapping[str, ChannelPlaybackState] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, SessionStatus):
@@ -452,6 +506,16 @@ class SessionState:
         _require_non_negative_int(self.cursor, "cursor")
         if not isinstance(self.adjusted, bool):
             raise ValueError("adjusted must be a boolean")
+        channels = _idle_channel_states() if self.channels is None else self.channels
+        if not isinstance(channels, Mapping) or set(channels) != _CHANNELS:
+            raise ValueError("channels must provide A and B")
+        normalized: dict[str, ChannelPlaybackState] = {}
+        for channel in _CHANNELS:
+            value = channels[channel]
+            if not isinstance(value, ChannelPlaybackState):
+                raise ValueError("channels must contain ChannelPlaybackState values")
+            normalized[channel] = value
+        object.__setattr__(self, "channels", normalized)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -462,6 +526,10 @@ class SessionState:
             "cursor": self.cursor,
             "current_event_id": self.current_event_id,
             "adjusted": self.adjusted,
+            "channels": {
+                channel: self.channels[channel].to_dict()
+                for channel in ("A", "B")
+            },
         }
 
     @classmethod
@@ -479,4 +547,12 @@ class SessionState:
             cursor=data.get("cursor", 0),
             current_event_id=data.get("current_event_id"),
             adjusted=data.get("adjusted", False),
+            channels=(
+                {
+                    channel: ChannelPlaybackState.from_dict(data["channels"][channel])
+                    for channel in ("A", "B")
+                }
+                if "channels" in data
+                else None
+            ),
         )
