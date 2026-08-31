@@ -395,7 +395,9 @@ class SessionController:
         async with self._lock:
             if self._status is SessionStatus.PAUSED:
                 if self._mode == "replay" and self._player is not None:
+                    self._set_status(SessionStatus.FINISHING)
                     await self._player.pause()
+                    self._set_status(SessionStatus.PAUSED)
                 elif self._mode == "autopilot" and self._live_clear_required:
                     await self._pause_live_locked("operator_pause_retry")
                 return self.to_state()
@@ -507,7 +509,9 @@ class SessionController:
         async with self._lock:
             if self._status is SessionStatus.PAUSED:
                 if self._mode == "replay" and self._player is not None:
+                    self._set_status(SessionStatus.FINISHING)
                     await self._player.pause()
+                    self._set_status(SessionStatus.PAUSED)
                 elif self._mode == "autopilot" and self._live_clear_required:
                     await self._pause_live_locked("disconnect_retry")
                 return self.to_state()

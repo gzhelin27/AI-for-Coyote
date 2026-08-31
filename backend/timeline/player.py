@@ -205,12 +205,16 @@ class RecordedCyclePlayer:
 
     async def pause(self) -> int:
         async with self._lock:
-            if self._stopped and self._cleared:
+            if self._stopped and self._clear_cache_is_current():
                 return self._cursor
             task = self._task
-            if self._paused and self._cleared:
+            if self._paused and self._clear_cache_is_current():
                 return self._cursor
-            if task is None and not self._running:
+            if (
+                task is None
+                and not self._running
+                and self._clear_cache_is_current()
+            ):
                 return self._cursor
             if self._running:
                 self._capture_active_elapsed()
@@ -255,7 +259,7 @@ class RecordedCyclePlayer:
 
     async def stop(self) -> None:
         async with self._lock:
-            if self._stopped and self._cleared:
+            if self._stopped and self._clear_cache_is_current():
                 return
             task = self._task
             if not self._stopped:
@@ -351,7 +355,11 @@ class RecordedCyclePlayer:
 
         strength_result = self._effective_for(executed, actions[0])
         cycle_result = self._effective_for(executed, actions[1])
-        if dropped or strength_result is None:
+        if strength_result is None:
+            raise ReplayPlaybackError(
+                "recorded strength prerequisite was not confirmed"
+            )
+        if dropped:
             self._adjusted = True
         if cycle_result is None:
             raise ReplayPlaybackError("recorded cycle action was not executed")
@@ -381,8 +389,9 @@ class RecordedCyclePlayer:
 
     async def _clear_once(self) -> None:
         async with self._clear_lock:
-            if self._cleared:
+            if self._clear_cache_is_current():
                 return
+            self._cleared = False
             self._clear_pending = True
             require_clear = getattr(
                 self._executor, "require_output_clear", None
@@ -394,6 +403,19 @@ class RecordedCyclePlayer:
                 raise ReplayPlaybackError("recorded playback clear was not confirmed")
             self._cleared = True
             self._clear_pending = False
+
+    def _clear_cache_is_current(self) -> bool:
+        if not self._cleared:
+            return False
+        is_confirmed = getattr(
+            self._executor, "output_clear_is_confirmed", None
+        )
+        if not callable(is_confirmed):
+            return True
+        try:
+            return bool(is_confirmed(("A", "B")))
+        except Exception:
+            return False
 
     @staticmethod
     def _clear_was_executed(result: object) -> bool:

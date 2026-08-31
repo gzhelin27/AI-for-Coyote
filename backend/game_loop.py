@@ -102,6 +102,7 @@ class GameLoop:
             OutputIntentKind.MANUAL,
             None,
         )
+        self._manual_session_takeover = False
         self.on_ai_turn = None                 # 由 AppState 注入：把 AI 主动回合推送到页面
         self.timeline_session = None            # 由 AppState 注入：确定性会话/重放控制器
 
@@ -430,6 +431,11 @@ class GameLoop:
             controller = self.timeline_session
             if controller is not None:
                 session_state = controller.to_state()
+                if session_state.mode in ("autopilot", "replay"):
+                    # Persist ownership before the first await.  Subsequent
+                    # manual actions in this takeover must clear the previous
+                    # unrecorded output even after replay has reset to IDLE.
+                    self._manual_session_takeover = True
                 if session_state.mode == "autopilot" and session_state.status.value in (
                     "running",
                     "paused",
@@ -460,7 +466,9 @@ class GameLoop:
                                 status_code=503,
                             ) from exc
                         raise
-            if controller is not None and controller.to_state().mode is not None:
+            if self._manual_session_takeover:
+                if not self._global_clear_is_confirmed():
+                    await self.clear_output()
                 if not self._global_clear_is_confirmed():
                     raise DeviceOutputError(
                         "manual prerequisite clear was not confirmed",
@@ -483,6 +491,7 @@ class GameLoop:
         self, channels=("A", "B")
     ) -> dict[str, int]:
         """Claim fresh coordinator generations for live or replay output."""
+        self._manual_session_takeover = False
         normalized = self._normalize_output_channels(channels)
         return {
             channel: self.output_coordinator.invalidate(
@@ -1529,17 +1538,49 @@ class GameLoop:
         ready = bool(client_id and slot_id)
         dry_run = self.safety.dry_run
         explicit_cycle_channels = set()
+        activation_strength_channels = set()
+        continuation_cycle_channels = set()
         for candidate in actions:
-            if not isinstance(candidate, dict) or candidate.get("op") != "pulse_cycle":
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("op") == "hold_strength":
+                try:
+                    strength_channel = self.safety.norm_channel(
+                        candidate.get("channel")
+                    )
+                except Exception:
+                    strength_channel = None
+                if strength_channel in ("A", "B"):
+                    activation_strength_channels.add(strength_channel)
+            if candidate.get("op") != "pulse_cycle":
                 continue
             wave_ok, _, wave_cmd = self.safety.validate(candidate)
             if wave_ok and wave_cmd and wave_cmd.get("channel") in ("A", "B"):
                 explicit_cycle_channels.add(wave_cmd["channel"])
+                if candidate.get("_strength_prerequisite_confirmed") is True:
+                    continuation_cycle_channels.add(wave_cmd["channel"])
+        required_cycle_prerequisites = (
+            explicit_cycle_channels - continuation_cycle_channels
+            if intent is OutputIntentKind.TIMELINE_OR_REPLAY
+            else explicit_cycle_channels & activation_strength_channels
+        )
+        activation_ready = {
+            channel: False for channel in required_cycle_prerequisites
+        }
 
         for action in actions:
             if not isinstance(action, dict):
                 dropped.append({"action": action, "reason": "动作必须是 JSON 对象"})
                 continue
+            if action.get("op") == "hold_strength":
+                try:
+                    prerequisite_channel = self.safety.norm_channel(
+                        action.get("channel")
+                    )
+                except Exception:
+                    prerequisite_channel = None
+                if prerequisite_channel in activation_ready:
+                    activation_ready[prerequisite_channel] = False
             ok, reason, cmd = self.safety.validate(action)
             if (
                 not ok
@@ -1567,6 +1608,19 @@ class GameLoop:
                 continue
 
             channel = cmd.get("channel")
+            if (
+                cmd["kind"] == "pulse_cycle"
+                and channel in activation_ready
+                and not activation_ready[channel]
+            ):
+                dropped.append(
+                    {
+                        "action": action,
+                        "reason": "strength prerequisite was not confirmed",
+                        "sent": False,
+                    }
+                )
+                continue
             if (
                 channel in ("A", "B")
                 and cmd["kind"] not in ("clear", "stop")
@@ -1622,19 +1676,14 @@ class GameLoop:
                 continue
 
             self.safety.record(cmd)
+            if (
+                cmd["kind"] == "hold"
+                and action.get("op") == "hold_strength"
+                and channel in activation_ready
+            ):
+                activation_ready[channel] = True
             if transaction.get("helper_cmd") is not None:
                 self.safety.record(transaction["helper_cmd"])
-            if cmd["kind"] == "temp" and ready and not dry_run:
-                self._schedule_temp_revert(
-                    client_id,
-                    slot_id,
-                    CHANNEL[channel],
-                    channel,
-                    cmd["duration_s"],
-                    owner_generation=transaction["generation"],
-                    owner_revision=self.output_coordinator.revision(channel),
-                    owner_intent=intent,
-                )
             self._record_success_turn(cmd)
             label = self._describe(cmd)
             executed.append({
@@ -1798,6 +1847,21 @@ class GameLoop:
                 effective.update(
                     waveform=helper_cmd["pattern"], waveform_mode="loop"
                 )
+            if cmd["kind"] == "temp":
+                # The coordinator owns this callback through settlement even
+                # when its caller is cancelled.  Install the delayed revert
+                # before publishing transport completion so cancellation can
+                # never strand a committed temporary strength.
+                self._schedule_temp_revert(
+                    client_id,
+                    slot_id,
+                    CHANNEL[channel],
+                    channel,
+                    cmd["duration_s"],
+                    owner_generation=generation,
+                    owner_revision=coordinator.revision(channel) + 1,
+                    owner_intent=intent,
+                )
             state["complete"] = True
             state["sent"] = not simulated or helper_sent
             return TransportOutcome(
@@ -1891,16 +1955,6 @@ class GameLoop:
                     for name in ("A", "B")
                 }
                 if dry_run:
-                    state["complete"] = True
-                    return TransportOutcome(
-                        sent=True, simulated=True, effective=effective
-                    )
-                if intent is OutputIntentKind.ESTOP and all(
-                    snapshots[name].strength in (None, 0)
-                    and snapshots[name].waveform is None
-                    and snapshots[name].waveform_mode is None
-                    for name in ("A", "B")
-                ):
                     state["complete"] = True
                     return TransportOutcome(
                         sent=True, simulated=True, effective=effective
@@ -2099,6 +2153,8 @@ class GameLoop:
         self, frames: list[dict]
     ) -> tuple[bool, str | None]:
         """Attempt every frame so safety cleanup is not truncated by one error."""
+        if not frames:
+            return False, "no transport frames"
         sent = True
         errors: list[str] = []
         for frame in frames:
@@ -2148,7 +2204,11 @@ class GameLoop:
         return tuple(channels)
 
     def _global_clear_is_confirmed(self) -> bool:
-        for channel in ("A", "B"):
+        return self.output_clear_is_confirmed(("A", "B"))
+
+    def output_clear_is_confirmed(self, channels=("A", "B")) -> bool:
+        """Return whether the coordinator has no output or pending clear work."""
+        for channel in self._normalize_output_channels(channels):
             confirmed = self.output_coordinator.confirmed(channel)
             pending = self.output_coordinator.pending(channel)
             if (

@@ -107,6 +107,27 @@ class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(harness.player.adjusted)
 
+    async def test_missing_replay_strength_result_fails_activation(self):
+        harness = ReplayHarness.from_strength(original=20, current_cap=40)
+        self.addAsyncCleanup(harness.close)
+        execute_actions = harness.executor.execute_actions
+
+        async def omit_strength_result(actions):
+            executed, dropped = await execute_actions(actions)
+            return [
+                item
+                for item in executed
+                if item.get("action", {}).get("op") != "hold_strength"
+            ], dropped
+
+        harness.executor.execute_actions = omit_strength_result
+
+        await harness.player.start()
+        with self.assertRaisesRegex(
+            ReplayPlaybackError, "strength prerequisite"
+        ):
+            await harness.player.wait()
+
     async def test_pause_and_resume_from_cursor_restarts_at_safe_cycle(self):
         harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
         self.addAsyncCleanup(harness.close)

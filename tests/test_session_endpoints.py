@@ -16,7 +16,10 @@ import backend.main as main_module
 from backend.output_coordinator import OutputIntentKind
 from backend.timeline.models import SessionStatus
 from backend.timeline.replay_store import ReplayStore
-from tests.test_game_loop_timeline import make_game_loop_for_test
+from tests.test_game_loop_timeline import (
+    make_game_loop_for_test,
+    relay_output_operations,
+)
 from tests.timeline_fakes import SessionHarness
 
 
@@ -367,6 +370,70 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stopped.status_code, 200)
         self.assertEqual(stopped.json()["status"], "idle")
 
+    async def test_paused_replay_stop_retries_new_pending_clear(self):
+        await self._start_active_replay()
+        paused = await self.client.post("/api/replays/playback/pause")
+        self.assertEqual(paused.status_code, 200)
+        self.harness.safety.dry_run = False
+        self.harness.relay.fail_next_clear()
+
+        failed = await self.client.post("/api/replays/playback/stop")
+
+        self.assertEqual(failed.status_code, 409)
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.FINISHING,
+        )
+        for channel in ("A", "B"):
+            self.assertTrue(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
+        retried = await self.client.post("/api/replays/playback/stop")
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.json()["status"], "idle")
+        for channel in ("A", "B"):
+            self.assertFalse(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
+    async def test_paused_replay_disconnect_retries_new_pending_clear(self):
+        await self._start_active_replay()
+        paused = await self.client.post("/api/replays/playback/pause")
+        self.assertEqual(paused.status_code, 200)
+        self.harness.safety.dry_run = False
+        self.harness.relay.fail_next_clear()
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await self.state.on_relay_event("client_disconnected", {})
+
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.FINISHING,
+        )
+        for channel in ("A", "B"):
+            self.assertTrue(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
+        await self.state.on_relay_event("client_disconnected", {})
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.PAUSED,
+        )
+        for channel in ("A", "B"):
+            self.assertFalse(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
     async def test_cancelled_replay_pause_endpoint_finishes_physical_clear(self):
         await self._start_active_replay()
         clear_started = asyncio.Event()
@@ -528,6 +595,55 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         stored = self.harness.store.load(replay_id)
         self.assertFalse(stored.manifest.adjusted)
 
+    async def test_repeated_live_manual_action_clears_previous_manual_output(self):
+        await self._start_physical_live(20)
+        first = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 7},
+        )
+        self.assertEqual(first.status_code, 200)
+        frame_count = len(self.harness.relay.sent_frames)
+
+        second = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 6},
+        )
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(self.harness.safety.current["A"], 6)
+        operations = relay_output_operations(
+            self.harness.relay.sent_frames[frame_count:]
+        )
+        self.assertTrue(any(item[0] == "clear" for item in operations))
+        self.assertTrue(
+            any(item[0] == "strength_delta" for item in operations)
+        )
+
+    async def test_repeated_replay_manual_action_clears_previous_manual_output(self):
+        await self._start_active_replay()
+        self.harness.safety.dry_run = False
+        first = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 7},
+        )
+        self.assertEqual(first.status_code, 200)
+        frame_count = len(self.harness.relay.sent_frames)
+
+        second = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 6},
+        )
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(self.harness.safety.current["A"], 6)
+        operations = relay_output_operations(
+            self.harness.relay.sent_frames[frame_count:]
+        )
+        self.assertTrue(any(item[0] == "clear" for item in operations))
+        self.assertTrue(
+            any(item[0] == "strength_delta" for item in operations)
+        )
+
     async def test_failed_live_prerequisite_clear_blocks_manual_device_output(self):
         await self._start_physical_live(20)
         self.harness.relay.fail_next_clear()
@@ -566,6 +682,14 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.controller.recorded_cycles, ())
         self.assertEqual(self.harness.store.list(), [])
         self.assertEqual(self.harness.safety.current["A"], 0)
+        self.assertFalse(
+            any(
+                operation[0] == "waveform"
+                for operation in relay_output_operations(
+                    self.harness.relay.sent_frames
+                )
+            )
+        )
 
     async def test_live_transport_exception_creates_no_cycle_record(self):
         self.harness.safety.dry_run = False
@@ -584,6 +708,58 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.controller.recorded_cycles, ())
         self.assertEqual(self.harness.store.list(), [])
         self.assertEqual(self.harness.safety.current["A"], 0)
+        self.assertFalse(
+            any(
+                operation[0] == "waveform"
+                for operation in relay_output_operations(
+                    self.harness.relay.sent_frames
+                )
+            )
+        )
+
+    async def test_replay_strength_failure_sends_no_waveform_frame(self):
+        summary = await self._finish_replay_with_cycle()
+        self.harness.safety.dry_run = False
+        self.harness.relay.sent_frames.clear()
+        self.harness.relay.fail_next_strength_delta("A")
+
+        playing = await self.client.post(
+            f"/api/replays/{summary['replay_id']}/play",
+            json={"cursor": 0},
+        )
+        self.assertEqual(playing.status_code, 200)
+        for _ in range(40):
+            await asyncio.sleep(0)
+            if self.harness.relay.sent_frames:
+                break
+
+        operations = relay_output_operations(self.harness.relay.sent_frames)
+        self.assertTrue(
+            any(operation[0] == "strength_delta" for operation in operations)
+        )
+        self.assertFalse(
+            any(operation[0] == "waveform" for operation in operations)
+        )
+
+    async def test_timeline_cycle_without_strength_prerequisite_sends_nothing(self):
+        self.harness.safety.dry_run = False
+        generations = self.harness.loop.begin_timeline_output(("A",))
+        self.harness.relay.sent_frames.clear()
+
+        executed, dropped = await self.harness.loop.execute_timeline_actions(
+            [
+                {
+                    "op": "pulse_cycle",
+                    "channel": "A",
+                    "pattern": "呼吸",
+                }
+            ],
+            generations,
+        )
+
+        self.assertEqual(executed, [])
+        self.assertTrue(dropped)
+        self.assertEqual(self.harness.relay.sent_frames, [])
 
     async def test_failed_replay_prerequisite_clear_blocks_manual_device_output(self):
         await self._start_active_replay()
@@ -676,6 +852,54 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.status_code, 200)
         self.assertTrue(blocked.json()["dropped"])
         self.assertEqual(len(self.harness.relay.sent_frames), frame_count)
+
+    async def test_missing_relay_ids_cannot_confirm_empty_helper_cleanup(self):
+        self.harness.safety.dry_run = False
+        self.harness.relay.fail_next_strength_delta("A")
+        connected = True
+        original_send = self.harness.relay.send_frame
+
+        def client_id():
+            return "client-test" if connected else None
+
+        def slot_id(_client_id=None):
+            return "slot-test" if connected else None
+
+        async def disconnect_on_primary(frame):
+            nonlocal connected
+            inner = frame.get("data", {}) if isinstance(frame, dict) else {}
+            data = inner.get("data", {}) if isinstance(inner, dict) else {}
+            if inner.get("m") == "device.op" and data.get("t") == 3:
+                connected = False
+            return await original_send(frame)
+
+        with (
+            patch.object(
+                self.harness.relay, "first_client_id", side_effect=client_id
+            ),
+            patch.object(
+                self.harness.relay, "get_slot_id", side_effect=slot_id
+            ),
+            patch.object(
+                self.harness.relay,
+                "send_frame",
+                side_effect=disconnect_on_primary,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/manual",
+                json={"op": "hold_strength", "channel": "A", "value": 5},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["dropped"])
+        confirmed = self.harness.loop.output_coordinator.confirmed("A")
+        self.assertEqual(confirmed.strength, 0)
+        self.assertEqual(confirmed.waveform, "呼吸")
+        self.assertEqual(confirmed.waveform_mode, "finite")
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("A").clear_required
+        )
 
     async def test_cancelled_failed_helper_cleanup_still_blocks_later_output(self):
         self.harness.safety.dry_run = False
@@ -787,6 +1011,66 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.harness.loop.output_coordinator.pending("A").clear_required
         )
 
+    async def test_cancel_after_temp_transport_still_owns_revert_scheduling(self):
+        self.harness.safety.dry_run = False
+        self.harness.safety.pulse_until["A"] = float("inf")
+        transport_committed = asyncio.Event()
+        release_boundary = asyncio.Event()
+        revert_scheduled = asyncio.Event()
+        scheduled = []
+        original_transaction = self.harness.loop._run_action_transaction
+        original_schedule = self.harness.loop._schedule_temp_revert
+
+        async def expose_post_transport_boundary(**kwargs):
+            result = await original_transaction(**kwargs)
+            if kwargs["cmd"]["kind"] == "temp":
+                transport_committed.set()
+                await release_boundary.wait()
+            return result
+
+        def capture_revert(*args, **kwargs):
+            before = set(asyncio.all_tasks())
+            original_schedule(*args, **kwargs)
+            scheduled.extend(set(asyncio.all_tasks()) - before)
+            revert_scheduled.set()
+
+        with (
+            patch.object(
+                self.harness.loop,
+                "_run_action_transaction",
+                side_effect=expose_post_transport_boundary,
+            ),
+            patch.object(
+                self.harness.loop,
+                "_schedule_temp_revert",
+                side_effect=capture_revert,
+            ),
+        ):
+            request = asyncio.create_task(
+                self.harness.loop.execute_manual_action(
+                    {
+                        "op": "temp_strength",
+                        "channel": "A",
+                        "value": 5,
+                        "duration_s": 10,
+                    }
+                )
+            )
+            await asyncio.wait_for(transport_committed.wait(), timeout=0.2)
+            self.assertEqual(
+                self.harness.loop.output_coordinator.confirmed("A").strength,
+                5,
+            )
+
+            request.cancel()
+            result = await asyncio.gather(request, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertTrue(revert_scheduled.is_set())
+        self.assertEqual(len(scheduled), 1)
+        scheduled[0].cancel()
+        await asyncio.gather(scheduled[0], return_exceptions=True)
+
     async def test_global_stop_result_maps_both_effective_channels(self):
         response = await self.client.post("/api/manual", json={"op": "stop"})
 
@@ -871,6 +1155,19 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.harness.loop.output_coordinator.pending("B").clear_required
         )
 
+    async def test_idle_physical_estop_always_sends_global_clear(self):
+        self.harness.safety.dry_run = False
+        self.harness.relay.sent_frames.clear()
+
+        response = await self.client.post("/api/estop")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["sent"])
+        operations = relay_output_operations(self.harness.relay.sent_frames)
+        self.assertIn(("clear", None), operations)
+        self.assertIn(("reset", 0), operations)
+        self.assertIn(("reset", 1), operations)
+
     async def test_stale_timeline_generation_cannot_reach_transport(self):
         self.harness.safety.dry_run = False
         generations = self.harness.loop.begin_timeline_output(("A",))
@@ -907,6 +1204,27 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.harness.controller.to_state().status, SessionStatus.IDLE
         )
+
+    async def test_repeated_idle_manual_action_does_not_add_session_clear(self):
+        self.harness.safety.dry_run = False
+        first = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 5},
+        )
+        self.assertEqual(first.status_code, 200)
+        frame_count = len(self.harness.relay.sent_frames)
+
+        second = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 6},
+        )
+
+        self.assertEqual(second.status_code, 200)
+        operations = relay_output_operations(
+            self.harness.relay.sent_frames[frame_count:]
+        )
+        self.assertFalse(any(item[0] == "clear" for item in operations))
+        self.assertEqual(self.harness.safety.current["A"], 6)
 
     async def test_download_uses_safe_name_and_rejects_missing_or_traversal_ids(self):
         started = await self.client.post("/api/session/start")

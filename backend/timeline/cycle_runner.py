@@ -394,6 +394,11 @@ class ChannelCycleRunner:
                     "channel": self.channel,
                     "pattern": directive.pattern,
                 }
+                if not activating:
+                    # A continuation reuses the strength confirmed by this
+                    # runner's current owner generation.  Initial activations
+                    # deliberately omit this marker and must carry a hold.
+                    pulse["_strength_prerequisite_confirmed"] = True
                 actions.append(pulse)
 
                 try:
