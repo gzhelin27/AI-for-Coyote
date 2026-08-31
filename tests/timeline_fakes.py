@@ -714,6 +714,10 @@ class _CountingCycleRandom:
 class _TimelineRelay:
     def __init__(self) -> None:
         self.frames: list[dict[str, Any]] = []
+        self.attempts: list[dict[str, Any]] = []
+        self._strength_failures: list[str] = []
+        self._clear_failures: list[str | None] = []
+        self.fail_all_clears = False
 
     def first_client_id(self) -> str:
         return "integration-client"
@@ -722,8 +726,76 @@ class _TimelineRelay:
         return "integration-slot"
 
     async def send_frame(self, frame: dict[str, Any]) -> bool:
+        self.attempts.append(frame)
+        method, payload = self._operation(frame)
+        channel = self._channel_name(payload)
+        if method == "device.op" and payload.get("t") == 3:
+            if channel in self._strength_failures:
+                self._strength_failures.remove(channel)
+                return False
+        if method == "device.op.clear":
+            if self.fail_all_clears or channel in self._clear_failures:
+                if channel in self._clear_failures:
+                    self._clear_failures.remove(channel)
+                return False
         self.frames.append(frame)
         return True
+
+    def fail_next_strength_delta(self, channel: str) -> None:
+        if channel not in ("A", "B"):
+            raise ValueError("channel must be A or B")
+        self._strength_failures.append(channel)
+
+    def fail_next_clear(self, channel: str | None = None) -> None:
+        if channel not in (None, "A", "B"):
+            raise ValueError("channel must be A, B, or None")
+        self._clear_failures.append(channel)
+
+    def strength_deltas(self, channel: str) -> list[int]:
+        if channel not in ("A", "B"):
+            raise ValueError("channel must be A or B")
+        return [
+            int(payload["v"])
+            for frame in self.attempts
+            for method, payload in (self._operation(frame),)
+            if method == "device.op"
+            and self._channel_name(payload) == channel
+            and payload.get("t") == 3
+        ]
+
+    @classmethod
+    def is_positive_manual_output(cls, frame: dict[str, Any]) -> bool:
+        method, payload = cls._operation(frame)
+        value = payload.get("v")
+        return (
+            method == "device.op"
+            and payload.get("t") == 3
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        )
+
+    @classmethod
+    def is_waveform_helper(cls, frame: dict[str, Any]) -> bool:
+        method, payload = cls._operation(frame)
+        values = payload.get("v")
+        return (
+            method == "device.op"
+            and payload.get("t") == 0
+            and isinstance(values, list)
+            and len(values) > 2
+        )
+
+    @staticmethod
+    def _operation(frame: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+        data = frame.get("data") if isinstance(frame, dict) else None
+        payload = data.get("data") if isinstance(data, dict) else None
+        method = data.get("m") if isinstance(data, dict) else None
+        return method, payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _channel_name(payload: Mapping[str, Any]) -> str | None:
+        return {0: "A", 1: "B"}.get(payload.get("c"))
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -742,7 +814,12 @@ class TimelineHarness:
         raise RuntimeError("use TimelineHarness.create")
 
     @classmethod
-    async def create(cls, seed: int, dry_run: bool) -> "TimelineHarness":
+    async def create(
+        cls,
+        seed: int,
+        dry_run: bool,
+        cycle_rngs: Mapping[str, Any] | None = None,
+    ) -> "TimelineHarness":
         from backend.config import DEFAULTS
         from backend.game_loop import GameLoop
         from backend.safety import SafetyManager
@@ -801,12 +878,23 @@ class TimelineHarness:
             self.relay,
         )
         self.store = ReplayStore(Path(self._temporary.name))
-        self._cycle_rngs = {
-            channel: _CountingCycleRandom(
-                derive_stream_seed(seed, f"cycle:{channel}")
-            )
-            for channel in ("A", "B")
-        }
+        if cycle_rngs is None:
+            self._cycle_rngs = {
+                channel: _CountingCycleRandom(
+                    derive_stream_seed(seed, f"cycle:{channel}")
+                )
+                for channel in ("A", "B")
+            }
+        else:
+            if set(cycle_rngs) - {"A", "B"}:
+                raise ValueError("cycle RNGs may only be provided for A or B")
+            self._cycle_rngs = {
+                channel: cycle_rngs.get(
+                    channel,
+                    _CountingCycleRandom(derive_stream_seed(seed, f"cycle:{channel}")),
+                )
+                for channel in ("A", "B")
+            }
         self.controller = SessionController(
             game_loop=self.loop,
             store=self.store,
@@ -827,6 +915,8 @@ class TimelineHarness:
                 "dlc_role": "integration",
                 "dlc_profile": "dry-run",
                 "dlc_version": "integration-v1",
+                "app_fingerprint": "integration-app-v1",
+                "dlc_fingerprint": "integration-dlc-v1",
             },
         )
         self.loop.timeline_session = self.controller
@@ -864,6 +954,48 @@ class TimelineHarness:
                 self.clock.advance(remaining)
             await asyncio.sleep(0)
         raise AssertionError(f"{channel} did not complete {count} cycles")
+
+    def completed_cycles(self, channel: str) -> int:
+        if channel not in ("A", "B"):
+            raise ValueError("channel must be A or B")
+        return sum(
+            record.channel == channel and record.completed
+            for record in self.controller.recorded_cycles
+        )
+
+    async def wait_for_phase(self, channel: str, phase: str) -> None:
+        if channel not in ("A", "B"):
+            raise ValueError("channel must be A or B")
+        for _ in range(100):
+            runner = self.controller.runners.get(channel)
+            if runner is not None and runner.state().phase.value == phase:
+                return
+            remaining = self.clock.next_remaining_ms
+            if remaining is not None:
+                self.clock.advance(remaining)
+            await asyncio.sleep(0)
+        raise AssertionError(f"{channel} did not enter {phase}")
+
+    async def wait_for_pending_record(self, channel: str) -> None:
+        if channel not in ("A", "B"):
+            raise ValueError("channel must be A or B")
+        for _ in range(100):
+            runner = self.controller.runners.get(channel)
+            if runner is not None and runner.pending_records():
+                return
+            remaining = self.clock.next_remaining_ms
+            if remaining is not None:
+                self.clock.advance(remaining)
+            await asyncio.sleep(0)
+        raise AssertionError(f"{channel} did not retain a pending record")
+
+    def set_current_provenance(self, **metadata: str) -> None:
+        allowed = {"app_fingerprint", "dlc_fingerprint"}
+        if set(metadata) - allowed or not all(
+            isinstance(value, str) and value for value in metadata.values()
+        ):
+            raise ValueError("only non-empty replay provenance fingerprints are allowed")
+        self.controller._manifest_metadata.update(metadata)
 
     async def finish(self) -> ReplaySummary:
         return await self.controller.finish()
