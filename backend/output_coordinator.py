@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -160,6 +161,46 @@ class DeviceOutputCoordinator:
         )
         return await _await_cleanup(task)
 
+    async def confirm_loop_stopped(
+        self,
+        channel: str,
+        waveform: str,
+        *,
+        expected_revision: int,
+        batch_expires_at: float,
+    ) -> int | None:
+        """Conditionally publish that a repeating waveform owner has stopped.
+
+        A successfully delivered batch remains physical until its deadline, so
+        the state becomes ``finite`` while that batch is active and clear after
+        it expires.  The revision comparison prevents an older worker from
+        overwriting a replacement that committed while cleanup was queued.
+        """
+        slot = self._slot(channel)
+        expected_waveform = _optional_text(waveform, "waveform")
+        if expected_waveform is None:
+            raise ValueError("waveform cannot be None")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected revision must be a non-negative integer")
+        if isinstance(batch_expires_at, bool) or not isinstance(
+            batch_expires_at, (int, float)
+        ):
+            raise ValueError("batch expiry must be a monotonic timestamp")
+        expiry = float(batch_expires_at)
+        task = asyncio.create_task(
+            self._confirm_loop_stopped_locked(
+                slot,
+                expected_waveform,
+                expected_revision,
+                expiry,
+            )
+        )
+        return await _await_cleanup(task)
+
     @staticmethod
     async def _confirm_reported_strength_locked(
         slot: _ChannelSlot,
@@ -176,6 +217,30 @@ class DeviceOutputCoordinator:
             slot.revision += 1
             slot.generation += 1
             return slot.confirmed
+
+    @staticmethod
+    async def _confirm_loop_stopped_locked(
+        slot: _ChannelSlot,
+        waveform: str,
+        expected_revision: int,
+        batch_expires_at: float,
+    ) -> int | None:
+        async with slot.lock:
+            if slot.revision != expected_revision:
+                return None
+            if (
+                slot.confirmed.waveform != waveform
+                or slot.confirmed.waveform_mode != "loop"
+            ):
+                return None
+            batch_active = time.monotonic() < batch_expires_at
+            slot.confirmed = replace(
+                slot.confirmed,
+                waveform=waveform if batch_active else None,
+                waveform_mode="finite" if batch_active else None,
+            )
+            slot.revision += 1
+            return slot.revision
 
     def generation(self, channel: str) -> int:
         return self._slot(channel).generation

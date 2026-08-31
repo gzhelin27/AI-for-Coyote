@@ -9,6 +9,7 @@ AddIntensity（相对增减）是最可靠的原语。因此所有强度命令�
 """
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from .config import reload_character
@@ -31,8 +32,10 @@ class _AIActionOrigin:
     session_id: str | None
 
 
-async def _await_owned_group(group):
-    """Let report reconciliation settle before propagating caller cancellation."""
+async def _await_owned_group(awaitables):
+    """Own every child through settlement before propagating an outcome."""
+    tasks = tuple(asyncio.ensure_future(item) for item in awaitables)
+    group = asyncio.gather(*tasks, return_exceptions=True)
     caller_cancelled = False
     while not group.done():
         try:
@@ -45,6 +48,9 @@ async def _await_owned_group(group):
     results = group.result()
     if caller_cancelled:
         raise asyncio.CancelledError
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
     return results
 
 
@@ -74,6 +80,7 @@ class GameLoop:
         # 循环波形任务：channel -> (task, stop_event)
         self.loop_tasks: dict[str, asyncio.Task] = {}
         self.loop_events: dict[str, asyncio.Event] = {}
+        self._loop_reset_requests: set[asyncio.Task] = set()
 
         # 当前播放的波形（按通道，供页面显示与 AI 上下文）
         self.patterns: dict[str, str | None] = {"A": None, "B": None}
@@ -656,10 +663,10 @@ class GameLoop:
             "wave_key": meta["waveform"], "frames": meta["frames"],
         }
         if ready and not dry_run:
-            sent = await self._start_pulse_loop(
+            batch_expires_at = await self._start_pulse_loop(
                 client_id, slot_id, CHANNEL[ch_name], ch_name, cmd
             )
-            if not sent:
+            if batch_expires_at is None:
                 return False
         self.patterns[ch_name] = pattern
         self.safety.record(cmd)
@@ -771,10 +778,18 @@ class GameLoop:
     ) -> bool:
         async def transport(snapshot):
             current = int(snapshot.strength or 0)
+            effective_cap = self.safety.cap_for(channel)
             if cmd["kind"] == "hold":
-                effective_strength = int(cmd["value"])
+                effective_strength = max(
+                    0, min(int(cmd["value"]), effective_cap)
+                )
             else:
-                effective_strength = max(0, min(200, current + int(cmd["delta"])))
+                requested_delta = int(
+                    cmd.get("requested_delta", cmd["delta"])
+                )
+                effective_strength = max(
+                    0, min(current + requested_delta, effective_cap)
+                )
             if dry_run:
                 return TransportOutcome(
                     sent=True,
@@ -829,8 +844,10 @@ class GameLoop:
             "wave_key": meta["waveform"],
             "frames": meta["frames"],
         }
+        batch_expires_at: float | None = None
 
         async def transport(snapshot):
+            nonlocal batch_expires_at
             if dry_run:
                 return TransportOutcome(
                     sent=True,
@@ -842,7 +859,7 @@ class GameLoop:
                 )
             if not ready:
                 return TransportOutcome(sent=False, error="device is not connected")
-            sent = await self._start_pulse_loop(
+            batch_expires_at = await self._start_pulse_loop(
                 client_id,
                 slot_id,
                 CHANNEL[channel],
@@ -850,6 +867,7 @@ class GameLoop:
                 cmd,
                 owner_generation=generation,
             )
+            sent = batch_expires_at is not None
             stale = not self._floor_generation_is_current(channel, generation)
             if stale:
                 self._cancel_loops(channel, reset_pulse=False)
@@ -871,7 +889,16 @@ class GameLoop:
         )
         if not outcome.sent:
             return False
-        self.safety.record(cmd)
+        confirmed = self.output_coordinator.confirmed(channel)
+        if confirmed.waveform_mode == "loop":
+            self.safety.record(cmd)
+        elif (
+            confirmed.waveform_mode == "finite"
+            and batch_expires_at is not None
+        ):
+            self.safety.pulse_until[channel] = batch_expires_at
+        elif confirmed.waveform is None:
+            self.safety.pulse_until[channel] = 0.0
         logger.info(
             "自动挂载默认波形：%s 通道「%s」（强度需波形承载）",
             channel,
@@ -1010,18 +1037,15 @@ class GameLoop:
         if not affected:
             return {}
 
-        report_group = asyncio.gather(
-            *(
-                self._reconcile_device_report_channel(
-                    channel,
-                    reported_strength=reported_strengths.get(channel),
-                    local_strength=local_strengths[channel],
-                    observed_revision=revisions[channel],
-                )
-                for channel in affected
+        channel_results = await _await_owned_group(
+            self._reconcile_device_report_channel(
+                channel,
+                reported_strength=reported_strengths.get(channel),
+                local_strength=local_strengths[channel],
+                observed_revision=revisions[channel],
             )
+            for channel in affected
         )
-        channel_results = await _await_owned_group(report_group)
         return {
             channel: result
             for channel, result in zip(affected, channel_results)
@@ -1469,10 +1493,11 @@ class GameLoop:
                 sent = False
                 if ready and not dry_run:
                     try:
-                        sent = await self._start_pulse_loop(
+                        batch_expires_at = await self._start_pulse_loop(
                             client_id, slot_id,
                             CHANNEL[cmd["channel"]], cmd["channel"], cmd,
                         )
+                        sent = batch_expires_at is not None
                     except Exception as exc:
                         dropped.append(
                             self._transport_failure(
@@ -1731,7 +1756,7 @@ class GameLoop:
         cmd: dict,
         *,
         owner_generation: int | None = None,
-    ) -> bool:
+    ) -> float | None:
         """分批下发波形实现无限循环，批间提前覆盖消除真空期。
 
         - 每批 = 波形自然周期的整数倍时长（尽量贴合循环边界）
@@ -1759,49 +1784,134 @@ class GameLoop:
         wait_s = max(0.1, batch_s - overlap)
 
         if not all(await self._send_all([next_frame()])):
-            return False
+            return None
+        last_batch_expires_at = time.monotonic() + batch_s
 
         stop_event = asyncio.Event()
         self.loop_events[ch_name] = stop_event
 
         async def worker() -> None:
+            nonlocal last_batch_expires_at
+            current_task = asyncio.current_task()
             logger.info(
                 "%s 通道循环波形开始：%s（批次 %.1fs，提前 %.2fs 覆盖）",
                 ch_name, cmd["pattern"], batch_s, overlap,
             )
-            while not stop_event.is_set():
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
-                    break
-                except asyncio.TimeoutError:
-                    pass
-                if self.safety.estop_active:
-                    break
+            try:
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            stop_event.wait(), timeout=wait_s
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+                    if self.safety.estop_active:
+                        break
+                    if (
+                        owner_generation is not None
+                        and not self._floor_generation_is_current(
+                            ch_name, owner_generation
+                        )
+                    ):
+                        break
+                    sent = all(await self._send_all([next_frame()]))
+                    if sent:
+                        last_batch_expires_at = time.monotonic() + batch_s
+            finally:
+                reset_requested = current_task in self._loop_reset_requests
+                self._loop_reset_requests.discard(current_task)
+                owns_task = self.loop_tasks.get(ch_name) is current_task
+                owns_event = self.loop_events.get(ch_name) is stop_event
+                if owns_task:
+                    self.loop_tasks.pop(ch_name, None)
+                if owns_event:
+                    self.loop_events.pop(ch_name, None)
                 if (
                     owner_generation is not None
-                    and not self._floor_generation_is_current(
-                        ch_name, owner_generation
-                    )
+                    and owns_task
+                    and owns_event
+                    and not reset_requested
                 ):
-                    break
-                await self._send_all([next_frame()])
-            logger.info("%s 通道循环波形结束：%s", ch_name, cmd["pattern"])
+                    await self._finish_floor_loop_worker(
+                        ch_name,
+                        str(cmd["pattern"]),
+                        last_batch_expires_at,
+                    )
+                logger.info(
+                    "%s 通道循环波形结束：%s",
+                    ch_name,
+                    cmd["pattern"],
+                )
 
-        self.loop_tasks[ch_name] = asyncio.create_task(worker())
-        return True
+        worker_task = asyncio.create_task(worker())
+        self.loop_tasks[ch_name] = worker_task
+
+        def reap_unstarted_or_finished_task(task: asyncio.Task) -> None:
+            self._loop_reset_requests.discard(task)
+            if self.loop_tasks.get(ch_name) is task:
+                self.loop_tasks.pop(ch_name, None)
+            if self.loop_events.get(ch_name) is stop_event:
+                self.loop_events.pop(ch_name, None)
+
+        worker_task.add_done_callback(reap_unstarted_or_finished_task)
+        return last_batch_expires_at
+
+    async def _finish_floor_loop_worker(
+        self,
+        channel: str,
+        waveform: str,
+        batch_expires_at: float,
+    ) -> None:
+        """Publish a stopped floor loop without overwriting a newer owner."""
+        coordinator = self.output_coordinator
+        while channel not in self.loop_tasks:
+            confirmed = coordinator.confirmed(channel)
+            if (
+                confirmed.waveform != waveform
+                or confirmed.waveform_mode != "loop"
+            ):
+                return
+            expected_revision = coordinator.revision(channel)
+            committed_revision = await coordinator.confirm_loop_stopped(
+                channel,
+                waveform,
+                expected_revision=expected_revision,
+                batch_expires_at=batch_expires_at,
+            )
+            if committed_revision is None:
+                continue
+            if (
+                channel in self.loop_tasks
+                or coordinator.revision(channel) != committed_revision
+            ):
+                return
+            self._publish_coordinator_confirmed(channel)
+            confirmed = coordinator.confirmed(channel)
+            if confirmed.waveform_mode == "finite":
+                self.safety.pulse_until[channel] = batch_expires_at
+            return
 
     def _cancel_loops(
         self, ch_name: str | None, *, reset_pulse: bool = True
     ) -> None:
         """取消循环波形；ch_name=None 时取消全部。"""
-        names = [ch_name] if ch_name else list(self.loop_events)
+        names = (
+            [ch_name]
+            if ch_name
+            else list(dict.fromkeys((*self.loop_events, *self.loop_tasks)))
+        )
         for name in names:
-            event = self.loop_events.pop(name, None)
+            event = self.loop_events.get(name)
             if event:
                 event.set()
-            task = self.loop_tasks.pop(name, None)
+            task = self.loop_tasks.get(name)
             if task:
+                if reset_pulse:
+                    self._loop_reset_requests.add(task)
                 task.cancel()
+            elif self.loop_events.get(name) is event:
+                self.loop_events.pop(name, None)
         if reset_pulse and ch_name and ch_name in self.safety.pulse_until:
             self.safety.pulse_until[ch_name] = 0.0
 

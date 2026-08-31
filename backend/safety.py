@@ -228,15 +228,23 @@ class SafetyManager:
         ch = self.norm_channel(a.get("channel"))
         if (reason := self._check_enabled(ch)):
             raise SafetyError(reason)
-        delta = int(float(a.get("delta", 0)))
-        delta = max(-self.max_step, min(delta, self.max_step))  # 步长钳制
+        requested_delta = int(float(a.get("delta", 0)))
+        requested_delta = max(
+            -self.max_step, min(requested_delta, self.max_step)
+        )  # 步长钳制
         cap = self.cap_for(ch)
-        new_value = max(0, min(self.current[ch] + delta, cap))
+        new_value = max(0, min(self.current[ch] + requested_delta, cap))
         actual_delta = new_value - self.current[ch]
         return (
             True,
             f"{ch} 通道增减 {actual_delta}（当前 {self.current[ch]} -> {new_value}）",
-            {"kind": "add", "channel": ch, "delta": actual_delta, "value": new_value},
+            {
+                "kind": "add",
+                "channel": ch,
+                "delta": actual_delta,
+                "requested_delta": requested_delta,
+                "value": new_value,
+            },
         )
 
     def _preset_meta(self, pattern: str) -> dict:

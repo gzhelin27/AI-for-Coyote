@@ -1,5 +1,6 @@
 import asyncio
 from copy import deepcopy
+import time
 import unittest
 from unittest.mock import AsyncMock, Mock
 
@@ -732,6 +733,146 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             loop.output_coordinator.pending("A").target_strength
         )
 
+    async def test_report_group_waits_for_blocked_sibling_before_raising(self):
+        loop = make_game_loop_for_test()
+        a_failed = asyncio.Event()
+        b_started = asyncio.Event()
+        release_b = asyncio.Event()
+        b_settled = asyncio.Event()
+
+        async def reconcile(channel, **_kwargs):
+            if channel == "A":
+                await b_started.wait()
+                a_failed.set()
+                raise RuntimeError("A failed")
+            b_started.set()
+            await release_b.wait()
+            b_settled.set()
+            return None
+
+        loop._reconcile_device_report_channel = reconcile
+        report = asyncio.create_task(
+            loop.update_device_state(
+                None, {"channelA": {}, "channelB": {}}
+            )
+        )
+        await asyncio.wait_for(a_failed.wait(), timeout=1)
+        try:
+            completed, _ = await asyncio.wait({report}, timeout=0.05)
+            self.assertNotIn(report, completed)
+        finally:
+            release_b.set()
+            result = (await asyncio.gather(report, return_exceptions=True))[0]
+
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual(str(result), "A failed")
+        self.assertTrue(b_settled.is_set())
+
+    async def test_report_group_cancellation_wins_after_child_error_and_cleanup(self):
+        loop = make_game_loop_for_test()
+        a_started = asyncio.Event()
+        b_started = asyncio.Event()
+        raise_a = asyncio.Event()
+        release_b = asyncio.Event()
+        b_settled = asyncio.Event()
+
+        async def reconcile(channel, **_kwargs):
+            if channel == "A":
+                a_started.set()
+                await raise_a.wait()
+                raise RuntimeError("A failed after cancellation")
+            b_started.set()
+            await release_b.wait()
+            b_settled.set()
+            return None
+
+        loop._reconcile_device_report_channel = reconcile
+        report = asyncio.create_task(
+            loop.update_device_state(
+                None, {"channelA": {}, "channelB": {}}
+            )
+        )
+        await asyncio.wait_for(a_started.wait(), timeout=1)
+        await asyncio.wait_for(b_started.wait(), timeout=1)
+        report.cancel()
+        await asyncio.sleep(0)
+        raise_a.set()
+        await asyncio.sleep(0)
+        try:
+            self.assertFalse(report.done())
+        finally:
+            release_b.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await report
+        self.assertTrue(b_settled.is_set())
+
+    async def test_report_group_retrieves_multiple_errors_after_all_children_settle(self):
+        loop = make_game_loop_for_test()
+        a_failed = asyncio.Event()
+        b_started = asyncio.Event()
+        release_b = asyncio.Event()
+        b_failed = asyncio.Event()
+
+        async def reconcile(channel, **_kwargs):
+            if channel == "A":
+                await b_started.wait()
+                a_failed.set()
+                raise RuntimeError("first channel failure")
+            b_started.set()
+            await release_b.wait()
+            b_failed.set()
+            raise ValueError("second channel failure")
+
+        loop._reconcile_device_report_channel = reconcile
+        report = asyncio.create_task(
+            loop.update_device_state(
+                None, {"channelA": {}, "channelB": {}}
+            )
+        )
+        await asyncio.wait_for(a_failed.wait(), timeout=1)
+        try:
+            completed, _ = await asyncio.wait({report}, timeout=0.05)
+            self.assertNotIn(report, completed)
+        finally:
+            release_b.set()
+            result = (await asyncio.gather(report, return_exceptions=True))[0]
+
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual(str(result), "first channel failure")
+        self.assertTrue(b_failed.is_set())
+
+    async def test_report_group_starts_a_and_b_concurrently(self):
+        loop = make_game_loop_for_test()
+        a_started = asyncio.Event()
+        b_started = asyncio.Event()
+
+        async def reconcile(channel, **_kwargs):
+            if channel == "A":
+                a_started.set()
+                await b_started.wait()
+            else:
+                b_started.set()
+                await a_started.wait()
+            return {"channel": channel}
+
+        loop._reconcile_device_report_channel = reconcile
+
+        result = await asyncio.wait_for(
+            loop.update_device_state(
+                None, {"channelA": {}, "channelB": {}}
+            ),
+            timeout=1,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "A": {"channel": "A"},
+                "B": {"channel": "B"},
+            },
+        )
+
     async def test_b_report_reconciles_while_a_transport_is_stalled(self):
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(relay=relay)
@@ -802,6 +943,158 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loop.output_coordinator.confirmed("A").strength, 15)
         self.assertEqual(loop.safety.current["A"], 15)
 
+    async def test_concurrent_additive_floors_clamp_each_snapshot_to_current_cap(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.turn_count = 2
+        loop.last_strength = {"A": 0, "B": 2}
+        loop.last_wave = {"A": 2, "B": 2}
+        loop.safety.current = {"A": 5, "B": 5}
+        loop.safety.pulse_until = {"A": float("inf"), "B": float("inf")}
+        loop.safety.set_user_cap("A", 10)
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=5, enabled=True
+        )
+        relay.report_strength("A", 5)
+        relay.arm("strength")
+        second_transaction_started = asyncio.Event()
+        coordinator_run = loop.output_coordinator.run
+        floor_transactions = 0
+
+        async def observed_run(channel, kind, operation):
+            nonlocal floor_transactions
+            if channel == "A" and kind is OutputIntentKind.MANUAL:
+                floor_transactions += 1
+                if floor_transactions == 2:
+                    second_transaction_started.set()
+            return await coordinator_run(channel, kind, operation)
+
+        loop.output_coordinator.run = observed_run
+
+        first = asyncio.create_task(loop._apply_channel_floor())
+        await asyncio.wait_for(relay.successful_send.wait(), timeout=1)
+        second = asyncio.create_task(loop._apply_channel_floor())
+        await asyncio.wait_for(second_transaction_started.wait(), timeout=1)
+        relay.release_send.set()
+        await asyncio.gather(first, second)
+
+        self.assertEqual(loop.ops.strength_deltas, [(0, 5)])
+        self.assertEqual(relay.physical_strength[0], 10)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 10)
+        self.assertEqual(loop.safety.current["A"], 10)
+
+    async def test_additive_floor_uses_original_negative_delta_on_newer_snapshot(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.current["A"] = 3
+        ok, _, cmd = loop.safety.validate(
+            {"op": "add_strength", "channel": "A", "delta": -5}
+        )
+        self.assertTrue(ok)
+        self.assertIsNotNone(cmd)
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=10, enabled=True
+        )
+        relay.report_strength("A", 10)
+
+        sent = await loop._apply_floor_strength(
+            "A", cmd, "client-1", "slot-1", True, False
+        )
+
+        self.assertTrue(sent)
+        self.assertEqual(loop.ops.strength_deltas, [(0, -5)])
+        self.assertEqual(relay.physical_strength[0], 5)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 5)
+        self.assertEqual(loop.safety.current["A"], 5)
+
+    async def test_additive_floor_observes_cap_change_while_queued(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.current["A"] = 5
+        loop.safety.set_user_cap("A", 20)
+        ok, _, cmd = loop.safety.validate(
+            {"op": "add_strength", "channel": "A", "delta": 5}
+        )
+        self.assertTrue(ok)
+        self.assertIsNotNone(cmd)
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=5, enabled=True
+        )
+        relay.report_strength("A", 5)
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def block_channel(snapshot):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": int(snapshot.strength or 0)},
+            )
+
+        blocker = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, block_channel
+            )
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        floor_queued = asyncio.Event()
+        coordinator_run = loop.output_coordinator.run
+
+        async def observed_run(channel, kind, operation):
+            if channel == "A" and kind is OutputIntentKind.MANUAL:
+                floor_queued.set()
+            return await coordinator_run(channel, kind, operation)
+
+        loop.output_coordinator.run = observed_run
+        floor = asyncio.create_task(
+            loop._apply_floor_strength(
+                "A", cmd, "client-1", "slot-1", True, False
+            )
+        )
+        await asyncio.wait_for(floor_queued.wait(), timeout=1)
+        loop.safety.set_user_cap("A", 7)
+        release_blocker.set()
+        blocker_result, floor_result = await asyncio.gather(blocker, floor)
+
+        self.assertTrue(blocker_result.sent)
+        self.assertTrue(floor_result)
+        self.assertEqual(loop.ops.strength_deltas, [(0, 2)])
+        self.assertEqual(relay.physical_strength[0], 7)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 7)
+        self.assertEqual(loop.safety.current["A"], 7)
+
+    async def test_additive_floor_at_cap_is_a_confirmed_noop(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.current["A"] = 5
+        loop.safety.set_user_cap("A", 10)
+        ok, _, cmd = loop.safety.validate(
+            {"op": "add_strength", "channel": "A", "delta": 5}
+        )
+        self.assertTrue(ok)
+        self.assertIsNotNone(cmd)
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=10, enabled=True
+        )
+        relay.report_strength("A", 10)
+
+        sent = await loop._apply_floor_strength(
+            "A", cmd, "client-1", "slot-1", True, False
+        )
+
+        self.assertTrue(sent)
+        self.assertEqual(loop.ops.strength_deltas, [])
+        self.assertEqual(relay.sent_frames, [])
+        self.assertEqual(relay.physical_strength[0], 10)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 10)
+        self.assertEqual(loop.safety.current["A"], 10)
+
     async def test_floor_loop_stops_at_invalidation_while_suspension_is_stalled(self):
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(relay=relay)
@@ -843,6 +1136,207 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(
                 disabling, second_pulse, return_exceptions=True
             )
+
+    async def test_identical_report_reaps_floor_worker_as_finite_batch(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.cfg["playback"]["frame_ms"] = 10
+        loop.cfg["playback"]["loop_batch_s"] = 0.4
+        loop.cfg["playback"]["loop_overlap_s"] = 0.2
+        loop.turn_count = 2
+        loop.last_strength = {"A": 2, "B": 2}
+        loop.last_wave = {"A": 0, "B": 2}
+        loop.safety.current = {"A": 5, "B": 5}
+        loop.safety.pulse_until["B"] = float("inf")
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=5, enabled=True
+        )
+
+        await loop._apply_channel_floor()
+        worker = loop.loop_tasks["A"]
+
+        result = await loop.update_device_state({"intensityA": 5}, None)
+        await asyncio.wait_for(asyncio.shield(worker), timeout=1)
+
+        self.assertEqual(result, {})
+        self.assertNotIn("A", loop.loop_tasks)
+        self.assertNotIn("A", loop.loop_events)
+        confirmed = loop.output_coordinator.confirmed("A")
+        self.assertEqual(confirmed.waveform, "呼吸")
+        self.assertEqual(confirmed.waveform_mode, "finite")
+        self.assertEqual(loop.patterns["A"], "呼吸")
+        finite_until = loop.safety.pulse_until["A"]
+        remaining = finite_until - time.monotonic()
+        self.assertGreater(remaining, 0)
+        self.assertLessEqual(remaining, 0.25)
+        self.assertTrue(loop.safety.pulse_active()["A"])
+
+        await asyncio.sleep(max(0, finite_until - time.monotonic()) + 0.02)
+
+        self.assertFalse(loop.safety.pulse_active()["A"])
+
+    async def test_cancelled_floor_worker_reaps_owner_and_marks_finite_batch(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.cfg["playback"]["frame_ms"] = 10
+        loop.cfg["playback"]["loop_batch_s"] = 0.4
+        loop.cfg["playback"]["loop_overlap_s"] = 0.2
+        loop.turn_count = 2
+        loop.last_strength = {"A": 2, "B": 2}
+        loop.last_wave = {"A": 0, "B": 2}
+        loop.safety.current = {"A": 5, "B": 5}
+        loop.safety.pulse_until["B"] = float("inf")
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=5, enabled=True
+        )
+
+        await loop._apply_channel_floor()
+        worker = loop.loop_tasks["A"]
+        worker.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await worker
+
+        self.assertNotIn("A", loop.loop_tasks)
+        self.assertNotIn("A", loop.loop_events)
+        confirmed = loop.output_coordinator.confirmed("A")
+        self.assertEqual(confirmed.waveform, "呼吸")
+        self.assertEqual(confirmed.waveform_mode, "finite")
+        remaining = loop.safety.pulse_until["A"] - time.monotonic()
+        self.assertGreater(remaining, 0)
+        self.assertLessEqual(remaining, 0.45)
+
+    async def test_floor_worker_cleanup_clears_already_expired_batch(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.cfg["playback"]["frame_ms"] = 10
+        loop.cfg["playback"]["loop_batch_s"] = 0.2
+        loop.cfg["playback"]["loop_overlap_s"] = 0.1
+        loop.safety.current["A"] = 5
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=5, enabled=True
+        )
+        generation = loop.output_coordinator.generation("A")
+        sent = await loop._apply_floor_default_wave(
+            "A", "client-1", "slot-1", True, False, generation
+        )
+        self.assertTrue(sent)
+        worker = loop.loop_tasks["A"]
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def block_channel(snapshot):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": int(snapshot.strength or 0)},
+            )
+
+        blocker = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, block_channel
+            )
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        loop.output_coordinator.invalidate("A", OutputIntentKind.MANUAL)
+        await wait_for_condition(lambda: "A" not in loop.loop_tasks)
+        await asyncio.sleep(0.15)
+        release_blocker.set()
+        blocker_result, worker_result = await asyncio.gather(blocker, worker)
+
+        self.assertTrue(blocker_result.sent)
+        self.assertIsNone(worker_result)
+        self.assertNotIn("A", loop.loop_events)
+        confirmed = loop.output_coordinator.confirmed("A")
+        self.assertIsNone(confirmed.waveform)
+        self.assertIsNone(confirmed.waveform_mode)
+        self.assertIsNone(loop.patterns["A"])
+        self.assertEqual(loop.safety.pulse_until["A"], 0.0)
+        self.assertFalse(loop.safety.pulse_active()["A"])
+
+    async def test_replaced_floor_worker_cannot_clobber_new_owner(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.cfg["playback"]["frame_ms"] = 10
+        loop.cfg["playback"]["loop_batch_s"] = 0.4
+        loop.cfg["playback"]["loop_overlap_s"] = 0.2
+        loop.safety.current["A"] = 5
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=5, enabled=True
+        )
+        first_generation = loop.output_coordinator.generation("A")
+
+        first_sent = await loop._apply_floor_default_wave(
+            "A", "client-1", "slot-1", True, False, first_generation
+        )
+        self.assertTrue(first_sent)
+        first_worker = loop.loop_tasks["A"]
+        first_event = loop.loop_events["A"]
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def block_channel(snapshot):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": int(snapshot.strength or 0)},
+            )
+
+        blocker = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, block_channel
+            )
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        replacement_generation = loop.output_coordinator.invalidate(
+            "A", OutputIntentKind.MANUAL
+        )
+        await wait_for_condition(lambda: "A" not in loop.loop_tasks)
+        loop.safety.presets["潮汐"] = {
+            "waveform": "wave_tide",
+            "frames": ["x"],
+            "default_duration_s": 5,
+            "max_duration_s": 10,
+        }
+        loop.cfg["ui"]["default_wave"] = "潮汐"
+
+        replacement = asyncio.create_task(
+            loop._apply_floor_default_wave(
+                "A",
+                "client-1",
+                "slot-1",
+                True,
+                False,
+                replacement_generation,
+            )
+        )
+        await asyncio.sleep(0)
+        release_blocker.set()
+        blocker_result, replacement_sent, first_result = await asyncio.gather(
+            blocker, replacement, first_worker, return_exceptions=True
+        )
+
+        self.assertIsInstance(blocker_result, TransportOutcome)
+        self.assertTrue(blocker_result.sent)
+        self.assertTrue(replacement_sent)
+        self.assertIsNone(first_result)
+        replacement_worker = loop.loop_tasks["A"]
+        replacement_event = loop.loop_events["A"]
+        self.assertIsNot(replacement_worker, first_worker)
+        self.assertIsNot(replacement_event, first_event)
+        self.assertFalse(replacement_worker.done())
+        confirmed = loop.output_coordinator.confirmed("A")
+        self.assertEqual(confirmed.waveform, "潮汐")
+        self.assertEqual(confirmed.waveform_mode, "loop")
+        self.assertEqual(loop.patterns["A"], "潮汐")
+        self.assertTrue(loop.safety.pulse_active()["A"])
 
     async def test_disable_serializes_against_inflight_channel_floor_start(self):
         relay = GatedPhysicalRelay()
