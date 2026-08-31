@@ -222,7 +222,11 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             calls.append(kind)
             return TransportOutcome(
                 sent=True,
-                effective={"strength": 0, "waveform": None},
+                effective={
+                    "strength": 0,
+                    "waveform": None,
+                    "waveform_mode": None,
+                },
             )
 
         clear = await coordinator.run(
@@ -265,7 +269,11 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             OutputIntentKind.CLEAR_OR_DISABLE,
             lambda state: async_outcome(
                 sent=True,
-                effective={"strength": 0, "waveform": None},
+                effective={
+                    "strength": 0,
+                    "waveform": None,
+                    "waveform_mode": None,
+                },
             ),
         )
 
@@ -360,8 +368,16 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             return TransportOutcome(
                 sent=True,
                 effective={
-                    "A": {"strength": 0, "waveform": None},
-                    "B": {"strength": 0, "waveform": None},
+                    "A": {
+                        "strength": 0,
+                        "waveform": None,
+                        "waveform_mode": None,
+                    },
+                    "B": {
+                        "strength": 0,
+                        "waveform": None,
+                        "waveform_mode": None,
+                    },
                 },
             )
 
@@ -388,6 +404,439 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(global_result.sent)
         self.assertTrue(global_started.is_set())
         self.assertTrue(a_started.is_set())
+
+    async def test_queued_estop_is_not_staled_by_later_clear(self):
+        coordinator = DeviceOutputCoordinator()
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        calls: list[str] = []
+
+        async def blocker(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(sent=True, effective={"strength": 25})
+
+        active = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.MANUAL, blocker)
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=0.2)
+        estop = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.ESTOP,
+                lambda state: self._record_clear(calls, "estop"),
+            )
+        )
+        await asyncio.sleep(0)
+        clear = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.CLEAR_OR_DISABLE,
+                lambda state: self._record_clear(calls, "clear"),
+            )
+        )
+        await asyncio.sleep(0)
+        release_blocker.set()
+
+        _, estop_result, clear_result = await asyncio.wait_for(
+            asyncio.gather(active, estop, clear), timeout=0.2
+        )
+        self.assertTrue(estop_result.sent)
+        self.assertFalse(clear_result.sent)
+        self.assertEqual(calls, ["estop"])
+        self.assertFalse(coordinator.pending("A").clear_required)
+
+    async def test_later_estop_stales_already_queued_clear(self):
+        coordinator = DeviceOutputCoordinator()
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        calls: list[str] = []
+
+        async def blocker(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(sent=True, effective={"strength": 25})
+
+        active = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.MANUAL, blocker)
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=0.2)
+        clear = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.CLEAR_OR_DISABLE,
+                lambda state: self._record_clear(calls, "clear"),
+            )
+        )
+        await asyncio.sleep(0)
+        estop = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.ESTOP,
+                lambda state: self._record_clear(calls, "estop"),
+            )
+        )
+        await asyncio.sleep(0)
+        release_blocker.set()
+
+        _, clear_result, estop_result = await asyncio.wait_for(
+            asyncio.gather(active, clear, estop), timeout=0.2
+        )
+        self.assertFalse(clear_result.sent)
+        self.assertTrue(estop_result.sent)
+        self.assertEqual(calls, ["estop"])
+        self.assertFalse(coordinator.pending("A").clear_required)
+
+    async def test_queued_estop_is_not_staled_by_later_reduction(self):
+        coordinator = DeviceOutputCoordinator()
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        calls: list[str] = []
+
+        async def blocker(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(sent=True, effective={"strength": 25})
+
+        active = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.MANUAL, blocker)
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=0.2)
+        estop = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.ESTOP,
+                lambda state: self._record_clear(calls, "estop"),
+            )
+        )
+        await asyncio.sleep(0)
+        coordinator.mark_reduction("A", 10)
+        reduction = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.SAFETY_REDUCE,
+                lambda state: self._record_strength(calls, "reduce", 10),
+            )
+        )
+        await asyncio.sleep(0)
+        release_blocker.set()
+
+        _, estop_result, reduction_result = await asyncio.wait_for(
+            asyncio.gather(active, estop, reduction), timeout=0.2
+        )
+        self.assertTrue(estop_result.sent)
+        self.assertFalse(reduction_result.sent)
+        self.assertEqual(calls, ["estop"])
+        self.assertIsNone(coordinator.pending("A").target_strength)
+
+    async def test_later_estop_stales_already_queued_reduction(self):
+        coordinator = DeviceOutputCoordinator()
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        calls: list[str] = []
+
+        async def blocker(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(sent=True, effective={"strength": 25})
+
+        active = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.MANUAL, blocker)
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=0.2)
+        coordinator.mark_reduction("A", 10)
+        reduction = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.SAFETY_REDUCE,
+                lambda state: self._record_strength(calls, "reduce", 10),
+            )
+        )
+        await asyncio.sleep(0)
+        estop = asyncio.create_task(
+            coordinator.run(
+                "A",
+                OutputIntentKind.ESTOP,
+                lambda state: self._record_clear(calls, "estop"),
+            )
+        )
+        await asyncio.sleep(0)
+        release_blocker.set()
+
+        _, reduction_result, estop_result = await asyncio.wait_for(
+            asyncio.gather(active, reduction, estop), timeout=0.2
+        )
+        self.assertFalse(reduction_result.sent)
+        self.assertTrue(estop_result.sent)
+        self.assertEqual(calls, ["estop"])
+        self.assertIsNone(coordinator.pending("A").target_strength)
+
+    async def test_sent_clear_without_complete_clear_state_fails_closed(self):
+        invalid_effective = (
+            None,
+            {"strength": 0},
+            {"strength": 1, "waveform": None, "waveform_mode": None},
+            {"strength": 0, "waveform": "pulse", "waveform_mode": None},
+            {"strength": 0, "waveform": None, "waveform_mode": "loop"},
+            {
+                "strength": 0,
+                "waveform": None,
+                "waveform_mode": None,
+                "enabled": "no",
+            },
+        )
+        for effective in invalid_effective:
+            with self.subTest(effective=effective):
+                coordinator = DeviceOutputCoordinator()
+                coordinator.seed_confirmed(
+                    "A",
+                    strength=25,
+                    waveform="pulse",
+                    waveform_mode="loop",
+                    enabled=True,
+                )
+                coordinator.require_clear("A")
+
+                result = await coordinator.run(
+                    "A",
+                    OutputIntentKind.CLEAR_OR_DISABLE,
+                    lambda state, effective=effective: async_outcome(
+                        sent=True, effective=effective
+                    ),
+                )
+
+                self.assertFalse(result.sent)
+                self.assertTrue(coordinator.pending("A").clear_required)
+                self.assertEqual(coordinator.confirmed("A").strength, 25)
+                blocked = await coordinator.run(
+                    "A",
+                    OutputIntentKind.MANUAL,
+                    lambda state: async_outcome(
+                        sent=True, effective={"strength": 30}
+                    ),
+                )
+                self.assertFalse(blocked.sent)
+
+    async def test_global_clear_rejects_missing_a_without_partial_commit(self):
+        await self._assert_invalid_global_clear(
+            {"B": self._clear_effective()},
+        )
+
+    async def test_global_clear_rejects_missing_b_without_partial_commit(self):
+        await self._assert_invalid_global_clear(
+            {"A": self._clear_effective()},
+        )
+
+    async def test_global_clear_rejects_malformed_channel_state(self):
+        await self._assert_invalid_global_clear(
+            {"A": "not-a-state", "B": self._clear_effective()},
+        )
+
+    async def test_global_clear_rejects_invalid_field_without_partial_commit(self):
+        await self._assert_invalid_global_clear(
+            {
+                "A": self._clear_effective(),
+                "B": {
+                    "strength": 0,
+                    "waveform": None,
+                    "waveform_mode": None,
+                    "enabled": "no",
+                },
+            },
+        )
+
+    async def test_global_clear_rejects_non_clear_channel_state(self):
+        await self._assert_invalid_global_clear(
+            {
+                "A": self._clear_effective(),
+                "B": {"strength": 1, "waveform": None, "waveform_mode": None},
+            },
+        )
+
+    async def test_failed_strict_reduction_is_not_weakened_by_relaxed_target(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.mark_reduction("A", 10)
+        failed = await coordinator.run(
+            "A",
+            OutputIntentKind.SAFETY_REDUCE,
+            lambda state: async_outcome(sent=False, effective={"strength": 10}),
+        )
+        self.assertFalse(failed.sent)
+
+        coordinator.mark_reduction("A", 20)
+
+        self.assertEqual(coordinator.pending("A").target_strength, 10)
+
+    async def test_confirmed_channel_clear_satisfies_pending_reduction(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed(
+            "A",
+            strength=30,
+            waveform="pulse",
+            waveform_mode="loop",
+            enabled=True,
+        )
+        coordinator.mark_reduction("A", 10)
+        coordinator.require_clear("A")
+
+        result = await coordinator.run(
+            "A",
+            OutputIntentKind.CLEAR_OR_DISABLE,
+            lambda state: async_outcome(sent=True, effective=self._clear_effective()),
+        )
+
+        self.assertTrue(result.sent)
+        self.assertIsNone(coordinator.pending("A").target_strength)
+        manual = await coordinator.run(
+            "A",
+            OutputIntentKind.MANUAL,
+            lambda state: async_outcome(sent=True, effective={"strength": 5}),
+        )
+        self.assertTrue(manual.sent)
+
+    async def test_confirmed_global_clear_satisfies_both_pending_reductions(self):
+        coordinator = DeviceOutputCoordinator()
+        for channel in ("A", "B"):
+            coordinator.seed_confirmed(
+                channel,
+                strength=30,
+                waveform="pulse",
+                waveform_mode="loop",
+                enabled=True,
+            )
+            coordinator.mark_reduction(channel, 10)
+
+        result = await coordinator.run_global(
+            OutputIntentKind.CLEAR_OR_DISABLE,
+            lambda states: async_outcome(
+                sent=True,
+                effective={
+                    "A": self._clear_effective(),
+                    "B": self._clear_effective(),
+                },
+            ),
+        )
+
+        self.assertTrue(result.sent)
+        self.assertIsNone(coordinator.pending("A").target_strength)
+        self.assertIsNone(coordinator.pending("B").target_strength)
+
+    async def test_channel_clear_blocks_reduction_queued_while_clear_is_in_flight(self):
+        coordinator = DeviceOutputCoordinator()
+        clear_started = asyncio.Event()
+        release_clear = asyncio.Event()
+        reduction_called = False
+
+        async def clear(state):
+            clear_started.set()
+            await release_clear.wait()
+            return TransportOutcome(sent=True, effective=self._clear_effective())
+
+        clear_task = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.CLEAR_OR_DISABLE, clear)
+        )
+        await asyncio.wait_for(clear_started.wait(), timeout=0.2)
+        coordinator.mark_reduction("A", 10)
+
+        async def reduce(state):
+            nonlocal reduction_called
+            reduction_called = True
+            return TransportOutcome(sent=True, effective={"strength": 10})
+
+        reduction_task = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.SAFETY_REDUCE, reduce)
+        )
+        await asyncio.sleep(0)
+        release_clear.set()
+
+        clear_result, reduction_result = await asyncio.wait_for(
+            asyncio.gather(clear_task, reduction_task), timeout=0.2
+        )
+        self.assertTrue(clear_result.sent)
+        self.assertFalse(reduction_result.sent)
+        self.assertFalse(reduction_called)
+        self.assertIsNone(coordinator.pending("A").target_strength)
+
+    async def test_global_clear_blocks_reductions_queued_while_clear_is_in_flight(self):
+        coordinator = DeviceOutputCoordinator()
+        clear_started = asyncio.Event()
+        release_clear = asyncio.Event()
+        reduction_calls: list[str] = []
+
+        async def clear(states):
+            clear_started.set()
+            await release_clear.wait()
+            return TransportOutcome(
+                sent=True,
+                effective={
+                    "A": self._clear_effective(),
+                    "B": self._clear_effective(),
+                },
+            )
+
+        clear_task = asyncio.create_task(
+            coordinator.run_global(OutputIntentKind.CLEAR_OR_DISABLE, clear)
+        )
+        await asyncio.wait_for(clear_started.wait(), timeout=0.2)
+        reduction_tasks = []
+        for channel in ("A", "B"):
+            coordinator.mark_reduction(channel, 10)
+            reduction_tasks.append(
+                asyncio.create_task(
+                    coordinator.run(
+                        channel,
+                        OutputIntentKind.SAFETY_REDUCE,
+                        lambda state, channel=channel: self._record_strength(
+                            reduction_calls, channel, 10
+                        ),
+                    )
+                )
+            )
+        await asyncio.sleep(0)
+        release_clear.set()
+
+        results = await asyncio.wait_for(
+            asyncio.gather(clear_task, *reduction_tasks), timeout=0.2
+        )
+        self.assertTrue(results[0].sent)
+        self.assertFalse(results[1].sent)
+        self.assertFalse(results[2].sent)
+        self.assertEqual(reduction_calls, [])
+        self.assertIsNone(coordinator.pending("A").target_strength)
+        self.assertIsNone(coordinator.pending("B").target_strength)
+
+    async def _assert_invalid_global_clear(self, effective):
+        coordinator = DeviceOutputCoordinator()
+        for channel in ("A", "B"):
+            coordinator.seed_confirmed(
+                channel,
+                strength=25,
+                waveform="pulse",
+                waveform_mode="loop",
+                enabled=True,
+            )
+
+        result = await coordinator.run_global(
+            OutputIntentKind.CLEAR_OR_DISABLE,
+            lambda states: async_outcome(sent=True, effective=effective),
+        )
+
+        self.assertFalse(result.sent)
+        for channel in ("A", "B"):
+            self.assertEqual(coordinator.confirmed(channel).strength, 25)
+            self.assertTrue(coordinator.pending(channel).clear_required)
+
+    async def _record_clear(self, calls, name):
+        calls.append(name)
+        return TransportOutcome(sent=True, effective=self._clear_effective())
+
+    async def _record_strength(self, calls, name, strength):
+        calls.append(name)
+        return TransportOutcome(sent=True, effective={"strength": strength})
+
+    @staticmethod
+    def _clear_effective():
+        return {"strength": 0, "waveform": None, "waveform_mode": None}
 
     async def test_public_snapshots_and_transport_effective_state_are_immutable(self):
         coordinator = DeviceOutputCoordinator()

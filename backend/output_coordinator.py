@@ -12,6 +12,7 @@ from typing import TypeAlias
 
 _CHANNELS = ("A", "B")
 _EMPTY_EFFECTIVE: Mapping[str, object] = MappingProxyType({})
+_NO_PENDING_EXPECTATION = object()
 __all__ = [
     "ConfirmedChannelOutput",
     "DeviceOutputCoordinator",
@@ -135,6 +136,8 @@ class DeviceOutputCoordinator:
     ) -> int:
         slot = self._slot(channel)
         kind = _kind(minimum_priority)
+        if kind < slot.minimum_priority:
+            return slot.generation
         slot.generation += 1
         if kind > slot.minimum_priority:
             slot.minimum_priority = kind
@@ -149,7 +152,14 @@ class DeviceOutputCoordinator:
 
     def mark_reduction(self, channel: str, target: int) -> None:
         slot = self._slot(channel)
-        slot.pending = replace(slot.pending, target_strength=_strength(target))
+        requested_target = _strength(target)
+        current_target = slot.pending.target_strength
+        strictest_target = (
+            requested_target
+            if current_target is None
+            else min(current_target, requested_target)
+        )
+        slot.pending = replace(slot.pending, target_strength=strictest_target)
         self.invalidate(channel, OutputIntentKind.SAFETY_REDUCE)
 
     def confirmed(self, channel: str) -> ConfirmedChannelOutput:
@@ -168,8 +178,20 @@ class DeviceOutputCoordinator:
         intent = _kind(kind)
         self._prepare_safety_intent(channel, intent)
         started_generation = slot.generation
+        pending_expectation: object = _NO_PENDING_EXPECTATION
+        if (
+            intent is OutputIntentKind.SAFETY_REDUCE
+            and slot.pending.target_strength is not None
+        ):
+            pending_expectation = slot.pending.target_strength
         task = asyncio.create_task(
-            self._run_channel_locked(slot, started_generation, intent, operation)
+            self._run_channel_locked(
+                slot,
+                started_generation,
+                intent,
+                pending_expectation,
+                operation,
+            )
         )
         return await _await_cleanup(task)
 
@@ -206,10 +228,16 @@ class DeviceOutputCoordinator:
         slot: _ChannelSlot,
         started_generation: int,
         kind: OutputIntentKind,
+        pending_expectation: object,
         operation: _ChannelOperation,
     ) -> TransportOutcome:
         async with slot.lock:
-            rejection = self._rejection(slot, started_generation, kind)
+            rejection = self._rejection(
+                slot,
+                started_generation,
+                kind,
+                pending_expectation,
+            )
             if rejection is not None:
                 return rejection
             outcome = await self._execute(operation, slot.confirmed)
@@ -238,12 +266,21 @@ class DeviceOutputCoordinator:
                 if not outcome.sent:
                     return _failure(outcome.error, simulated=outcome.simulated)
                 effective = outcome.effective or _EMPTY_EFFECTIVE
+                channel_effective: dict[str, Mapping[str, object]] = {}
                 for channel in _CHANNELS:
-                    channel_effective = effective.get(channel)
-                    if isinstance(channel_effective, Mapping):
-                        self._commit_sent(
-                            self._slots[channel], kind, channel_effective
+                    state = effective.get(channel)
+                    if not isinstance(state, Mapping) or not self._valid_effective(
+                        kind, state
+                    ):
+                        return _failure(
+                            "global transport did not confirm both channels",
+                            simulated=outcome.simulated,
                         )
+                    channel_effective[channel] = state
+                for channel in _CHANNELS:
+                    self._commit_sent(
+                        self._slots[channel], kind, channel_effective[channel]
+                    )
                 return outcome
 
     @staticmethod
@@ -277,15 +314,40 @@ class DeviceOutputCoordinator:
                     )
                     self._raise_priority(slot, OutputIntentKind.SAFETY_REDUCE)
             return _failure(outcome.error, simulated=outcome.simulated)
-        self._commit_sent(slot, kind, outcome.effective or _EMPTY_EFFECTIVE)
+        effective = outcome.effective or _EMPTY_EFFECTIVE
+        if not self._valid_effective(kind, effective):
+            return _failure(
+                "transport did not confirm effective output state",
+                simulated=outcome.simulated,
+            )
+        self._commit_sent(slot, kind, effective)
         return outcome
 
-    def _commit_sent(
-        self,
-        slot: _ChannelSlot,
-        kind: OutputIntentKind,
+    @staticmethod
+    def _valid_effective(
+        kind: OutputIntentKind, effective: Mapping[str, object]
+    ) -> bool:
+        try:
+            changes = DeviceOutputCoordinator._effective_changes(effective)
+        except ValueError:
+            return False
+        if not changes:
+            return False
+        if kind >= OutputIntentKind.CLEAR_OR_DISABLE:
+            return (
+                effective.get("strength") == 0
+                and not isinstance(effective.get("strength"), bool)
+                and "waveform" in effective
+                and effective["waveform"] is None
+                and "waveform_mode" in effective
+                and effective["waveform_mode"] is None
+            )
+        return True
+
+    @staticmethod
+    def _effective_changes(
         effective: Mapping[str, object],
-    ) -> None:
+    ) -> dict[str, object]:
         changes: dict[str, object] = {}
         if "strength" in effective:
             changes["strength"] = _strength(effective["strength"])
@@ -299,12 +361,25 @@ class DeviceOutputCoordinator:
             )
         if "enabled" in effective:
             changes["enabled"] = _enabled(effective["enabled"])
+        return changes
+
+    def _commit_sent(
+        self,
+        slot: _ChannelSlot,
+        kind: OutputIntentKind,
+        effective: Mapping[str, object],
+    ) -> None:
+        changes = self._effective_changes(effective)
         if changes:
             slot.confirmed = replace(slot.confirmed, **changes)
 
         pending = slot.pending
         if kind >= OutputIntentKind.CLEAR_OR_DISABLE:
-            pending = replace(pending, clear_required=False)
+            pending = replace(
+                pending,
+                target_strength=None,
+                clear_required=False,
+            )
         if kind is OutputIntentKind.SAFETY_REDUCE:
             target = pending.target_strength
             if (
@@ -321,9 +396,15 @@ class DeviceOutputCoordinator:
         slot: _ChannelSlot,
         started_generation: int,
         kind: OutputIntentKind,
+        pending_expectation: object = _NO_PENDING_EXPECTATION,
     ) -> TransportOutcome | None:
         if started_generation != slot.generation:
             return _failure("stale output generation")
+        if (
+            pending_expectation is not _NO_PENDING_EXPECTATION
+            and slot.pending.target_strength != pending_expectation
+        ):
+            return _failure("pending safety reduction changed")
         if kind < slot.minimum_priority:
             return _failure("blocked by higher-priority output intent")
         if not slot.confirmed.enabled and kind < OutputIntentKind.CLEAR_OR_DISABLE:
