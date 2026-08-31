@@ -238,6 +238,46 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.pending_indices, [])
         self.assertFalse(harness.delivery_owner_active)
 
+    async def test_sync_callback_returning_task_can_reenter_delivery(self):
+        harness = DeliveryHarness()
+        self.addAsyncCleanup(harness.close)
+        reentry_started = asyncio.Event()
+        callback_records: list[CycleRecord] = []
+        callback_tasks: list[asyncio.Task[None]] = []
+
+        async def reenter_delivery() -> None:
+            reentry_started.set()
+            await harness.retry()
+
+        def callback_factory(record: CycleRecord) -> asyncio.Task[None]:
+            callback_records.append(record)
+            task = asyncio.create_task(reenter_delivery())
+            callback_tasks.append(task)
+            return task
+
+        harness.runner._on_cycle = callback_factory
+        await harness.queue_records([cycle(1)])
+        owner = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(reentry_started.wait(), timeout=0.2)
+
+        owner_completed = False
+        try:
+            try:
+                await asyncio.wait_for(asyncio.shield(owner), timeout=0.2)
+                owner_completed = True
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            if not owner.done():
+                callback_tasks[0].cancel()
+            await asyncio.gather(*callback_tasks, return_exceptions=True)
+            await asyncio.gather(owner, return_exceptions=True)
+
+        self.assertTrue(owner_completed)
+        self.assertEqual([record.cycle_index for record in callback_records], [1])
+        self.assertEqual(harness.pending_indices, [])
+        self.assertFalse(harness.delivery_owner_active)
+
     async def test_pending_duplicate_key_is_upserted_before_owner_drains_it(self):
         harness = DeliveryHarness()
         self.addAsyncCleanup(harness.close)

@@ -75,6 +75,12 @@ class _CycleCallbackError(RuntimeError):
     pass
 
 
+@dataclass
+class _DeliveryCallbackContext:
+    owner: asyncio.Task[Any]
+    task: asyncio.Task[Any] | None = None
+
+
 class ChannelCycleRunner:
     """Repeat complete raw cycles for one channel without crossing boundaries."""
 
@@ -131,7 +137,7 @@ class ChannelCycleRunner:
         self._delivery_owner: asyncio.Task[Any] | None = None
         self._delivery_completion: asyncio.Future[BaseException | None] | None = None
         self._delivery_callback_owner: contextvars.ContextVar[
-            tuple[asyncio.Task[Any], asyncio.Task[Any]] | None
+            _DeliveryCallbackContext | None
         ] = (
             contextvars.ContextVar(
                 f"cycle-delivery-callback-owner-{channel}-{id(self)}",
@@ -642,8 +648,8 @@ class ChannelCycleRunner:
                 return
             if (
                 callback_context is not None
-                and current is callback_context[1]
-                and self._delivery_owner is callback_context[0]
+                and current is callback_context.task
+                and self._delivery_owner is callback_context.owner
             ):
                 # Async callbacks run in a child task, so their context carries
                 # the owner identity needed to avoid waiting on themselves.
@@ -698,33 +704,39 @@ class ChannelCycleRunner:
             completion.set_result(outcome)
 
     async def _invoke_callback(self, record: CycleRecord) -> bool:
+        owner = self._delivery_owner
+        if owner is None:
+            raise RuntimeError("cycle callback has no delivery owner")
+        callback_context = _DeliveryCallbackContext(owner)
+        token = self._delivery_callback_owner.set(callback_context)
         try:
-            result = self._on_cycle(record)
-        except asyncio.CancelledError as exc:
-            raise _CycleCallbackError("cycle callback cancelled") from exc
-        except Exception as exc:
-            raise _CycleCallbackError(f"cycle callback failed: {exc}") from exc
-        if inspect.isawaitable(result):
-            owner = self._delivery_owner
-            if owner is None:
-                raise RuntimeError("cycle callback has no delivery owner")
-            return await self._await_callback(result, owner)
-        return False
+            try:
+                result = self._on_cycle(record)
+            except asyncio.CancelledError as exc:
+                raise _CycleCallbackError("cycle callback cancelled") from exc
+            except Exception as exc:
+                raise _CycleCallbackError(f"cycle callback failed: {exc}") from exc
+            if inspect.isawaitable(result):
+                return await self._await_callback(result, callback_context)
+            return False
+        finally:
+            self._delivery_callback_owner.reset(token)
 
     async def _await_callback(
-        self, result: Any, owner: asyncio.Task[Any]
+        self, result: Any, callback_context: _DeliveryCallbackContext
     ) -> bool:
         async def invoke_callback() -> Any:
             callback_task = asyncio.current_task()
             if callback_task is None:
                 raise RuntimeError("cycle callback requires an asyncio task")
-            token = self._delivery_callback_owner.set((owner, callback_task))
-            try:
-                return await result
-            finally:
-                self._delivery_callback_owner.reset(token)
+            callback_context.task = callback_task
+            return await result
 
-        delivery = asyncio.ensure_future(invoke_callback())
+        if isinstance(result, asyncio.Task):
+            delivery = result
+            callback_context.task = result
+        else:
+            delivery = asyncio.ensure_future(invoke_callback())
         try:
             await asyncio.shield(delivery)
             return False
