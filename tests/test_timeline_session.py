@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
@@ -589,6 +590,34 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(paused.phase, "paused")
         self.assertIsNone(paused.pattern)
         self.assertEqual(paused.strength, 0)
+
+    async def test_legacy_replay_is_adjusted_when_provenance_cannot_be_confirmed(self):
+        controller = SessionHarness.create(seed=141)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([20], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+
+        state = await controller.start_replay(bundle.manifest.replay_id)
+
+        self.assertTrue(state.adjusted)
+
+    async def test_replay_provenance_mismatch_is_adjusted(self):
+        controller = SessionHarness.create(seed=142)
+        self.addAsyncCleanup(controller.close)
+        controller._manifest_metadata.update(
+            {"app_fingerprint": "current-app", "dlc_fingerprint": "current-dlc"}
+        )
+        bundle = make_replay_bundle([20], "completed")
+        manifest = replace(
+            bundle.manifest,
+            app_fingerprint="current-app",
+            dlc_fingerprint="archived-dlc",
+        )
+        controller.store.save(manifest, bundle.timeline)
+
+        state = await controller.start_replay(manifest.replay_id)
+
+        self.assertTrue(state.adjusted)
 
     async def test_empty_replay_clears_then_returns_controller_to_idle(self):
         controller = SessionHarness.create(seed=27)

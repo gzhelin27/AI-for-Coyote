@@ -166,6 +166,7 @@ class SessionController:
         self._runner_watchers: dict[str, asyncio.Task[None]] = {}
         self._player: RecordedCyclePlayer | None = None
         self._player_watcher: asyncio.Task[None] | None = None
+        self._replay_identity_adjusted = False
         self._plot_events: list[PlotEvent] = []
         self._cycle_records: dict[tuple[str, int], CycleRecord] = {}
         self._retained: dict[str, CycleDirective] = {}
@@ -551,6 +552,9 @@ class SessionController:
             )
             player.load(bundle)
             player.validate_cursor(cursor)
+            self._replay_identity_adjusted = not self._provenance_matches(
+                bundle.manifest, self._current_manifest_metadata()
+            )
             self._set_player_output_generations(player)
             self._player = player
             self._mode = "replay"
@@ -620,7 +624,7 @@ class SessionController:
             replay_id=self._replay_id,
             cursor=cursor,
             current_event_id=self._current_event_id,
-            adjusted=adjusted,
+            adjusted=adjusted or self._replay_identity_adjusted,
             channels=self.channel_states(),
         )
 
@@ -1000,6 +1004,8 @@ class SessionController:
                 "dlc_role",
                 "dlc_profile",
                 "dlc_version",
+                "app_fingerprint",
+                "dlc_fingerprint",
             }
         }
         return ReplayManifest(
@@ -1020,6 +1026,25 @@ class SessionController:
             adjusted=False,
             **allowed_metadata,
         )
+
+    def _current_manifest_metadata(self) -> dict[str, Any]:
+        if self._manifest_metadata_factory is None:
+            return dict(self._manifest_metadata)
+        metadata = self._manifest_metadata_factory()
+        if not isinstance(metadata, Mapping):
+            raise TypeError("manifest_metadata_factory must return a mapping")
+        return dict(metadata)
+
+    @staticmethod
+    def _provenance_matches(
+        manifest: ReplayManifest, current: Mapping[str, Any]
+    ) -> bool:
+        for field in ("app_fingerprint", "dlc_fingerprint"):
+            archived = getattr(manifest, field)
+            live = current.get(field)
+            if not isinstance(archived, str) or not archived or archived != live:
+                return False
+        return True
 
     def _new_cycle_rngs(self) -> dict[str, Any]:
         if self._provided_cycle_rngs is not None:
@@ -1105,6 +1130,7 @@ class SessionController:
         self._runner_watchers = {}
         self._player = None
         self._player_watcher = None
+        self._replay_identity_adjusted = False
         self._plot_events = []
         self._cycle_records = {}
         self._retained = {}

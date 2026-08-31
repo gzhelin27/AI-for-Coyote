@@ -1,6 +1,8 @@
 import asyncio
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -9,6 +11,7 @@ import warnings
 
 import backend.main as main_module
 from backend.config import DEFAULTS
+from backend.timeline.replay_store import ReplaySummary
 from backend.timeline.session import SessionController
 from tests.test_game_loop_timeline import FakeRelay
 from tests.timeline_fakes import make_replay_bundle
@@ -159,6 +162,81 @@ class ProductionAppStateTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             manifest.random_profile["waveform_policy"], "all_allowed"
         )
+
+    def test_dlc_fingerprint_covers_effective_behavior_in_canonical_order(self):
+        self.cfg["character"].pop("dlc_version")
+        self.cfg["character"]["prompt"] = "effective prompt"
+        self.cfg["character"]["examples"] = [
+            {"user": "first", "assistant": "first reply"}
+        ]
+        prompt_file = self.root / "effective-prompt.txt"
+        prompt_file.write_bytes(b"prompt file one")
+        self.cfg["character"]["prompt_file"] = str(prompt_file)
+
+        baseline = main_module._dlc_provenance(self.cfg)
+        reordered = deepcopy(self.cfg)
+        reordered["character"]["examples"] = [
+            {"assistant": "first reply", "user": "first"}
+        ]
+        self.assertEqual(main_module._dlc_provenance(reordered), baseline)
+
+        inline_prompt = deepcopy(self.cfg)
+        inline_prompt["character"]["prompt"] = "changed inline prompt"
+        self.assertNotEqual(main_module._dlc_provenance(inline_prompt), baseline)
+
+        examples = deepcopy(self.cfg)
+        examples["character"]["examples"] = [
+            {"user": "first", "assistant": "changed example"}
+        ]
+        self.assertNotEqual(main_module._dlc_provenance(examples), baseline)
+
+        prompt_file.write_bytes(b"prompt file two")
+        self.assertNotEqual(main_module._dlc_provenance(self.cfg), baseline)
+
+        waveform_policy = deepcopy(self.cfg)
+        waveform_policy["timeline"]["waveform_policy"] = "changed-policy"
+        self.assertNotEqual(main_module._dlc_provenance(waveform_policy), baseline)
+
+    def test_app_fingerprint_tracks_allowlisted_runtime_sources_beyond_main(self):
+        source_root = self.root / "source"
+        (source_root / "backend").mkdir(parents=True)
+        (source_root / "backend" / "main.py").write_bytes(b"main")
+        safety = source_root / "backend" / "safety.py"
+        safety.write_bytes(b"safety one")
+        with (
+            patch.object(main_module, "PROJECT_ROOT", source_root),
+            patch.object(main_module.subprocess, "run", side_effect=OSError("no git")),
+        ):
+            baseline = main_module._app_version()
+            safety.write_bytes(b"safety two")
+            changed = main_module._app_version()
+
+        self.assertNotEqual(changed, baseline)
+
+    def test_public_state_and_replay_summaries_redact_provenance_hashes(self):
+        with (
+            self._fake_external_dependencies(),
+            patch.object(main_module, "_app_version", return_value="source-sha256:private"),
+        ):
+            state = main_module.AppState(self.cfg)
+        bundle = make_replay_bundle([], "completed")
+        summary = ReplaySummary.from_manifest(
+            replace(
+                bundle.manifest,
+                app_commit="source-sha256:private",
+                dlc_version="sha256:private",
+            )
+        )
+
+        public_payloads = (
+            state.build_state(),
+            main_module._session_payload(state.timeline_session),
+            main_module._replay_summary_payload(summary),
+        )
+        for payload in public_payloads:
+            encoded = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("sha256", encoded)
+            self.assertNotIn("\"seed\"", encoded)
 
     def test_source_app_version_fallback_is_a_fingerprint_not_dev(self):
         source_root = self.root / "source"

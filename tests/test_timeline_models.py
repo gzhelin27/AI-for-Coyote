@@ -110,6 +110,8 @@ class TimelineModelTests(unittest.TestCase):
             completed_at="2026-08-31T00:01:00Z",
             source_hash="source-hash",
             checksums={"timeline.json": "timeline-hash"},
+            app_fingerprint="release+source-sha256:app",
+            dlc_fingerprint="sha256:dlc",
         )
         state = SessionState(
             status=SessionStatus.REPLAYING,
@@ -151,6 +153,8 @@ class TimelineModelTests(unittest.TestCase):
                 seed=7,
                 status=SessionStatus.COMPLETED,
                 mode="autopilot",
+                app_fingerprint="",
+                dlc_fingerprint="",
             ),
         )
 

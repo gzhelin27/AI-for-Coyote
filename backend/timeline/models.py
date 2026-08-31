@@ -334,6 +334,8 @@ class ReplayManifest:
     dlc_role: str = ""
     dlc_profile: str = ""
     dlc_version: str = ""
+    app_fingerprint: str = ""
+    dlc_fingerprint: str = ""
     random_profile: Mapping[str, Any] | None = None
     safety_caps: Mapping[str, int] | None = None
     created_at: str = ""
@@ -358,6 +360,8 @@ class ReplayManifest:
             (self.dlc_role, "dlc_role"),
             (self.dlc_profile, "dlc_profile"),
             (self.dlc_version, "dlc_version"),
+            (self.app_fingerprint, "app_fingerprint"),
+            (self.dlc_fingerprint, "dlc_fingerprint"),
             (self.created_at, "created_at"),
         ):
             if not isinstance(value, str):
@@ -399,6 +403,8 @@ class ReplayManifest:
             "dlc_role": self.dlc_role,
             "dlc_profile": self.dlc_profile,
             "dlc_version": self.dlc_version,
+            "app_fingerprint": self.app_fingerprint,
+            "dlc_fingerprint": self.dlc_fingerprint,
             "random_profile": dict(self.random_profile or {}),
             "safety_caps": dict(self.safety_caps or {}),
             "created_at": self.created_at,
@@ -426,6 +432,7 @@ class ReplayManifest:
         }
         for field in (
             "app_commit", "model", "dlc_role", "dlc_profile", "dlc_version",
+            "app_fingerprint", "dlc_fingerprint",
             "random_profile", "safety_caps", "created_at", "completed_at",
             "source_hash", "checksums", "adjusted",
         ):

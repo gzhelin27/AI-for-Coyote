@@ -59,9 +59,32 @@ else:
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
+_RUNTIME_FINGERPRINT_FILES = (
+    "backend/__init__.py",
+    "backend/audio.py",
+    "backend/camera.py",
+    "backend/config.py",
+    "backend/device_ops.py",
+    "backend/game_loop.py",
+    "backend/llm.py",
+    "backend/logging_utils.py",
+    "backend/main.py",
+    "backend/output_coordinator.py",
+    "backend/relay_client.py",
+    "backend/safety.py",
+    "backend/timeline/__init__.py",
+    "backend/timeline/cycle_runner.py",
+    "backend/timeline/models.py",
+    "backend/timeline/player.py",
+    "backend/timeline/randomizer.py",
+    "backend/timeline/replay_store.py",
+    "backend/timeline/session.py",
+    "backend/waveforms.py",
+)
 
-def _app_version() -> str:
-    """Return packaged version, source commit, or a deterministic source fingerprint."""
+
+def _release_version() -> str:
+    """Return a stable released or source-control version when available."""
     f = PROJECT_ROOT / "version.txt"
     if f.exists():
         v = f.read_text(encoding="utf-8").strip().lstrip("\ufeff")
@@ -84,35 +107,64 @@ def _app_version() -> str:
             return commit.lower()
     except (OSError, subprocess.SubprocessError):
         pass
-    source = Path(__file__).read_bytes()
-    return f"source-sha256:{hashlib.sha256(source).hexdigest()}"
+    return ""
+
+
+def _runtime_content_fingerprint() -> str:
+    """Hash the allowlisted runtime sources with unambiguous path boundaries."""
+    digest = hashlib.sha256()
+    for relative_path in _RUNTIME_FINGERPRINT_FILES:
+        source_path = PROJECT_ROOT / relative_path
+        try:
+            source_bytes = source_path.read_bytes()
+        except OSError:
+            continue
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source_bytes)
+        digest.update(b"\0")
+    return f"source-sha256:{digest.hexdigest()}"
+
+
+def _app_version() -> str:
+    """Return release identity plus the complete runtime content fingerprint."""
+    content_fingerprint = _runtime_content_fingerprint()
+    release = _release_version()
+    return f"{release}+{content_fingerprint}" if release else content_fingerprint
+
+
+def _public_app_version() -> str:
+    """Keep internal content hashes out of browser-visible application state."""
+    return _release_version() or "development"
 
 
 def _dlc_provenance(cfg: dict) -> str:
     character = cfg.get("character") or {}
-    configured = str(character.get("dlc_version") or "").strip()
-    if configured:
-        return configured
-    identity = {
-        "name": str(character.get("name") or "default"),
-        "role": str(character.get("role") or "default"),
-        "profile": str(character.get("profile") or "default"),
-        "profile_level": str(character.get("profile_level") or "default"),
-        "prompt_file": str(character.get("prompt_file") or ""),
-    }
-    digest = hashlib.sha256(
-        json.dumps(
-            identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    )
-    prompt_path = Path(identity["prompt_file"])
-    if identity["prompt_file"] and not prompt_path.is_absolute():
+    prompt_file = str(character.get("prompt_file") or "")
+    prompt_path = Path(prompt_file)
+    if prompt_file and not prompt_path.is_absolute():
         prompt_path = PROJECT_ROOT / prompt_path
     try:
-        digest.update(prompt_path.read_bytes())
+        prompt_file_sha256 = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
     except (OSError, ValueError):
-        pass
-    return f"sha256:{digest.hexdigest()}"
+        prompt_file_sha256 = ""
+    identity = {
+        "role": str(character.get("role") or "default"),
+        "profile": str(character.get("profile") or "default"),
+        "dlc": str(
+            character.get("dlc_version") or character.get("name") or "default"
+        ),
+        "prompt": str(character.get("prompt") or ""),
+        "examples": character.get("examples") or [],
+        "prompt_file_sha256": prompt_file_sha256,
+        "waveform_policy": str(
+            (cfg.get("timeline") or {}).get("waveform_policy") or ""
+        ),
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def get_lan_ip() -> str:
@@ -166,11 +218,9 @@ def _replay_summary_payload(summary: ReplaySummary) -> dict:
         "created_at": summary.created_at,
         "completed_at": summary.completed_at,
         "adjusted": summary.adjusted,
-        "app_commit": summary.app_commit,
         "model": summary.model,
         "dlc_role": summary.dlc_role,
         "dlc_profile": summary.dlc_profile,
-        "dlc_version": summary.dlc_version,
         "title": summary.title,
         "cycle_count": summary.cycle_count,
     }
@@ -257,14 +307,21 @@ class AppState:
 
     def _timeline_manifest_metadata(self) -> dict[str, str]:
         """Snapshot provenance when a new live session actually begins."""
+        app_fingerprint = _app_version()
+        dlc_fingerprint = _dlc_provenance(self.cfg)
+        dlc_version = str(
+            self.cfg["character"].get("dlc_version") or dlc_fingerprint
+        )
         return {
-            "app_commit": _app_version(),
+            "app_commit": app_fingerprint,
             "model": str(self.cfg["llm"].get("model") or "unconfigured"),
             "dlc_role": str(self.cfg["character"].get("role") or "default"),
             "dlc_profile": str(
                 self.cfg["character"].get("profile") or "default"
             ),
-            "dlc_version": _dlc_provenance(self.cfg),
+            "dlc_version": dlc_version,
+            "app_fingerprint": app_fingerprint,
+            "dlc_fingerprint": dlc_fingerprint,
         }
 
     # ---------- 麦克风转写回调 ----------
@@ -356,7 +413,7 @@ class AppState:
             "title": str(self.cfg["app"].get("title", "郊狼 · AI 驯服师")),
             "profile": str(self.cfg["character"].get("profile") or "调教"),
             "player_nick": str(self.cfg["character"].get("player_nick") or "小柳"),
-            "version": _app_version(),
+            "version": _public_app_version(),
         }
         return state
 
