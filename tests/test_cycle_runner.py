@@ -308,16 +308,18 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_state.disconnected, stopped_state.disconnected)
         self.assertEqual(harness.sent_patterns, [])
 
-    async def test_executor_exception_stops_runner_and_records_failure(self):
+    async def test_executor_exception_during_activation_stops_recordlessly(self):
         harness = self.make_harness(
             frames={"呼吸": ["f"]}, raise_on_cycle=1
         )
 
         await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
-        await harness.runner.wait_stopped()
+        state = await harness.runner.wait_stopped()
 
-        self.assertIn("injected executor failure", harness.runner.state().failure or "")
-        self.assertEqual(harness.records[0].interruption_reason, "executor_failure")
+        self.assertEqual(state.phase, RunnerPhase.STOPPED)
+        self.assertIn("injected executor failure", state.failure or "")
+        self.assertEqual(harness.records, [])
+        self.assertEqual(harness.runner.pending_records(), ())
 
     async def test_confirmed_disconnect_is_surfaced(self):
         harness = self.make_harness(

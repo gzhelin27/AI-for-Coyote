@@ -359,8 +359,9 @@ class ChannelCycleRunner:
                     ),
                 )
 
+                activating = self._needs_activation
                 actions: list[dict[str, Any]] = []
-                if self._needs_activation:
+                if activating:
                     actions.append(
                         {
                             "op": "hold_strength",
@@ -381,11 +382,13 @@ class ChannelCycleRunner:
                     raise
                 except Exception as exc:
                     self._resolve_startup(startup)
-                    record = self._record_from_attempt(
-                        attempt,
-                        completed=False,
-                        interruption_reason="executor_failure",
-                    )
+                    record = None
+                    if not activating:
+                        record = self._record_from_attempt(
+                            attempt,
+                            completed=False,
+                            interruption_reason="executor_failure",
+                        )
                     attempt = None
                     await self._stop_for_failure(
                         exc,
