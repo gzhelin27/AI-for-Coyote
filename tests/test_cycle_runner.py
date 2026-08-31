@@ -55,6 +55,10 @@ class DeliveryHarness:
     def pending_indices(self) -> list[int]:
         return [record.cycle_index for record in self.runner.pending_records()]
 
+    @property
+    def delivery_owner_active(self) -> bool:
+        return self.runner._delivery_owner is not None
+
     async def _deliver(self, record: CycleRecord) -> None:
         attempts = self._callback_attempts.get(record.cycle_index, 0) + 1
         self._callback_attempts[record.cycle_index] = attempts
@@ -101,11 +105,138 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         first = asyncio.create_task(harness.retry())
         await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
         second = asyncio.create_task(harness.retry())
+        await asyncio.sleep(0)
+        self.assertFalse(second.done())
+        self.assertTrue(harness.delivery_owner_active)
         harness.release_delivery()
         await asyncio.wait_for(asyncio.gather(first, second), timeout=0.2)
 
         self.assertEqual(harness.delivered_indices, [1, 2])
         self.assertEqual(harness.pending_indices, [])
+        self.assertFalse(harness.delivery_owner_active)
+
+    async def test_concurrent_retry_propagates_active_owner_failure(self):
+        harness = DeliveryHarness(failures={1: 1})
+        self.addAsyncCleanup(harness.close)
+        await harness.queue_records([cycle(1), cycle(2)])
+        harness.block_first_delivery()
+        owner = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
+        waiting_retry = asyncio.create_task(harness.retry())
+        await asyncio.sleep(0)
+        self.assertFalse(waiting_retry.done())
+        self.assertTrue(harness.delivery_owner_active)
+
+        harness.release_delivery()
+        with self.assertRaisesRegex(RuntimeError, "persistence failure for 1"):
+            await owner
+        with self.assertRaisesRegex(RuntimeError, "persistence failure for 1"):
+            await waiting_retry
+
+        self.assertEqual(harness.delivered_indices, [1])
+        self.assertEqual(harness.pending_indices, [1, 2])
+        self.assertFalse(harness.delivery_owner_active)
+        await harness.retry()
+        self.assertEqual(harness.delivered_indices, [1, 1, 2])
+        self.assertEqual(harness.pending_indices, [])
+
+    async def test_cancelled_owner_never_strands_enqueued_record_after_callback(self):
+        harness = DeliveryHarness()
+        self.addAsyncCleanup(harness.close)
+        await harness.queue_records([cycle(1)])
+        harness.block_first_delivery()
+        owner = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
+        producer = asyncio.create_task(harness.runner._deliver_record(cycle(2)))
+        await asyncio.sleep(0)
+        self.assertFalse(producer.done())
+        self.assertTrue(harness.delivery_owner_active)
+
+        owner.cancel()
+        harness.release_delivery()
+        with self.assertRaises(asyncio.CancelledError):
+            await owner
+        with self.assertRaises(asyncio.CancelledError):
+            await producer
+
+        self.assertEqual(harness.delivered_indices, [1])
+        self.assertEqual(harness.pending_indices, [2])
+        self.assertFalse(harness.delivery_owner_active)
+        await harness.retry()
+        self.assertEqual(harness.delivered_indices, [1, 2])
+        self.assertEqual(harness.pending_indices, [])
+
+    async def test_record_behind_failed_owner_receives_failure_not_false_success(self):
+        harness = DeliveryHarness(failures={1: 1})
+        self.addAsyncCleanup(harness.close)
+        await harness.queue_records([cycle(1)])
+        harness.block_first_delivery()
+        owner = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
+        producer = asyncio.create_task(harness.runner._deliver_record(cycle(2)))
+        await asyncio.sleep(0)
+        self.assertFalse(producer.done())
+
+        harness.release_delivery()
+        with self.assertRaisesRegex(RuntimeError, "persistence failure for 1"):
+            await owner
+        with self.assertRaisesRegex(RuntimeError, "persistence failure for 1"):
+            await producer
+
+        self.assertEqual(harness.delivered_indices, [1])
+        self.assertEqual(harness.pending_indices, [1, 2])
+        self.assertFalse(harness.delivery_owner_active)
+
+    async def test_inflight_duplicate_key_delivers_current_then_latest_value(self):
+        harness = DeliveryHarness()
+        self.addAsyncCleanup(harness.close)
+        original = cycle(1)
+        replacement = replace(original, plot_event_id="evt-replacement")
+        harness.block_first_delivery()
+        owner = asyncio.create_task(harness.runner._deliver_record(original))
+        await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
+        update = asyncio.create_task(harness.runner._deliver_record(replacement))
+        await asyncio.sleep(0)
+        self.assertFalse(update.done())
+        self.assertTrue(harness.delivery_owner_active)
+
+        harness.release_delivery()
+        await asyncio.wait_for(asyncio.gather(owner, update), timeout=0.2)
+
+        self.assertEqual(harness.delivered_indices, [1, 1])
+        self.assertEqual(
+            [record.plot_event_id for record in harness.delivered_records],
+            ["evt-1", "evt-replacement"],
+        )
+        self.assertEqual(harness.pending_indices, [])
+        self.assertFalse(harness.delivery_owner_active)
+
+    async def test_callback_child_waits_for_owner_drain(self):
+        harness = DeliveryHarness()
+        self.addAsyncCleanup(harness.close)
+        callback_checked = asyncio.Event()
+        child: asyncio.Task[None] | None = None
+        child_completed_during_callback = None
+
+        async def callback(record: CycleRecord) -> None:
+            nonlocal child, child_completed_during_callback
+            child = asyncio.create_task(harness.retry())
+            await asyncio.sleep(0)
+            child_completed_during_callback = child.done()
+            callback_checked.set()
+
+        harness.runner._on_cycle = callback
+        await harness.queue_records([cycle(1)])
+        owner = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(callback_checked.wait(), timeout=0.2)
+
+        self.assertFalse(child_completed_during_callback)
+        self.assertTrue(harness.delivery_owner_active)
+        await asyncio.wait_for(owner, timeout=0.2)
+        if child is not None:
+            await asyncio.wait_for(child, timeout=0.2)
+        self.assertEqual(harness.pending_indices, [])
+        self.assertFalse(harness.delivery_owner_active)
 
     async def test_pending_duplicate_key_is_upserted_before_owner_drains_it(self):
         harness = DeliveryHarness()
