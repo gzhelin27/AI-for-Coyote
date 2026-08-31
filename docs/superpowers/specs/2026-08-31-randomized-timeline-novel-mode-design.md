@@ -1,7 +1,7 @@
 # Randomized Timeline, Replay, and Novel Mode Design
 
 **Date:** 2026-08-31
-**Status:** Accepted architecture; implementation is intentionally phased
+**Status:** Design approved in chat; written revision awaiting user review
 **Repository:** `gzhelin27/AI-for-Coyote` fork of `indhg/AI-for-Coyote`
 
 ## 1. Purpose
@@ -49,13 +49,19 @@ ChannelDirective[A/B]
         │
         ▼
 TimelineResolver
-  waveform policy + ±4 jitter + interval profile + duration
+  waveform policy + ±4 strength jitter
         │
         ▼
-TimelineEvent[] (fully resolved and serializable)
+PlotEvent[] (fully resolved and serializable)
         │
         ▼
-TimelinePlayer ──► GameLoop.execute_actions()
+TimelinePlayer ──► ChannelCycleRunner[A/B]
+                         │
+                         ▼
+                  one raw cycle + sampled gap
+                         │
+                         ▼
+                  GameLoop.execute_actions()
                         │
                         ▼
                   SafetyManager
@@ -71,7 +77,8 @@ SessionRecorder
 ### 4.1 Modules
 
 - `backend/timeline/models.py`: enums and dataclasses for directives, profiles, events, timelines, session state, and replay manifests.
-- `backend/timeline/randomizer.py`: seeded waveform, jitter, duration, and weighted-interval resolution.
+- `backend/timeline/randomizer.py`: seeded waveform and strength-jitter resolution.
+- `backend/timeline/cycle_runner.py`: independent A/B raw-cycle playback, seeded gap sampling, and boundary-safe directive changes.
 - `backend/timeline/player.py`: monotonic-clock playback, pause/resume/finish, event cursor, and callbacks.
 - `backend/timeline/replay_store.py`: safe `.coyote-replay` ZIP read/write/list/delete/download.
 - `backend/timeline/session.py`: live-session lifecycle, recording, exact-replay state, and integration callbacks.
@@ -106,26 +113,47 @@ Schema version 1 contains:
 
 - `strength_jitter: 4`;
 - waveform policy `all_allowed` for MVP1;
-- weighted interval bands: normal `0.70 / 6–12s`, short `0.20 / 2–5s`, long `0.10 / 15–25s`;
-- per-DLC override fields;
+- one project-wide waveform-cycle gap policy;
 - random seed.
 
 The resolver chooses an integer strength inside `base_strength ± 4`, then clips to `0..effective_cap`. It does not add cross-scene smoothing. Safety validation still applies afterward.
 
 At design time the user's selected runtime ceiling is 40 per channel. That personal value remains in ignored local configuration/runtime state; neither timeline generation nor replay may raise it automatically.
 
-### 5.3 Resolved timeline event
+### 5.3 Waveform-cycle gap policy
+
+A raw waveform cycle is the preset's complete frame sequence. Each frame represents 100 ms, so:
+
+```text
+cycle_duration_ms = frame_count × 100
+```
+
+After a channel completes one raw cycle, it independently samples one pause multiplier:
+
+- 40%: exactly `0.0` cycles;
+- 30%: uniformly choose an integer from `1..10`, then divide by 10 (`0.1..1.0`);
+- 30%: uniformly choose an integer from `11..20`, then divide by 10 (`1.1..2.0`).
+
+```text
+gap_duration_ms = cycle_duration_ms × gap_multiplier
+```
+
+Integer tenths are stored and used for calculation to avoid floating-point selection ambiguity. A/B use independent RNG streams derived from the session seed, so an extra A cycle never shifts B's future results.
+
+Pattern and resolved strength are selected once when a plot event begins. Only the gap multiplier is resampled after each completed cycle. During a generated gap, the runner sends no waveform frames but retains the channel's current strength.
+
+The cycle-gap policy does not change the existing AI/autopilot plot-turn interval and never triggers a model call. MVP1 provides no UI or DLC override for these weights. Manual waveform test and manual continuous playback retain their existing behavior.
+
+### 5.4 Resolved plot event
 
 ```json
 {
   "event_id": "evt-000042",
   "scene_id": "live-turn-12",
   "offset_ms": 18300,
-  "duration_ms": 6500,
-  "next_gap_ms": 3200,
   "requested_actions": [
     {"op": "hold_strength", "channel": "A", "value": 27},
-    {"op": "pulse", "channel": "A", "pattern": "呼吸", "duration_s": 6.5}
+    {"op": "cycle_hold", "channel": "A", "pattern": "呼吸"}
   ],
   "source": {
     "base_strength": 24,
@@ -135,7 +163,15 @@ At design time the user's selected runtime ceiling is 40 per channel. That perso
 }
 ```
 
-After execution the recorder adds effective values, safety adjustments, send status, and failure reasons. Exact replay schedules `requested_actions` at the recorded offsets and compares the new effective results to the original effective results.
+After execution the recorder adds effective values, safety adjustments, send status, and failure reasons. Normal waveform/strength changes wait for the active raw cycle to finish. If a new plot event arrives while the channel is already in its generated gap, the gap ends and the new directive starts immediately. Stop, pause, disconnect, and emergency stop remain immediate.
+
+### 5.5 Cycle execution record
+
+Every started raw cycle records channel, per-channel cycle index, plot event ID, pattern and waveform-data version, requested/effective strength, cycle start offset, raw cycle duration, selected gap in integer tenths, planned gap duration, actual gap duration, and interruption reason.
+
+Exact replay schedules recorded cycle starts and gap results; it never samples again. Manual/operator pause duration is removed from active replay time, while automatically generated waveform gaps are retained. Current safety is re-applied and may mark playback adjusted.
+
+Each channel runner owns at most one async worker plus one pending normal directive. A generation token prevents cancelled workers from sending later frames. Resume begins with a complete new raw cycle rather than continuing a partial cycle.
 
 ## 6. Session lifecycle
 
@@ -179,10 +215,11 @@ Replay rules:
 MVP1 applies to the existing automatic mode.
 
 - An AI turn remains responsible for narrative/chat output and base device actions.
-- The resolver converts the turn's channel actions into a serializable live segment.
+- The resolver converts the turn's channel actions into a serializable plot event.
 - MVP1 randomly selects from all allowed waveform presets for each channel that is set.
 - Strength is resolved independently per channel inside the base target `±4`.
-- The weighted interval chooses the next automatic turn delay.
+- A/B cycle runners repeatedly send one complete raw frame sequence followed by the independently sampled cycle-relative gap.
+- The existing automatic-turn delay remains responsible for AI/dialogue pacing.
 - Stop/clear intent is preserved and never randomized into output.
 - A/B are recorded independently.
 - The UI exposes start/resume, pause, finish-and-save, current waveform/strength, and a minimal replay list.
@@ -209,9 +246,10 @@ The scheduler calculates:
 
 - scene duration from normalized character count and reading-speed preset;
 - a scene pace multiplier from analysis;
-- weighted event intervals;
 - `±4` strength jitter;
 - resolved timeline offsets and actions.
+
+Within an active scene directive, the shared cycle-runner policy supplies independent A/B raw-cycle gaps. Scene boundaries remain plot events and therefore replace the pending directive according to the cycle-boundary rules.
 
 The chapter must parse, validate, and pass a dry timeline validation before playback starts automatically. Partial chapter output is never played.
 
@@ -279,6 +317,8 @@ MVP2 adds source upload, analysis status, chapter selection, reader text/progres
 - LLM generation failure: no chapter playback; retain a retryable analysis/plan error.
 - Invalid waveform or channel directive: reject the chapter plan, report the exact scene, and do not partially play.
 - Relay disconnect: clear and pause.
+- Waveform send failure: cancel the affected runner; if caused by device disconnect, clear and pause the whole session.
+- Empty or invalid frame sequence: reject before starting the runner and record the exact channel/pattern failure.
 - Safety rejection: record it; continue only when the remaining event is still meaningful, and mark replay adjusted.
 - Corrupt replay: reject before player creation.
 - Pause/finish timeout: issue the existing clear/zero fallback and report the failure.
@@ -292,7 +332,10 @@ MVP1 gate:
 
 - seeded resolution is deterministic;
 - strength always stays in `base ±4` and effective caps;
-- interval selection follows configured bands;
+- raw cycle duration equals `frame_count × 100ms`;
+- cycle-gap sampling follows `40% zero / 30% 0.1..1.0 / 30% 1.1..2.0` using integer tenths;
+- A/B random streams are deterministic and independent;
+- normal directive changes occur only at cycle boundaries, while stop/pause/disconnect/estop remain immediate;
 - archive round-trip preserves resolved events;
 - pause and finish clear output;
 - exact replay reproduces the same requested timeline;

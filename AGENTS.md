@@ -40,20 +40,25 @@ Randomness must be resolved into a deterministic timeline before exact replay. D
 
 - Use a lightweight timeline layer between AI decisions and the existing `SafetyManager`/`GameLoop` execution path.
 - AI chooses channel intent, waveform, and base strength where the active mode requires it.
-- The timeline resolver applies configured interval selection and scene-local strength jitter.
+- The timeline resolver applies scene-local strength jitter. Per-channel cycle runners apply the approved waveform-cycle pause policy without changing the AI plot-turn cadence.
 - The player sends resolved actions through the existing safety layer; it never bypasses safety validation.
 - The recorder stores both requested and effective results so safety clamping is auditable.
 - A replay is exact only when its fully resolved timeline can be executed without current safety adjustments.
 
 ## Randomization decisions
 
-- DLC supplies default behavior settings; a future UI may override them per session.
 - MVP1 starts with random selection from all allowed waveform presets.
 - Strength jitter is an integer in `[-4, +4]` around the scene/base target.
 - The user's current runtime output ceiling is 40 per channel. Keep that value in ignored local configuration/runtime state; committed code must never raise it automatically.
 - Do not add extra cross-scene smoothing in the timeline resolver. The existing safety layer remains authoritative.
-- Default interval profile is weighted: 70% normal `6–12s`, 20% short `2–5s`, 10% long `15–25s`; DLC may override it.
 - A/B channels share the same plot beat but have independent intent, waveform, base strength, and effective cap.
+- The AI/autopilot plot-turn interval remains unchanged. Random cycle pauses do not trigger model calls.
+- One waveform cycle is its complete raw frame sequence; every frame represents 100 ms.
+- After every completed cycle, each channel independently samples a pause multiplier: 40% exactly `0`, 30% uniformly from `0.1..1.0`, and 30% uniformly from `1.1..2.0`, all in 0.1 steps.
+- Pause duration is `raw cycle duration × sampled multiplier`. During the pause no waveform frame is sent, but the current strength is retained.
+- Pattern and strength are selected once per plot event. Only the pause multiplier is resampled after each completed cycle.
+- Normal plot changes wait for the current cycle boundary. If the channel is already in its gap, the gap ends and the new event starts immediately. Stop, pause, disconnect, and emergency stop remain immediate.
+- MVP1 uses one project-wide cycle-gap policy with no UI or DLC override. Manual waveform test/continuous controls retain their existing behavior.
 
 ## Session and replay decisions
 
@@ -65,6 +70,7 @@ Randomness must be resolved into a deterministic timeline before exact replay. D
 - Replay archives use the `.coyote-replay` extension and ZIP container format.
 - Archives contain a manifest, complete resolved timeline, source/scene metadata, model/DLC/app versions, and the original novel when novel mode is used.
 - Exact replay uses resolved values, not random ranges. Random ranges are metadata and are reused only by the later “similar version” feature.
+- Exact replay also stores every completed cycle's selected pause multiplier and actual timing. Manual/operator pause duration is omitted from replay timing, while generated cycle gaps are preserved.
 - If current caps alter a replay event, clamp it and mark the run as adjusted/non-exact; never raise current caps automatically.
 
 ## Novel-mode decisions
@@ -76,7 +82,7 @@ Randomness must be resolved into a deterministic timeline before exact replay. D
 - Generate and validate a complete chapter timeline before playback. API failure prevents playback of that chapter.
 - MVP2 implements only faithful mode. The later interpretation mode may expand transitions without changing major plot events.
 - In novel mode the AI generates device intent only: for A/B independently choose `keep`, `set`, or `stop`; `set` supplies waveform and base strength.
-- The scheduler supplies duration, weighted interval, reading-speed timing, and `±4` scene-local jitter.
+- The scheduler supplies reading-speed timing and `±4` scene-local jitter; the same per-channel cycle runner supplies waveform-cycle gaps.
 - Reading speed is selected as slow/standard/fast and adjusted by scene pacing.
 - No camera or microphone reaction influences novel planning in MVP2. Chat remains available but does not change the novel's main plot.
 - Playback begins automatically after chapter generation and validation; no mandatory preview screen.
