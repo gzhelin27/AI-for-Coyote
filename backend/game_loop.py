@@ -161,7 +161,10 @@ class GameLoop:
                 actions = []
             self.turn_count += 1
             executed, dropped = await self.execute_actions(actions)
-            await self._apply_channel_floor()
+            # 模型失败时绝不能执行通道保底，否则用户只会看到错误，
+            # 设备却可能在没有有效 AI 决策的情况下自行开始输出。
+            if error is None:
+                await self._apply_channel_floor()
         finally:
             self.turn_busy = False
 
@@ -415,8 +418,12 @@ class GameLoop:
                     self.last_wave[ch] = self.turn_count
                     fixed = True
                 if strength <= 0:
-                    cmd = {"kind": "hold", "channel": ch, "value": base}
-                    self._scale_cmd(cmd)
+                    ok, reason, cmd = self.safety.validate(
+                        {"op": "hold_strength", "channel": ch, "value": base}
+                    )
+                    if not ok or cmd is None:
+                        logger.warning("通道保底强度被安全层拒绝: %s -> %s", ch, reason)
+                        continue
                     if ready and not self.safety.dry_run:
                         await self._send_all(self._build_frames(cmd, client_id, slot_id))
                     self.safety.record(cmd)
@@ -425,8 +432,12 @@ class GameLoop:
             # 规则 2：每 2 轮内，强度与波形至少各调整一次
             if self.turn_count - self.last_strength.get(ch, 0) >= 2:
                 delta = 5 if strength < self.safety.cap_for(ch) else -5
-                cmd = {"kind": "add", "channel": ch, "delta": delta}
-                self._scale_cmd(cmd)
+                ok, reason, cmd = self.safety.validate(
+                    {"op": "add_strength", "channel": ch, "delta": delta}
+                )
+                if not ok or cmd is None:
+                    logger.warning("通道保底增减被安全层拒绝: %s -> %s", ch, reason)
+                    continue
                 if ready and not self.safety.dry_run:
                     await self._send_all(self._build_frames(cmd, client_id, slot_id))
                 self.safety.record(cmd)
@@ -629,16 +640,19 @@ class GameLoop:
         overlap = min(float(playback["loop_overlap_s"]), batch_s * 0.5)
         total = max(1, int(round(batch_s * 10)))
         tiled = (base * (total // len(base) + 1))[:total] if base else []
-        frame = self.ops.pulse(
-            client_id, slot_id, ch, tiled, int(batch_s * 1000), immediate=True
-        )
+        def next_frame() -> dict:
+            # 每次重发都生成新的 reqId；复用同一帧会被 DG-LAB 4
+            # 以 duplicate_request_id 拒绝，导致循环波形在首批后停止。
+            return self.ops.pulse(
+                client_id, slot_id, ch, tiled, int(batch_s * 1000), immediate=True
+            )
         wait_s = max(0.1, batch_s - overlap)
 
         stop_event = asyncio.Event()
         self.loop_events[ch_name] = stop_event
 
         async def worker() -> None:
-            ok = await self._send_all([frame])
+            ok = await self._send_all([next_frame()])
             if not ok:
                 return
             logger.info(
@@ -653,7 +667,7 @@ class GameLoop:
                     pass
                 if self.safety.estop_active:
                     break
-                await self._send_all([frame])
+                await self._send_all([next_frame()])
             logger.info("%s 通道循环波形结束：%s", ch_name, cmd["pattern"])
 
         self.loop_tasks[ch_name] = asyncio.create_task(worker())

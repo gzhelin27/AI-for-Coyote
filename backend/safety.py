@@ -128,13 +128,31 @@ class SafetyManager:
             return f"{ch} 通道已手动关闭，拒绝动作"
         return None
 
+    def _safe_target(self, ch: str, raw_value) -> tuple[int, int]:
+        """统一钳制目标强度。
+
+        所有“设到某个值”的入口都必须走这里：先受通道有效上限约束，
+        再限制单条指令的上升幅度。降低强度不限制步长，确保清零、急停
+        和过热降档可以立即生效。
+
+        返回 (实际目标值, 当前有效上限)。
+        """
+        try:
+            requested = int(float(raw_value))
+        except (TypeError, ValueError):
+            requested = 0
+        cap = self.cap_for(ch)
+        target = max(0, min(requested, cap))
+        current = max(0, min(int(self.current.get(ch, 0)), cap))
+        if target > current:
+            target = min(target, current + self.max_step)
+        return target, cap
+
     def _validate_temp(self, a: dict):
         ch = self.norm_channel(a.get("channel"))
         if (reason := self._check_enabled(ch)):
             raise SafetyError(reason)
-        value = int(float(a.get("value", 0)))
-        cap = self.cap_for(ch)
-        value = max(0, min(value, cap))  # 硬钳制
+        value, cap = self._safe_target(ch, a.get("value", 0))
         try:
             duration_s = float(a.get("duration_s", 1))
         except (TypeError, ValueError):
@@ -151,9 +169,7 @@ class SafetyManager:
         ch = self.norm_channel(a.get("channel"))
         if (reason := self._check_enabled(ch)):
             raise SafetyError(reason)
-        value = int(float(a.get("value", 0)))
-        cap = self.cap_for(ch)
-        value = max(0, min(value, cap))  # 硬钳制
+        value, cap = self._safe_target(ch, a.get("value", 0))
         return (
             True,
             f"{ch} 通道持续强度 {value}（上限 {cap}，保持到清除）",
