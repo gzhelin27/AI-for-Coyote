@@ -51,6 +51,12 @@ class ConnectedRelay:
         return True
 
 
+class YieldingConnectedRelay(ConnectedRelay):
+    async def send_frame(self, frame):
+        await asyncio.sleep(0)
+        return await super().send_frame(frame)
+
+
 def make_game_loop_for_test(*, pattern="呼吸", frames=None):
     cfg = deepcopy(DEFAULTS)
     cfg["app"]["dry_run"] = False
@@ -134,6 +140,53 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loop.ops.last_pulse_frames, ["a", "b", "c"] * 10)
         self.assertEqual(loop.ops.last_pulse_duration_ms, 3000)
         self.assertEqual(executed[0]["effective"]["duration_ms"], 3000)
+
+    async def test_strength_then_manual_pulse_keeps_legacy_default_wave_fallback(self):
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a", "b", "c"])
+        loop.relay = YieldingConnectedRelay()
+        loop.safety.presets["潮汐"] = {
+            "waveform": "wave_tide",
+            "frames": ["x", "y"],
+            "default_duration_s": 5,
+            "max_duration_s": 10,
+        }
+
+        executed, dropped = await loop.execute_actions([
+            {"op": "hold_strength", "channel": "A", "value": 20},
+            {"op": "pulse", "channel": "A", "pattern": "潮汐", "duration_s": 3},
+        ])
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(executed), 2)
+        self.assertEqual(
+            [(frames[:3], len(frames), duration) for _, frames, duration in loop.ops.pulse_calls],
+            [(["a", "b", "c"], 300, 30000), (["x", "y", "x"], 30, 3000)],
+        )
+        loop._cancel_loops(None)
+
+    async def test_strength_then_pulse_hold_keeps_legacy_default_wave_fallback(self):
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a", "b", "c"])
+        loop.relay = YieldingConnectedRelay()
+        loop.safety.presets["潮汐"] = {
+            "waveform": "wave_tide",
+            "frames": ["x", "y"],
+            "default_duration_s": 5,
+            "max_duration_s": 10,
+        }
+
+        executed, dropped = await loop.execute_actions([
+            {"op": "hold_strength", "channel": "A", "value": 20},
+            {"op": "pulse_hold", "channel": "A", "pattern": "潮汐"},
+        ])
+        await asyncio.sleep(0)
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(executed), 2)
+        self.assertEqual(
+            [(frames[:3], len(frames), duration) for _, frames, duration in loop.ops.pulse_calls],
+            [(["a", "b", "c"], 300, 30000), (["x", "y", "x"], 300, 30000)],
+        )
+        loop._cancel_loops(None)
 
     async def test_clear_output_does_not_enter_estop(self):
         loop = make_game_loop_for_test()

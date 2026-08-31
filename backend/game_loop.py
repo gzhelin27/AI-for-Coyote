@@ -460,15 +460,13 @@ class GameLoop:
         slot_id = self.relay.get_slot_id()
         ready = bool(client_id and slot_id)
         dry_run = self.safety.dry_run
-        explicit_wave_channels = set()
+        explicit_cycle_channels = set()
         for candidate in actions:
-            if not isinstance(candidate, dict) or candidate.get("op") not in (
-                "pulse", "pulse_hold", "pulse_cycle",
-            ):
+            if not isinstance(candidate, dict) or candidate.get("op") != "pulse_cycle":
                 continue
             wave_ok, _, wave_cmd = self.safety.validate(candidate)
             if wave_ok and wave_cmd and wave_cmd.get("channel") in ("A", "B"):
-                explicit_wave_channels.add(wave_cmd["channel"])
+                explicit_cycle_channels.add(wave_cmd["channel"])
 
         for action in actions:
             if not isinstance(action, dict):
@@ -494,7 +492,7 @@ class GameLoop:
             if cmd["kind"] in ("hold", "add", "temp") and cmd.get("channel") in ("A", "B"):
                 ch_name = cmd["channel"]
                 if (
-                    ch_name not in explicit_wave_channels
+                    ch_name not in explicit_cycle_channels
                     and ch_name not in self.loop_tasks
                     and not self.safety.pulse_active().get(ch_name)
                 ):
