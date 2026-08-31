@@ -1,6 +1,6 @@
 # Phase 3 Authoring, Interpretation, and Replay Library Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans task-by-task. Apply superpowers:test-driven-development to every schema, API, or playback behavior change and superpowers:verification-before-completion before release claims.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let the user override selected novel scenes, opt into an interpretation mode, and manage/search/derive completed replays without weakening exact-replay semantics.
 
@@ -8,9 +8,11 @@
 
 **Tech Stack:** Python 3.12, stdlib `sqlite3`, FastAPI, MVP1 timeline/MVP2 story packages, React 19, TypeScript, Zustand, Python `unittest`.
 
+**Spec:** `docs/superpowers/specs/2026-08-31-randomized-timeline-novel-mode-design.md`
+
 **Depends on:** Accepted tag `mvp2-faithful-novel-mode`.
 
-## Constraints
+## Global Constraints
 
 - Scene override modes are `force`, `prefer`, and `random`.
 - Optional locks apply to base strength and duration independently.
@@ -19,6 +21,8 @@
 - Exact replay never resamples. Similar-version generation always creates a new derived replay and is never labeled exact.
 - Cross-DLC conversion validates patterns and caps, reports every substitution, and creates a new archive.
 - Every normally completed session stays permanent until the user explicitly deletes it.
+
+---
 
 ### Task 1: Versioned sidecar override model and migration
 
@@ -75,7 +79,7 @@ Commit: `feat: add versioned scene override sidecars`
 
 - [ ] **Step 1: Define and test precedence**
 
-Use this exact order: safety caps > `force` locks > validated AI directive > `prefer` hint > DLC defaults > random allowed choice. `random` discards AI pattern choice for the selected fields but retains source scene identity and cap. A duration lock controls scene duration only; interval generation still produces events inside it.
+Use this exact order: safety caps > `force` locks > validated AI directive > `prefer` hint > DLC defaults > random allowed choice. `random` discards AI pattern choice for the selected fields but retains source scene identity and cap. A duration lock controls scene duration only; the shared per-channel cycle runners continue generating raw cycles and fixed-policy gaps inside that duration.
 
 Test A/B independently, unavailable forced pattern rejection, cap-clamped strength, duration lock bounds, deterministic seed behavior, and no mutation of input models.
 
@@ -187,7 +191,7 @@ Commit: `feat: add searchable replay library`
 
 - [ ] **Step 1: Test derivation semantics**
 
-Similar version: retain scene order, base targets, random ranges, and source; use a new seed to resample waveform/strength/interval; set `exact=false`, parent ID, and `derivation_kind=similar`.
+Similar version: retain scene order, scene durations, base targets, random ranges, and source; use a new seed to resample waveform/strength and the independent A/B cycle-gap schedules over the same active-duration boundaries; set `exact=false`, parent ID, and `derivation_kind=similar`.
 
 Cross-DLC: map available pattern names, clamp to target caps, collect explicit substitutions, require user confirmation if any substitution exists, and set `derivation_kind=cross_dlc`. The source archive is unchanged.
 

@@ -4,11 +4,11 @@
 
 **Goal:** Deliver the accepted lightweight timeline architecture through four independently usable releases while keeping the deployed checkout stable and every device command behind the existing safety layer.
 
-**Architecture:** The roadmap builds one deterministic timeline core first, then adds novel, authoring/library, and video adapters. Later phases consume the same `ChannelDirective -> TimelineResolver -> TimelinePlayer -> GameLoop.execute_actions() -> SafetyManager` path; they do not create alternate device paths.
+**Architecture:** The roadmap builds one deterministic timeline core first, then adds novel, authoring/library, and video adapters. Later phases consume the same `ChannelDirective -> TimelineResolver -> TimelinePlayer/ChannelCycleRunner -> GameLoop.execute_actions() -> SafetyManager` path; they do not create alternate device paths.
 
 **Tech Stack:** Python 3.12, FastAPI, React 19, TypeScript, Zustand, stdlib ZIP/JSON/hash support, `python-docx` in MVP2, and the existing optional OpenCV stack in Phase 4.
 
-**Accepted design:** `docs/superpowers/specs/2026-08-31-randomized-timeline-novel-mode-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-31-randomized-timeline-novel-mode-design.md`
 
 ## Git delivery model
 
@@ -30,7 +30,7 @@
 
 | Gate | User-visible outcome | Explicitly deferred | Detailed plan |
 |---|---|---|---|
-| MVP1 | Random waveform, strength `base ±4`, weighted interval, completed-session archive, exact replay | Novel/video, authoring, search/rating | `2026-08-31-mvp1-randomized-timeline-replay.md` |
+| MVP1 | Random waveform, strength `base ±4`, independent raw-cycle gaps, completed-session archive, exact replay | Novel/video, authoring, search/rating | `2026-08-31-mvp1-randomized-timeline-replay.md` |
 | MVP2 | TXT/MD/DOCX import, one-time analysis, faithful chapter autoplay, built-in reader | Interpretation, manual nodes, video | `2026-08-31-mvp2-faithful-novel-mode.md` |
 | Phase 3 | Force/prefer/random scene overrides, interpretation mode, replay library | Local video | `2026-08-31-phase3-authoring-replay-library.md` |
 | Phase 4 | Local video/subtitle/keyframe analysis synchronized to video clock | Live web capture, camera/mic reaction | `2026-08-31-phase4-video-content-source.md` |
@@ -45,6 +45,7 @@
 6. Exact replay reuses the resolved event sequence and makes no model calls; safety-adjusted playback is labeled adjusted.
 7. Full source text and credentials are omitted from logs and Git.
 8. A later phase may extend schemas only through versioned, backward-compatible readers and migrations.
+9. AI/plot timing remains source-driven. Independent A/B cycle runners alone apply the fixed `40% zero / 30% 0.1..1.0 / 30% 1.1..2.0` pause policy.
 
 ## Phase execution checklist
 

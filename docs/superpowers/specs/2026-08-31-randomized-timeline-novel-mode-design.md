@@ -1,7 +1,7 @@
 # Randomized Timeline, Replay, and Novel Mode Design
 
 **Date:** 2026-08-31
-**Status:** Design approved in chat; written revision awaiting user review
+**Status:** Approved; ready for phased implementation
 **Repository:** `gzhelin27/AI-for-Coyote` fork of `indhg/AI-for-Coyote`
 
 ## 1. Purpose
@@ -153,7 +153,7 @@ The cycle-gap policy does not change the existing AI/autopilot plot-turn interva
   "offset_ms": 18300,
   "requested_actions": [
     {"op": "hold_strength", "channel": "A", "value": 27},
-    {"op": "cycle_hold", "channel": "A", "pattern": "呼吸"}
+    {"op": "pulse_cycle", "channel": "A", "pattern": "呼吸"}
   ],
   "source": {
     "base_strength": 24,

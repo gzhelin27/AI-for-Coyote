@@ -1,16 +1,18 @@
 # Phase 4 Local Video Content Source Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans task-by-task. Apply superpowers:test-driven-development before feature code and superpowers:verification-before-completion before release claims.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Import a local video, derive stable timecoded scenes from subtitles and sampled keyframes, generate A/B directives, and keep safe device playback synchronized to the video clock with manual timecode overrides.
 
-**Architecture:** Implement video as another content-source adapter. Metadata/subtitle/keyframe analysis produces stable timecoded scenes; the existing planner/override/timeline packages resolve them; `VideoTimelineSynchronizer` advances only from the frontend video clock and routes due events through `TimelinePlayer` and the existing safety path.
+**Architecture:** Implement video as another content-source adapter. Metadata/subtitle/keyframe analysis produces stable timecoded scenes; the existing planner/override/timeline packages resolve plot events; `VideoTimelineSynchronizer` advances only from the frontend video clock while the shared independent A/B cycle runners provide raw-cycle gaps inside each active scene and route output through the existing safety path.
 
 **Tech Stack:** Python 3.12, existing optional OpenCV dependency, stdlib subtitle parser/hash support, FastAPI, MVP timeline/story/override packages, browser HTML5 video, React 19, TypeScript, Python `unittest`.
 
+**Spec:** `docs/superpowers/specs/2026-08-31-randomized-timeline-novel-mode-design.md`
+
 **Depends on:** Accepted tag `phase3-authoring-replay-library`.
 
-## Constraints
+## Global Constraints
 
 - Local video files only. No live URL capture, browser scraping, DRM bypass, or camera/microphone reaction.
 - Prefer subtitles for scene text; sample bounded keyframes when subtitles are absent or sparse.
@@ -19,6 +21,8 @@
 - Resume occurs at a validated safe event boundary at or after the current timecode.
 - Use Phase 3 force/prefer/random overrides keyed by stable video scene IDs.
 - All generated frames/source material stay local except explicitly selected analysis payloads sent to the configured model.
+
+---
 
 ### Task 1: Video source model, safe import, and metadata
 

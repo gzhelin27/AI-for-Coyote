@@ -1,25 +1,29 @@
 # MVP2 Faithful Novel Mode Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Use superpowers:test-driven-development for each behavior change and superpowers:verification-before-completion at the release gate.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Import a local TXT, MD, or DOCX novel, analyze it once, generate and validate a faithful full-chapter A/B timeline, display the original text in a reader, and automatically play the selected chapter through the accepted MVP1 timeline/safety path.
 
-**Architecture:** Add `backend.story` as a content-source adapter above the MVP1 timeline layer. Extraction and analysis produce stable chapter/scene records; planning produces only `keep`, `set`, or `stop` channel directives; the resolver owns interval sampling and `±4` strength variation. Source bytes, scene map, and resolved timeline are embedded in the completed replay.
+**Architecture:** Add `backend.story` as a content-source adapter above the MVP1 timeline layer. Extraction and analysis produce stable chapter/scene records; planning produces only `keep`, `set`, or `stop` channel directives; the resolver owns waveform/`±4` strength variation and the shared A/B cycle runners own cycle-relative gaps. Source bytes, scene map, resolved plot events, and cycle records are embedded in the completed replay.
 
 **Tech Stack:** Python 3.12, FastAPI, `python-docx`, stdlib hashing/JSON, existing LLM client, MVP1 timeline package, React 19, TypeScript, Zustand, Python `unittest`.
 
+**Spec:** `docs/superpowers/specs/2026-08-31-randomized-timeline-novel-mode-design.md`
+
 **Depends on:** Accepted tag `mvp1-randomized-timeline-replay`.
 
-## Constraints
+## Global Constraints
 
 - Faithful mode only: preserve chapter order and source meaning; chat cannot change the main plot.
 - Analyze the whole novel once. Use chapter/size fallback only when the single request fails or exceeds model limits.
 - Do not send camera or microphone state to novel analysis/planning.
 - Generate, parse, validate, and dry-run the full selected chapter before autoplay begins.
-- AI chooses per-channel `keep`, `set(pattern, base_strength)`, or `stop`; scheduler owns interval timing and strength jitter.
+- AI chooses per-channel `keep`, `set(pattern, base_strength)`, or `stop`; the story scheduler owns scene timing/reading progress, the resolver owns strength jitter, and the MVP1 cycle runners own waveform-cycle gaps.
 - Reading speeds are slow 250, standard 400, and fast 600 normalized Chinese characters per minute.
 - Pause clears output. Resume begins at a chosen safe event/chapter cursor.
 - Imported source and caches stay in ignored local `data/` paths.
+
+---
 
 ## File structure
 
@@ -202,7 +206,7 @@ The planner request includes scene text/summaries, ordered scene IDs, allowed wa
 
 - [ ] **Step 3: Resolve chapter timing before playback**
 
-Calculate scene duration as `normalized_character_count / cpm * 60`, multiply by validated scene pace, then resolve events with the MVP1 seeded resolver and interval profile. Ensure offsets are monotonic and inside the scene duration. Perform a frame-free dry validation through the safety adapter. Return `ValidatedChapterPlan` only after every event succeeds; do not expose a partial timeline.
+Calculate scene duration as `normalized_character_count / cpm * 60`, multiply by validated scene pace, and resolve one plot event per ordered scene with the MVP1 seeded resolver. Ensure plot offsets are monotonic and inside the chapter. During playback, the existing independent A/B cycle runners repeat the active scene directive using the fixed cycle-gap policy until the next scene boundary. Perform a frame-free dry validation through the safety adapter. Return `ValidatedChapterPlan` only after every plot event succeeds; do not expose a partial timeline.
 
 - [ ] **Step 4: Verify and commit**
 
