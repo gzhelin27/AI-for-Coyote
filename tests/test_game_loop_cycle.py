@@ -1,6 +1,7 @@
 import asyncio
 from copy import deepcopy
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
@@ -203,6 +204,33 @@ async def wait_for_condition(predicate, *, timeout=1):
 
 
 class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_add_strength_keeps_coordinator_truth_through_next_action_seed(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(pattern="呼吸", frames=["a"], relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.pulse_until["A"] = float("inf")
+
+        held, hold_dropped = await loop.execute_actions(
+            [{"op": "hold_strength", "channel": "A", "value": 10}]
+        )
+        added, add_dropped = await loop.execute_actions(
+            [{"op": "add_strength", "channel": "A", "delta": 5}]
+        )
+        pulsed, pulse_dropped = await loop.execute_actions(
+            [{"op": "pulse_cycle", "channel": "A", "pattern": "呼吸"}]
+        )
+
+        self.assertEqual(hold_dropped, [])
+        self.assertEqual(add_dropped, [])
+        self.assertEqual(pulse_dropped, [])
+        self.assertEqual(len(held), 1)
+        self.assertEqual(len(added), 1)
+        self.assertEqual(len(pulsed), 1)
+        self.assertEqual(relay.physical_strength[0], 15)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 15)
+        self.assertEqual(loop.safety.current["A"], 15)
+        self.assertEqual(loop.safety.requested["A"], 15)
+
     async def test_hold_strength_send_false_is_dropped_without_state_mutation(self):
         loop = make_game_loop_for_test(pattern="呼吸", frames=["a"])
         loop.relay = RejectingConnectedRelay()
@@ -424,6 +452,113 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             loop.output_coordinator.pending("A").target_strength,
             10,
         )
+
+    async def test_lowered_cap_preempts_queued_hold_before_failed_reduction(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.pulse_until["A"] = float("inf")
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def block_channel(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": int(state.strength or 0)},
+            )
+
+        blocker = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, block_channel
+            )
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+
+        queued = asyncio.Event()
+        original_run_locked = loop.output_coordinator._run_channel_locked
+
+        async def observed_run_locked(
+            slot,
+            started_generation,
+            started_normal_epoch,
+            kind,
+            pending_expectation,
+            operation,
+        ):
+            if operation is not block_channel:
+                queued.set()
+            return await original_run_locked(
+                slot,
+                started_generation,
+                started_normal_epoch,
+                kind,
+                pending_expectation,
+                operation,
+            )
+
+        loop.output_coordinator._run_channel_locked = observed_run_locked
+        original_send = relay.send_frame
+
+        async def reject_negative_delta(frame):
+            if isinstance(frame, dict) and "strength" in frame:
+                _channel, delta = frame["strength"]
+                if delta < 0:
+                    relay.sent_frames.append(frame)
+                    return False
+            return await original_send(frame)
+
+        relay.send_frame = reject_negative_delta
+        normal = asyncio.create_task(
+            loop.execute_actions(
+                [{"op": "hold_strength", "channel": "A", "value": 30}]
+            )
+        )
+        await asyncio.wait_for(queued.wait(), timeout=1)
+        lowering = asyncio.create_task(loop.set_runtime_cap("A", 10))
+        await wait_for_condition(lambda: loop.safety.user_caps["A"] == 10)
+        release_blocker.set()
+
+        blocker_result, normal_result, cap_result = await asyncio.gather(
+            blocker, normal, lowering, return_exceptions=True
+        )
+
+        self.assertTrue(blocker_result.sent)
+        self.assertNotIsInstance(cap_result, BaseException)
+        self.assertEqual(normal_result[0], [])
+        self.assertEqual(len(normal_result[1]), 1)
+        self.assertEqual(relay.physical_strength[0], 0)
+        self.assertEqual(loop.ops.strength_deltas, [])
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 0)
+        self.assertEqual(loop.safety.current["A"], 0)
+
+    async def test_lowered_cap_preempts_primary_after_helper_delivery(self):
+        relay = GatedPhysicalRelay()
+        relay.arm("pulse")
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+
+        normal = asyncio.create_task(
+            loop.execute_actions(
+                [{"op": "hold_strength", "channel": "A", "value": 30}]
+            )
+        )
+        await asyncio.wait_for(relay.successful_send.wait(), timeout=1)
+
+        lowering = asyncio.create_task(loop.set_runtime_cap("A", 10))
+        await wait_for_condition(lambda: loop.safety.user_caps["A"] == 10)
+        relay.release_send.set()
+        normal_result, cap_result = await asyncio.gather(normal, lowering)
+
+        self.assertEqual(normal_result[0], [])
+        self.assertEqual(len(normal_result[1]), 1)
+        self.assertEqual(cap_result["dropped"], [])
+        self.assertEqual(relay.physical_strength[0], 0)
+        self.assertEqual(loop.ops.strength_deltas, [])
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 0)
+        self.assertEqual(loop.safety.current["A"], 0)
 
     async def test_explicit_runtime_safety_reconciliation_retries_pending_delta(self):
         loop = make_game_loop_for_test()
@@ -701,7 +836,7 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             await report
         await wait_for_condition(
             lambda: loop.output_coordinator.revision("A")
-            >= initial_revision + 2
+            >= initial_revision + 1
         )
 
         self.assertEqual(relay.physical_strength[0], 30)
@@ -732,6 +867,52 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             loop.output_coordinator.pending("A").target_strength
         )
+
+    async def test_safe_report_below_cap_resumes_retained_channel(self):
+        loop = make_game_loop_for_test()
+        loop.safety.set_user_cap("A", 20)
+        loop.safety.current["A"] = 30
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=30, enabled=True
+        )
+        loop.output_coordinator.mark_reduction("A", 20)
+        controller = SimpleNamespace(
+            suspend_channel_for_safety=AsyncMock(return_value=True),
+            resume_channel_after_safety=AsyncMock(),
+        )
+        loop.timeline_session = controller
+
+        result = await loop.update_device_state({"intensityA": 5}, None)
+
+        self.assertEqual(result["A"]["dropped"], [])
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 5)
+        self.assertIsNone(
+            loop.output_coordinator.pending("A").target_strength
+        )
+        controller.resume_channel_after_safety.assert_awaited_once_with("A")
+
+    async def test_unsafe_report_above_cap_never_resumes_retained_channel(self):
+        loop = make_game_loop_for_test()
+        loop.safety.set_user_cap("A", 20)
+        loop.safety.current["A"] = 30
+        loop.output_coordinator.seed_confirmed(
+            "A", strength=30, enabled=True
+        )
+        loop.output_coordinator.mark_reduction("A", 20)
+        controller = SimpleNamespace(
+            suspend_channel_for_safety=AsyncMock(return_value=True),
+            resume_channel_after_safety=AsyncMock(),
+        )
+        loop.timeline_session = controller
+        loop._reconcile_channel_safety_locked = AsyncMock(
+            return_value={"executed": [], "dropped": []}
+        )
+
+        result = await loop.update_device_state({"intensityA": 30}, None)
+
+        self.assertEqual(result["A"]["dropped"], [])
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 30)
+        controller.resume_channel_after_safety.assert_not_awaited()
 
     async def test_report_group_waits_for_blocked_sibling_before_raising(self):
         loop = make_game_loop_for_test()

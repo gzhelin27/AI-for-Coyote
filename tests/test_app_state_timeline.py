@@ -14,7 +14,7 @@ import backend.main as main_module
 from backend.config import DEFAULTS, reload_character
 from backend.timeline.replay_store import ReplaySummary
 from backend.timeline.session import SessionController
-from tests.test_game_loop_timeline import FakeRelay
+from tests.test_game_loop_timeline import FakeRelay, relay_output_operations
 from tests.timeline_fakes import make_replay_bundle
 
 
@@ -513,6 +513,55 @@ roles:
         self.assertEqual(
             [item.replay_id for item in state.replay_store.list()], ["replay-1"]
         )
+
+    async def test_shutdown_stop_failure_estops_and_reaps_background_tasks(self):
+        self.cfg["app"]["dry_run"] = False
+        self.cfg["safety"]["auto_clear_on_disconnect"] = False
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+        bundle = make_replay_bundle([0], "completed")
+        state.replay_store.save(bundle.manifest, bundle.timeline)
+        await state.timeline_session.start_replay("replay-1", cursor=0)
+        for _ in range(40):
+            if state.safety.current["A"] == 20:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(state.safety.current["A"], 20)
+
+        background_started = asyncio.Event()
+        background_stopped = asyncio.Event()
+
+        async def background():
+            background_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                background_stopped.set()
+
+        background_task = asyncio.create_task(background())
+        state.tasks.append(background_task)
+        await background_started.wait()
+        state.relay.fail_next_clear()
+        frames_before = len(state.relay.sent_frames)
+
+        try:
+            result = await asyncio.gather(
+                state.shutdown(), return_exceptions=True
+            )
+
+            self.assertIsInstance(result[0], BaseException)
+            operations = relay_output_operations(
+                state.relay.sent_frames[frames_before:]
+            )
+            self.assertGreaterEqual(operations.count(("clear", None)), 2)
+            self.assertTrue(state.safety.estop_active)
+            self.assertTrue(background_task.done())
+            self.assertTrue(background_stopped.is_set())
+            self.assertEqual(state.tasks, [])
+        finally:
+            if not background_task.done():
+                background_task.cancel()
+            await asyncio.gather(background_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,8 @@ class _ChannelSlot:
     confirmed: ConfirmedChannelOutput = field(default_factory=ConfirmedChannelOutput)
     pending: PendingSafetyWork = field(default_factory=PendingSafetyWork)
     generation: int = 0
+    normal_epoch: int = 0
+    helper_generation: int = 0
     revision: int = 0
     minimum_priority: OutputIntentKind = OutputIntentKind.MANUAL
     estop_latched: bool = False
@@ -131,6 +133,14 @@ class DeviceOutputCoordinator:
     def revision(self, channel: str) -> int:
         """Return the monotonic confirmed-output revision for one channel."""
         return self._slot(channel).revision
+
+    def helper_generation(self, channel: str) -> int:
+        """Return the owner generation for legacy unbounded resend helpers."""
+        return self._slot(channel).helper_generation
+
+    def normal_policy_epoch(self, channel: str) -> int:
+        """Return the safety-policy epoch observed by normal output work."""
+        return self._slot(channel).normal_epoch
 
     async def confirm_reported_strength(
         self,
@@ -213,9 +223,13 @@ class DeviceOutputCoordinator:
                 and slot.revision != expected_revision
             ):
                 return slot.confirmed
+            # A report supersedes legacy unbounded resend helpers without
+            # invalidating the live/replay owner generation for this channel.
+            slot.helper_generation += 1
+            if slot.confirmed.strength == strength:
+                return slot.confirmed
             slot.confirmed = replace(slot.confirmed, strength=strength)
             slot.revision += 1
-            slot.generation += 1
             return slot.confirmed
 
     @staticmethod
@@ -262,6 +276,10 @@ class DeviceOutputCoordinator:
             slot.estop_latched = True
         return slot.generation
 
+    def invalidate_queued_normal(self, channel: str) -> None:
+        """Reject lower-priority work that prepared under an older policy."""
+        self._slot(channel).normal_epoch += 1
+
     def require_clear(self, channel: str) -> None:
         slot = self._slot(channel)
         slot.pending = replace(slot.pending, clear_required=True)
@@ -295,6 +313,7 @@ class DeviceOutputCoordinator:
         intent = _kind(kind)
         self._prepare_safety_intent(channel, intent)
         started_generation = slot.generation
+        started_normal_epoch = slot.normal_epoch
         pending_expectation: object = _NO_PENDING_EXPECTATION
         if (
             intent is OutputIntentKind.SAFETY_REDUCE
@@ -305,6 +324,7 @@ class DeviceOutputCoordinator:
             self._run_channel_locked(
                 slot,
                 started_generation,
+                started_normal_epoch,
                 intent,
                 pending_expectation,
                 operation,
@@ -330,6 +350,34 @@ class DeviceOutputCoordinator:
         )
         return await _await_cleanup(task)
 
+    async def release_estop(self) -> bool:
+        """Release both estop latches only after a confirmed global clear."""
+        task = asyncio.create_task(self._release_estop_locked())
+        return await _await_cleanup(task)
+
+    async def _release_estop_locked(self) -> bool:
+        slot_a = self._slots["A"]
+        slot_b = self._slots["B"]
+        async with slot_a.lock:
+            async with slot_b.lock:
+                for slot in (slot_a, slot_b):
+                    confirmed = slot.confirmed
+                    pending = slot.pending
+                    if (
+                        confirmed.strength != 0
+                        or confirmed.waveform is not None
+                        or confirmed.waveform_mode is not None
+                        or pending.clear_required
+                        or pending.target_strength is not None
+                    ):
+                        return False
+                for slot in (slot_a, slot_b):
+                    if slot.estop_latched:
+                        slot.estop_latched = False
+                        slot.generation += 1
+                    self._refresh_priority(slot)
+                return True
+
     def _prepare_safety_intent(
         self, channel: str, kind: OutputIntentKind
     ) -> None:
@@ -344,6 +392,7 @@ class DeviceOutputCoordinator:
         self,
         slot: _ChannelSlot,
         started_generation: int,
+        started_normal_epoch: int,
         kind: OutputIntentKind,
         pending_expectation: object,
         operation: _ChannelOperation,
@@ -354,6 +403,7 @@ class DeviceOutputCoordinator:
                 started_generation,
                 kind,
                 pending_expectation,
+                started_normal_epoch,
             )
             if rejection is not None:
                 return rejection
@@ -515,9 +565,16 @@ class DeviceOutputCoordinator:
         started_generation: int,
         kind: OutputIntentKind,
         pending_expectation: object = _NO_PENDING_EXPECTATION,
+        started_normal_epoch: int | None = None,
     ) -> TransportOutcome | None:
         if started_generation != slot.generation:
             return _failure("stale output generation")
+        if (
+            kind < OutputIntentKind.SAFETY_REDUCE
+            and started_normal_epoch is not None
+            and started_normal_epoch != slot.normal_epoch
+        ):
+            return _failure("stale output safety policy")
         if (
             pending_expectation is not _NO_PENDING_EXPECTATION
             and slot.pending.target_strength != pending_expectation

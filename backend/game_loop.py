@@ -1025,7 +1025,10 @@ class GameLoop:
         """Apply desired cap policy and publish strength only after delivery."""
         channel = self.safety.norm_channel(channel)
         requested_cap = max(1, min(self.safety.caps[channel], int(value)))
+        previous_effective_cap = self.safety.cap_for(channel)
         applied = self.safety.set_user_cap(channel, requested_cap)
+        if self.safety.cap_for(channel) < previous_effective_cap:
+            self.output_coordinator.invalidate_queued_normal(channel)
         self._sync_output_coordinator_channel(channel)
         confirmed_strength = self.output_coordinator.confirmed(channel).strength
         effective_cap = self.safety.cap_for(channel)
@@ -1055,7 +1058,7 @@ class GameLoop:
         if (
             restart
             and self.safety.desired_enabled[channel]
-            and self.safety.cap_for(channel) <= confirmed_strength
+            and confirmed_strength <= self.safety.cap_for(channel)
         ):
             await controller.resume_channel_after_safety(channel)
         result = reconciled[channel]
@@ -1134,7 +1137,13 @@ class GameLoop:
             for channel, key in (("A", "intensityA"), ("B", "intensityB"))
             if isinstance(props, dict) and key in props
         }
+        previous_effective_caps = {
+            channel: self.safety.cap_for(channel) for channel in policy_channels
+        }
         self.safety.update_device_policy(slot_state)
+        for channel, previous_cap in previous_effective_caps.items():
+            if self.safety.cap_for(channel) < previous_cap:
+                self.output_coordinator.invalidate_queued_normal(channel)
         confirmed_reports = self.safety.update_reported_strength(props)
         reported_strengths = {
             channel: int(self.safety.current[channel])
@@ -1221,7 +1230,7 @@ class GameLoop:
             and restart
             and not result["dropped"]
             and self.safety.desired_enabled[channel]
-            and self.safety.cap_for(channel) <= confirmed_strength
+            and confirmed_strength <= self.safety.cap_for(channel)
         ):
             await controller.resume_channel_after_safety(channel)
         return result
@@ -1722,7 +1731,13 @@ class GameLoop:
                 )
                 continue
 
-            self.safety.record(cmd)
+            if cmd["kind"] in ("temp", "hold", "add") and channel in ("A", "B"):
+                confirmed_strength = self.output_coordinator.confirmed(
+                    channel
+                ).strength
+                self.safety.requested[channel] = int(confirmed_strength or 0)
+            else:
+                self.safety.record(cmd)
             if (
                 cmd["kind"] == "hold"
                 and action.get("op") == "hold_strength"
@@ -1784,6 +1799,7 @@ class GameLoop:
             if expected_generation is None
             else expected_generation
         )
+        policy_epoch = coordinator.normal_policy_epoch(channel)
         state = {
             "complete": False,
             "sent": False,
@@ -1791,11 +1807,24 @@ class GameLoop:
             "generation": generation,
             "helper_cmd": None,
             "helper_expiry": None,
+            "helper_task": None,
+            "cancelled": False,
         }
 
+        def normal_policy_is_current() -> bool:
+            if coordinator.normal_policy_epoch(channel) != policy_epoch:
+                return False
+            return not (
+                cmd["kind"] in ("temp", "hold", "add")
+                and int(cmd["value"]) > self.safety.cap_for(channel)
+            )
+
         async def transport(confirmed):
-            if not self._normal_output_is_current(channel, generation):
-                state["error"] = "stale output generation"
+            if (
+                not self._normal_output_is_current(channel, generation)
+                or not normal_policy_is_current()
+            ):
+                state["error"] = "stale output safety policy"
                 return TransportOutcome(sent=False, error=state["error"])
             helper_cmd = self._default_wave_command(channel) if helper_required else None
             if helper_required and helper_cmd is None:
@@ -1817,15 +1846,26 @@ class GameLoop:
                             owner_generation=generation,
                             owner_intent=intent,
                         )
+                    except asyncio.CancelledError:
+                        state["cancelled"] = True
+                        state["error"] = "默认波形发送被取消"
+                        return await self._rollback_helper_transport(
+                            channel, confirmed, helper_cmd, state
+                        )
                     except Exception as exc:
                         state["error"] = f"默认波形发送失败: {exc}"
                         return TransportOutcome(sent=False, error=state["error"])
                     helper_sent = expiry is not None
                     state["helper_expiry"] = expiry
+                    state["helper_task"] = self.loop_tasks.get(channel)
                 if not helper_sent:
                     state["error"] = "默认波形发送失败"
                     return TransportOutcome(sent=False, error=state["error"])
-                if not self._normal_output_is_current(channel, generation):
+                if (
+                    not self._normal_output_is_current(channel, generation)
+                    or not normal_policy_is_current()
+                ):
+                    state["error"] = "stale output safety policy"
                     return await self._rollback_helper_transport(
                         channel, confirmed, helper_cmd, state
                     )
@@ -1874,7 +1914,18 @@ class GameLoop:
                 primary_sent, primary_error = True, None
                 simulated = True
             else:
-                primary_sent, primary_error = await self._send_frames_complete(frames)
+                try:
+                    primary_sent, primary_error = await self._send_frames_complete(
+                        frames
+                    )
+                except asyncio.CancelledError:
+                    state["cancelled"] = True
+                    state["error"] = "设备发送被取消"
+                    if helper_cmd is not None:
+                        return await self._rollback_helper_transport(
+                            channel, confirmed, helper_cmd, state
+                        )
+                    raise
                 simulated = False
             if not primary_sent:
                 state["error"] = (
@@ -1923,20 +1974,30 @@ class GameLoop:
             self._publish_coordinator_confirmed(channel)
         if not outcome.sent and state["error"] is None:
             state["error"] = outcome.error or "设备发送失败"
+        if state["cancelled"]:
+            raise asyncio.CancelledError
         return state
 
     async def _rollback_helper_transport(
         self, channel: str, confirmed, helper_cmd: dict, state: dict
     ) -> TransportOutcome:
         """Clean a sent helper before reporting its parent action as dropped."""
-        self._cancel_loops(channel, reset_pulse=False)
+        helper_task = state.get("helper_task")
+        self._cancel_loops(channel, reset_pulse=True)
+        if isinstance(helper_task, asyncio.Task) and helper_task is not asyncio.current_task():
+            await asyncio.gather(helper_task, return_exceptions=True)
         frames = self._channel_clear_frames(
             channel,
             self.relay.first_client_id(),
             self.relay.get_slot_id(),
             int(confirmed.strength or 0),
         )
-        cleanup_sent, cleanup_error = await self._send_frames_complete(frames)
+        try:
+            cleanup_sent, cleanup_error = await self._send_frames_complete(frames)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            cleanup_sent = False
+            cleanup_error = "helper clear was cancelled"
         if cleanup_sent:
             return TransportOutcome(
                 sent=True,
@@ -2502,6 +2563,7 @@ class GameLoop:
         """
         if owner_generation is None:
             owner_generation = self.output_coordinator.generation(ch_name)
+        helper_generation = self.output_coordinator.helper_generation(ch_name)
         base = cmd["frames"]
         playback = self.cfg["playback"]
         frame_s = float(playback["frame_ms"]) / 1000.0
@@ -2520,7 +2582,11 @@ class GameLoop:
             )
         wait_s = max(0.1, batch_s - overlap)
 
-        if not self._normal_output_is_current(ch_name, owner_generation):
+        if (
+            not self._normal_output_is_current(ch_name, owner_generation)
+            or self.output_coordinator.helper_generation(ch_name)
+            != helper_generation
+        ):
             return None
         initial_sent, initial_error = await self._send_frames_complete(
             [next_frame()]
@@ -2556,11 +2622,20 @@ class GameLoop:
                         pass
                     if not self._normal_output_is_current(
                         ch_name, owner_generation
-                    ):
+                    ) or self.output_coordinator.helper_generation(
+                        ch_name
+                    ) != helper_generation:
                         break
                     async def resend(confirmed):
-                        if not self._normal_output_is_current(
-                            ch_name, owner_generation
+                        if (
+                            stop_event.is_set()
+                            or not self._normal_output_is_current(
+                                ch_name, owner_generation
+                            )
+                            or self.output_coordinator.helper_generation(
+                                ch_name
+                            )
+                            != helper_generation
                         ):
                             return TransportOutcome(
                                 sent=False,
@@ -2751,6 +2826,21 @@ class GameLoop:
         return {"estop": True, "sent": sent}
 
     async def resume(self) -> dict:
+        if not self.safety.estop_active:
+            return {"estop": False}
+        if not self._global_clear_is_confirmed():
+            await self.clear_output()
+        if not self._global_clear_is_confirmed():
+            raise DeviceOutputError(
+                "estop clear was not confirmed",
+                status_code=503,
+            )
+        released = await self.output_coordinator.release_estop()
+        if not released:
+            raise DeviceOutputError(
+                "estop latch release requires confirmed clear",
+                status_code=503,
+            )
         self.safety.resume()
         return {"estop": False}
 

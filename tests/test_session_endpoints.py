@@ -20,7 +20,7 @@ from tests.test_game_loop_timeline import (
     make_game_loop_for_test,
     relay_output_operations,
 )
-from tests.timeline_fakes import SessionHarness
+from tests.timeline_fakes import SessionHarness, make_replay_bundle
 
 
 class FakeSensor:
@@ -291,6 +291,65 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             self.harness.loop.output_coordinator.pending("A").target_strength
         )
+
+    async def test_live_slots_patch_identical_and_changed_strength_keep_owner_active(self):
+        await self._start_physical_live(20)
+
+        for reported_strength in (20, 15):
+            self.harness.safety.pulse_until["A"] = 0.0
+            self.harness.relay.clients = {
+                "client-test": {
+                    "props": {"intensityA": reported_strength},
+                    "slotState": {},
+                }
+            }
+
+            await self.state.on_relay_event("slots_patch", {})
+            await self._complete_active_cycle("A")
+            await self._complete_active_cycle("A")
+
+            self.assertIn("A", self.harness.controller.runners)
+            self.assertIsNone(
+                self.harness.controller.runners["A"].state().failure
+            )
+
+    async def test_replay_slots_patch_identical_and_changed_strength_keep_owner_active(self):
+        bundle = make_replay_bundle([0, 0, 0], "completed")
+        self.harness.store.save(bundle.manifest, bundle.timeline)
+        playing = await self.client.post(
+            "/api/replays/replay-1/play", json={"cursor": 0}
+        )
+        self.assertEqual(playing.status_code, 200)
+
+        for _ in range(40):
+            if self.harness.controller.to_state().cursor >= 1:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(self.harness.controller.to_state().cursor, 1)
+
+        for expected_cursor, reported_strength in ((2, 20), (3, 15)):
+            self.harness.safety.pulse_until["A"] = 0.0
+            self.harness.relay.clients = {
+                "client-test": {
+                    "props": {"intensityA": reported_strength},
+                    "slotState": {},
+                }
+            }
+            await self.state.on_relay_event("slots_patch", {})
+            remaining = self.harness.clock.next_remaining_ms
+            self.assertIsNotNone(remaining)
+            self.harness.clock.advance(remaining)
+            for _ in range(40):
+                if self.harness.controller.to_state().cursor >= expected_cursor:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(
+                self.harness.controller.to_state().cursor, expected_cursor
+            )
+            self.assertEqual(
+                self.harness.controller.to_state().status,
+                SessionStatus.REPLAYING,
+            )
 
     async def test_cap_transport_exception_returns_safe_retryable_service_error(self):
         await self._start_physical_live(30)
@@ -911,6 +970,57 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.harness.loop.patterns["A"])
         self.assertNotIn("A", self.harness.loop.loop_tasks)
 
+    async def test_cancelled_primary_settles_delivered_helper_before_reraising(self):
+        self.harness.safety.dry_run = False
+        helper_delivered = asyncio.Event()
+        original_send = self.harness.relay.send_frame
+        helper_task = None
+
+        async def cancel_primary(frame):
+            nonlocal helper_task
+            inner = frame.get("data", {}) if isinstance(frame, dict) else {}
+            data = inner.get("data", {}) if isinstance(inner, dict) else {}
+            if inner.get("m") == "device.op" and data.get("t") == 0:
+                sent = await original_send(frame)
+                helper_delivered.set()
+                return sent
+            if inner.get("m") == "device.op" and data.get("t") == 3:
+                await helper_delivered.wait()
+                helper_task = self.harness.loop.loop_tasks.get("A")
+                raise asyncio.CancelledError
+            return await original_send(frame)
+
+        try:
+            with patch.object(
+                self.harness.relay, "send_frame", side_effect=cancel_primary
+            ):
+                result = await asyncio.gather(
+                    self.harness.loop.execute_manual_action(
+                        {"op": "hold_strength", "channel": "A", "value": 5}
+                    ),
+                    return_exceptions=True,
+                )
+
+            self.assertIsInstance(result[0], asyncio.CancelledError)
+            self.assertIsNotNone(helper_task)
+            self.assertTrue(helper_task.done())
+            self.assertNotIn("A", self.harness.loop.loop_tasks)
+            self.assertNotIn("A", self.harness.loop.loop_events)
+            confirmed = self.harness.loop.output_coordinator.confirmed("A")
+            self.assertEqual(confirmed.strength, 0)
+            self.assertIsNone(confirmed.waveform)
+            self.assertIsNone(confirmed.waveform_mode)
+            self.assertFalse(
+                self.harness.loop.output_coordinator.pending("A").clear_required
+            )
+            frame_count = len(self.harness.relay.sent_frames)
+            await asyncio.sleep(0)
+            self.assertEqual(len(self.harness.relay.sent_frames), frame_count)
+        finally:
+            self.harness.loop._cancel_loops(None)
+            if helper_task is not None:
+                await asyncio.gather(helper_task, return_exceptions=True)
+
     async def test_failed_helper_cleanup_is_confirmed_and_blocks_later_output(self):
         self.harness.safety.dry_run = False
         self.harness.relay.fail_next_strength_delta("A")
@@ -1255,6 +1365,49 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("clear", None), operations)
         self.assertIn(("reset", 0), operations)
         self.assertIn(("reset", 1), operations)
+
+    async def test_resume_releases_estop_only_after_confirmed_clear(self):
+        self.harness.safety.dry_run = False
+        self.harness.relay.fail_next_clear()
+
+        stopped = await self.client.post("/api/estop")
+
+        self.assertEqual(stopped.status_code, 200)
+        self.assertFalse(stopped.json()["sent"])
+        self.assertTrue(self.harness.safety.estop_active)
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("A").clear_required
+        )
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("B").clear_required
+        )
+
+        self.harness.relay.fail_next_clear()
+        failed_resume = await self.client.post("/api/resume")
+        failed_state = (await self.client.get("/api/state")).json()
+        frames_before_blocked = len(self.harness.relay.sent_frames)
+        blocked = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 5},
+        )
+
+        self.assertEqual(failed_resume.status_code, 503)
+        self.assertTrue(failed_state["estop"])
+        self.assertTrue(self.harness.safety.estop_active)
+        self.assertTrue(blocked.json()["dropped"])
+        self.assertEqual(len(self.harness.relay.sent_frames), frames_before_blocked)
+
+        resumed = await self.client.post("/api/resume")
+        manual = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 5},
+        )
+        resumed_state = (await self.client.get("/api/state")).json()
+
+        self.assertEqual(resumed.status_code, 200)
+        self.assertFalse(resumed_state["estop"])
+        self.assertFalse(manual.json()["dropped"])
+        self.assertEqual(self.harness.safety.current["A"], 5)
 
     async def test_stale_timeline_generation_cannot_reach_transport(self):
         self.harness.safety.dry_run = False

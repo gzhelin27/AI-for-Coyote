@@ -470,20 +470,71 @@ class AppState:
         self.loop.start_observe_loop()
 
     async def shutdown(self) -> None:
+        cleanup = asyncio.create_task(
+            self._shutdown_cleanup(), name="app-state-shutdown-cleanup"
+        )
+        caller_cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is None or not current.cancelling():
+                    break
+                caller_cancelled = True
+            except BaseException:
+                break
+        if caller_cancelled:
+            if not cleanup.cancelled():
+                cleanup.exception()
+            raise asyncio.CancelledError
+        return cleanup.result()
+
+    async def _shutdown_cleanup(self) -> None:
+        observe_task = self.loop.observe_task
         self.loop.stop_observe_loop()
-        async with self.timeline_transition_lock:
-            # Process shutdown is always abnormal lifecycle termination: live work
-            # and replay playback clear output but never create an archive.
-            await self.loop.stop_timeline_session()
-            await self.set_sensors(False)
-            if self.cfg["safety"]["auto_clear_on_disconnect"]:
-                with contextlib.suppress(Exception):
-                    await self.loop.estop()
-        for task in self.tasks:
-            task.cancel()
-        if self.tasks:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
-        self.tasks.clear()
+        primary_error: BaseException | None = None
+        try:
+            async with self.timeline_transition_lock:
+                # Process shutdown is always abnormal lifecycle termination: live
+                # work and replay playback clear output but never create an archive.
+                try:
+                    await self.loop.stop_timeline_session()
+                except BaseException as exc:
+                    primary_error = exc
+                try:
+                    await self.set_sensors(False)
+                except BaseException as exc:
+                    if primary_error is None:
+                        primary_error = exc
+
+                if (
+                    primary_error is not None
+                    or self.cfg["safety"]["auto_clear_on_disconnect"]
+                ):
+                    try:
+                        await self.loop.estop()
+                    except BaseException as exc:
+                        self.logger.exception(
+                            "shutdown estop fallback failed: %s", exc
+                        )
+        finally:
+            background = list(self.tasks)
+            if self.sensor_watch_task is not None:
+                background.append(self.sensor_watch_task)
+                self.sensor_watch_task = None
+            if observe_task is not None:
+                background.append(observe_task)
+            unique_tasks = tuple(dict.fromkeys(background))
+            for task in unique_tasks:
+                if task is not asyncio.current_task() and not task.done():
+                    task.cancel()
+            if unique_tasks:
+                await asyncio.gather(*unique_tasks, return_exceptions=True)
+            self.tasks.clear()
+
+        if primary_error is not None:
+            raise primary_error
 
 
 def make_app() -> FastAPI:
@@ -719,8 +770,11 @@ def make_app() -> FastAPI:
 
     @app.post("/api/resume")
     async def api_resume() -> JSONResponse:
-        async with state.timeline_transition_lock:
-            result = await state.loop.resume()
+        try:
+            async with state.timeline_transition_lock:
+                result = await state.loop.resume()
+        except (DeviceOutputError, RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
         await state.broadcast()
         return JSONResponse(result)
 
