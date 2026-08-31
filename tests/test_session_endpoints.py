@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import suppress
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from fastapi import WebSocketDisconnect
 
 import backend.main as main_module
 from backend.timeline.models import SessionStatus
+from backend.timeline.replay_store import ReplayStore
 from tests.test_game_loop_timeline import make_game_loop_for_test
 from tests.timeline_fakes import SessionHarness
 
@@ -69,6 +71,7 @@ def make_endpoint_state(harness):
     state.auto_opened = True
     state.sensors_on = False
     state.sensor_watch_task = None
+    state.timeline_transition_lock = asyncio.Lock()
     state.layout = {}
     state.sensor_switches = {"camera": False, "audio": False}
     state.start_background = AsyncMock()
@@ -203,6 +206,48 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(traversal.status_code, 400)
         self.assertNotIn(str(self.replay_root), downloaded.headers["content-disposition"])
+
+    async def test_download_streams_the_validated_open_archive_not_swapped_path(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        finished = await self.client.post("/api/session/finish")
+        replay_id = finished.json()["replay_id"]
+        archive_path = self.harness.store._path(replay_id)
+        original_bytes = archive_path.read_bytes()
+        swapped_bytes = b"SWAPPED_AFTER_VALIDATION"
+
+        class SwappingDownloadStore:
+            root = self.replay_root
+
+            @staticmethod
+            def _validate_replay_id(value):
+                ReplayStore._validate_replay_id(value)
+
+            def _path(self, value):
+                return archive_path
+
+            def load(self, value):
+                bundle = self.harness.store.load(value)
+                archive_path.write_bytes(swapped_bytes)
+                return bundle
+
+            def open_validated(self, value):
+                self._validate_replay_id(value)
+                opened = io.BytesIO(original_bytes)
+                archive_path.write_bytes(swapped_bytes)
+                return opened
+
+        swapping_store = SwappingDownloadStore()
+        swapping_store.harness = self.harness
+        self.state.replay_store = swapping_store
+
+        downloaded = await self.client.get(
+            f"/api/replays/{replay_id}/download"
+        )
+
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.content, original_bytes)
+        self.assertEqual(archive_path.read_bytes(), swapped_bytes)
 
     async def test_http_and_websocket_state_redact_internal_timeline_data(self):
         started = await self.client.post("/api/session/start")
@@ -423,6 +468,115 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(bad_cursor.status_code, 400)
         self.assertNotIn(str(self.replay_root), bad_cursor.text)
+
+    async def test_start_response_and_sensors_are_atomic_against_finish(self):
+        sensors_started = asyncio.Event()
+        allow_sensors = asyncio.Event()
+
+        async def blocking_sensors(on):
+            if on:
+                sensors_started.set()
+                await allow_sensors.wait()
+
+        self.state.set_sensors.side_effect = blocking_sensors
+        starting = asyncio.create_task(self.client.post("/api/session/start"))
+        await asyncio.wait_for(sensors_started.wait(), timeout=0.2)
+        finishing = asyncio.create_task(self.client.post("/api/session/finish"))
+        await asyncio.sleep(0)
+
+        self.assertFalse(finishing.done())
+        allow_sensors.set()
+        started, finished = await asyncio.gather(starting, finishing)
+
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(started.json()["status"], "running")
+        self.assertEqual(finished.status_code, 200)
+        self.assertEqual(finished.json()["status"], "completed")
+
+    async def test_history_finish_sensor_and_mutation_block_a_new_start(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        self.harness.loop.history = [{"role": "user", "content": "keep me"}]
+        sensors_stopping = asyncio.Event()
+        allow_sensors = asyncio.Event()
+        mutation_states = []
+        original_clear = self.harness.loop.clear_history
+
+        async def blocking_sensors(on):
+            if not on:
+                sensors_stopping.set()
+                await allow_sensors.wait()
+
+        def observed_clear():
+            mutation_states.append(self.harness.controller.to_state().status)
+            original_clear()
+
+        self.state.set_sensors.side_effect = blocking_sensors
+        with patch.object(
+            self.harness.loop, "clear_history", side_effect=observed_clear
+        ):
+            clearing = asyncio.create_task(
+                self.client.post("/api/history/clear", json={})
+            )
+            await asyncio.wait_for(sensors_stopping.wait(), timeout=0.2)
+            starting = asyncio.create_task(self.client.post("/api/session/start"))
+            await asyncio.sleep(0)
+
+            self.assertFalse(starting.done())
+            allow_sensors.set()
+            cleared, restarted = await asyncio.gather(clearing, starting)
+
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(restarted.status_code, 200)
+        self.assertEqual(mutation_states, [SessionStatus.IDLE])
+        self.assertEqual(self.harness.controller.to_state().status, SessionStatus.RUNNING)
+
+    async def test_profile_reload_finish_sensor_and_save_block_a_new_start(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        sensors_stopping = asyncio.Event()
+        allow_sensors = asyncio.Event()
+        reload_states = []
+        save_states = []
+
+        async def blocking_sensors(on):
+            if not on:
+                sensors_stopping.set()
+                await allow_sensors.wait()
+
+        def observed_reload(_cfg):
+            reload_states.append(self.harness.controller.to_state().status)
+
+        def observed_save(cfg, *, role=None, profile=None, **_values):
+            save_states.append(self.harness.controller.to_state().status)
+            cfg["character"]["role"] = role
+            cfg["character"]["profile"] = profile
+
+        self.state.set_sensors.side_effect = blocking_sensors
+        with (
+            patch.object(main_module, "reload_character", side_effect=observed_reload),
+            patch.object(
+                main_module, "save_character_runtime", side_effect=observed_save
+            ),
+        ):
+            switching = asyncio.create_task(
+                self.client.post(
+                    "/api/character/profile",
+                    json={"role": "装置", "profile": "调教"},
+                )
+            )
+            await asyncio.wait_for(sensors_stopping.wait(), timeout=0.2)
+            starting = asyncio.create_task(self.client.post("/api/session/start"))
+            await asyncio.sleep(0)
+
+            self.assertFalse(starting.done())
+            allow_sensors.set()
+            switched, restarted = await asyncio.gather(switching, starting)
+
+        self.assertEqual(switched.status_code, 200)
+        self.assertEqual(restarted.status_code, 200)
+        self.assertEqual(reload_states, [SessionStatus.IDLE])
+        self.assertEqual(save_states, [SessionStatus.IDLE])
 
 
 class SessionFinishCancellationRegressionTests(unittest.IsolatedAsyncioTestCase):

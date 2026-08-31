@@ -161,6 +161,54 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.fail(f"runner {channel} did not reach {phase.value}")
 
+    async def _assert_live_turn_finishing_late_is_discarded(self, invoke):
+        entered_llm = asyncio.Event()
+        release_llm = asyncio.Event()
+
+        async def delayed_chat(*_args, **_kwargs):
+            entered_llm.set()
+            await release_llm.wait()
+            return (
+                "late timeline line",
+                [{"op": "hold_strength", "channel": "A", "value": 20}],
+            )
+
+        await self.harness.controller.start_live()
+        self.harness.loop.turn_count = 1
+        self.harness.llm.chat.side_effect = delayed_chat
+        with patch("backend.game_loop.reload_character"):
+            turn = asyncio.create_task(invoke())
+            await asyncio.wait_for(entered_llm.wait(), timeout=0.2)
+            await self.harness.loop.finish_timeline_session()
+            release_llm.set()
+            result = await turn
+
+        self.assertEqual(result["executed"], [])
+        self.assertEqual(result["dropped"], [])
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(self.harness.loop.patterns, {"A": None, "B": None})
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
+
+    async def test_user_turn_started_live_is_discarded_after_finish(self):
+        await self._assert_live_turn_finishing_late_is_discarded(
+            lambda: self.harness.loop.handle_user_message("hello")
+        )
+
+    async def test_auto_open_started_live_is_discarded_after_finish(self):
+        await self._assert_live_turn_finishing_late_is_discarded(
+            self.harness.loop.auto_open
+        )
+
+    async def test_observation_started_live_is_discarded_after_finish(self):
+        await self._assert_live_turn_finishing_late_is_discarded(
+            self.harness.loop._auto_observe_turn
+        )
+
+    async def test_autopilot_turn_started_live_is_discarded_after_finish(self):
+        await self._assert_live_turn_finishing_late_is_discarded(
+            self.harness.loop._autopilot_turn
+        )
+
     async def test_automatic_turn_routes_actions_into_running_live_session(self):
         await self.harness.controller.start_live()
 
@@ -299,6 +347,93 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dropped, [])
         self.assertEqual(self.harness.safety.current["A"], 0)
         self.assertEqual(self.harness.controller.to_state().cursor, 0)
+
+    async def test_user_turn_started_during_replay_is_discarded_after_stop(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        await self._advance_until_phase("A", RunnerPhase.GAP)
+        summary = await self.harness.controller.finish()
+        await self.harness.controller.start_replay(summary.replay_id, cursor=0)
+
+        entered_llm = asyncio.Event()
+        release_llm = asyncio.Event()
+
+        async def delayed_chat(*_args, **_kwargs):
+            entered_llm.set()
+            await release_llm.wait()
+            return (
+                "late replay line",
+                [{"op": "hold_strength", "channel": "A", "value": 20}],
+            )
+
+        self.harness.loop.turn_count = 1
+        self.harness.llm.chat.side_effect = delayed_chat
+        with patch("backend.game_loop.reload_character"):
+            turn = asyncio.create_task(
+                self.harness.loop.handle_user_message("during replay")
+            )
+            await asyncio.wait_for(entered_llm.wait(), timeout=0.2)
+            await self.harness.controller.stop()
+            release_llm.set()
+            result = await turn
+
+        self.assertEqual(result["executed"], [])
+        self.assertEqual(result["dropped"], [])
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(self.harness.loop.patterns, {"A": None, "B": None})
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
+
+    async def _install_stubborn_autopilot_task(self):
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stubborn_task():
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release.wait()
+
+        self.harness.loop.autopilot = True
+        self.harness.loop.autopilot_task = asyncio.create_task(stubborn_task())
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        return cancellation_seen, release
+
+    async def test_cancelled_automatic_off_has_already_paused_and_cleared(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        cancellation_seen, release = await self._install_stubborn_autopilot_task()
+
+        stopping = asyncio.create_task(self.harness.loop.set_autopilot(False))
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=0.2)
+        stopping.cancel()
+        result = await asyncio.gather(stopping, return_exceptions=True)
+        release.set()
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(self.harness.controller.to_state().status.value, "paused")
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(self.harness.store.list(), [])
+
+    async def test_cancelled_finish_wrapper_has_already_finished_and_cleared(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        cancellation_seen, release = await self._install_stubborn_autopilot_task()
+
+        finishing = asyncio.create_task(
+            self.harness.loop.finish_timeline_session()
+        )
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=0.2)
+        finishing.cancel()
+        result = await asyncio.gather(finishing, return_exceptions=True)
+        release.set()
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        self.assertEqual(len(self.harness.store.list()), 1)
 
     async def test_resume_transition_serializes_against_finish(self):
         await self.harness.controller.start_live()

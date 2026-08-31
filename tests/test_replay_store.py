@@ -100,6 +100,30 @@ class ReplayStoreTests(unittest.TestCase):
                 bundle.timeline.cycles,
             )
 
+    def test_open_validated_rejects_identity_swap_between_stat_and_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[7], status="completed")
+            archive_path = store.save(bundle.manifest, bundle.timeline)
+            replacement = Path(tmp, "replacement.tmp")
+            replacement.write_bytes(b"replacement archive bytes")
+            real_path_open = Path.open
+            swapped = False
+
+            def swap_before_open(path, *args, **kwargs):
+                nonlocal swapped
+                if Path(path) == archive_path and not swapped:
+                    swapped = True
+                    archive_path.unlink()
+                    replacement.replace(archive_path)
+                return real_path_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=swap_before_open):
+                with self.assertRaisesRegex(ReplayStoreError, "changed"):
+                    store.open_validated(bundle.manifest.replay_id)
+
+            self.assertTrue(swapped)
+
     def test_rejects_path_unsafe_archive_before_reading_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "evil.coyote-replay")

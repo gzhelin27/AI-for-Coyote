@@ -6,10 +6,12 @@ from dataclasses import dataclass, replace
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import tempfile
-from typing import Any
+from typing import Any, BinaryIO
 import zipfile
 import zlib
 
@@ -164,12 +166,57 @@ class ReplayStore:
                 temporary_path.unlink(missing_ok=True)
 
     def load(self, replay_id: str) -> ReplayBundle:
+        with self._open_contained(replay_id) as archive_file:
+            return self._load_opened(replay_id, archive_file)
+
+    def open_validated(self, replay_id: str) -> BinaryIO:
+        """Return the exact opened archive after validating that same handle."""
+        archive_file = self._open_contained(replay_id)
+        try:
+            self._load_opened(replay_id, archive_file)
+            archive_file.seek(0)
+            return archive_file
+        except BaseException:
+            archive_file.close()
+            raise
+
+    def _open_contained(self, replay_id: str) -> BinaryIO:
         self._validate_replay_id(replay_id)
         archive_path = self._path(replay_id)
+        archive_file: BinaryIO | None = None
         try:
-            if archive_path.stat().st_size > _MAX_ARCHIVE_SIZE:
+            resolved = archive_path.resolve(strict=True)
+            root = self.root.resolve()
+            if resolved.parent != root:
+                raise ReplayStoreError("replay archive path is unsafe")
+            before = resolved.stat()
+            archive_file = resolved.open("rb")
+            opened = os.fstat(archive_file.fileno())
+        except ReplayStoreError:
+            if archive_file is not None:
+                archive_file.close()
+            raise
+        except OSError as exc:
+            if archive_file is not None:
+                archive_file.close()
+            raise ReplayStoreError("could not load replay archive") from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            archive_file.close()
+            raise ReplayStoreError("replay archive changed while opening")
+        return archive_file
+
+    def _load_opened(
+        self, replay_id: str, archive_file: BinaryIO
+    ) -> ReplayBundle:
+        try:
+            archive_file.seek(0, os.SEEK_END)
+            if archive_file.tell() > _MAX_ARCHIVE_SIZE:
                 raise ReplayStoreError("replay archive size exceeds limit")
-            with zipfile.ZipFile(archive_path, "r") as archive:
+            archive_file.seek(0)
+            with zipfile.ZipFile(archive_file, "r") as archive:
                 infos = archive.infolist()
                 if len(infos) > _MAX_ENTRY_COUNT:
                     raise ReplayStoreError("replay archive has too many entries")

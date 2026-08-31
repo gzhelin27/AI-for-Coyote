@@ -9,12 +9,21 @@ AddIntensity（相对增减）是最可靠的原语。因此所有强度命令�
 """
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from .config import reload_character
 from .device_ops import CHANNEL, DeviceOps
 from .safety import SafetyManager
 
 logger = logging.getLogger("ai-for-coyote.game")
+
+
+@dataclass(frozen=True)
+class _AIActionOrigin:
+    controller: object | None
+    routing_generation: int | None
+    mode: str | None
+    session_id: str | None
 
 
 class GameLoop:
@@ -172,6 +181,7 @@ class GameLoop:
         text = (text or "").strip()
         if not text:
             return {"line": "", "executed": [], "dropped": []}
+        action_origin = self._capture_ai_action_origin()
         reload_character(self.cfg)  # 角色设定热加载：改完保存，下一条消息生效
 
         self.history.append({"role": "user", "content": text})
@@ -197,7 +207,7 @@ class GameLoop:
                 actions = []
             self.turn_count += 1
             executed, dropped, timeline_managed = await self._execute_ai_actions(
-                actions
+                actions, action_origin
             )
             # 模型失败时绝不能执行通道保底，否则用户只会看到错误，
             # 设备却可能在没有有效 AI 决策的情况下自行开始输出。
@@ -219,6 +229,7 @@ class GameLoop:
     # ---------- 主动开场（配对成功后 AI 自动开口） ----------
     async def auto_open(self) -> dict:
         """场景开始：AI 主动开口挑逗并给出第一个轻微试探。"""
+        action_origin = self._capture_ai_action_origin()
         reload_character(self.cfg)
         self._note_rage()
         state = self.build_state()
@@ -247,7 +258,7 @@ class GameLoop:
                 actions = []
             self.turn_count += 1
             executed, dropped, timeline_managed = await self._execute_ai_actions(
-                actions
+                actions, action_origin
             )
             if not timeline_managed:
                 await self._apply_channel_floor()
@@ -304,6 +315,7 @@ class GameLoop:
 
     async def _auto_observe_turn(self) -> dict | None:
         """观察最新画面，决定是否调整，并把台词推给页面（由调用方广播）。"""
+        action_origin = self._capture_ai_action_origin()
         reload_character(self.cfg)
         self._note_rage()
         state = self.build_state()
@@ -330,7 +342,7 @@ class GameLoop:
                 return None
             self.turn_count += 1
             executed, dropped, timeline_managed = await self._execute_ai_actions(
-                actions
+                actions, action_origin
             )
             if not timeline_managed:
                 await self._apply_channel_floor()
@@ -375,23 +387,40 @@ class GameLoop:
                 self._start_autopilot_task()
                 return
 
-            await self._stop_autopilot_task()
             if self.timeline_session is not None:
                 session_state = self.timeline_session.to_state()
                 if (
                     session_state.mode == "autopilot"
                     and session_state.status.value in ("running", "paused")
                 ):
-                    await self.timeline_session.pause()
+                    try:
+                        await self.timeline_session.pause()
+                    finally:
+                        await self._stop_autopilot_task()
+                    logger.info("自动运行已停止")
+                    return
+            await self._stop_autopilot_task()
             logger.info("自动运行已停止")
 
     async def finish_timeline_session(self):
         """Stop automatic turns and normally finish the current live session."""
         async with self._autopilot_transition_lock:
-            await self._stop_autopilot_task()
             if self.timeline_session is None:
                 raise RuntimeError("timeline session is unavailable")
-            return await self.timeline_session.finish()
+            try:
+                return await self.timeline_session.finish()
+            finally:
+                await self._stop_autopilot_task()
+
+    async def stop_timeline_session(self):
+        """Abnormally stop live or replay work without creating an archive."""
+        async with self._autopilot_transition_lock:
+            try:
+                if self.timeline_session is None:
+                    raise RuntimeError("timeline session is unavailable")
+                return await self.timeline_session.stop()
+            finally:
+                await self._stop_autopilot_task()
 
     def _start_autopilot_task(self) -> None:
         self.autopilot = True
@@ -430,6 +459,7 @@ class GameLoop:
                 logger.exception("自动运行循环异常，跳过本轮继续")
 
     async def _autopilot_turn(self) -> dict | None:
+        action_origin = self._capture_ai_action_origin()
         reload_character(self.cfg)
         self._note_rage()
         state = self.build_state()
@@ -461,7 +491,7 @@ class GameLoop:
                 return None
             self.turn_count += 1
             executed, dropped, timeline_managed = await self._execute_ai_actions(
-                actions
+                actions, action_origin
             )
             if not timeline_managed:
                 await self._apply_channel_floor()
@@ -477,21 +507,49 @@ class GameLoop:
                 logger.exception("自动回合推送失败")
         return result
 
-    async def _execute_ai_actions(
-        self, actions: list
-    ) -> tuple[list, list, bool]:
-        """Route live AI intent through the timeline; manual controls stay direct."""
-        session_state = (
-            self.timeline_session.to_state()
-            if self.timeline_session is not None
-            else None
+    def _capture_ai_action_origin(self) -> _AIActionOrigin:
+        controller = self.timeline_session
+        if controller is None:
+            return _AIActionOrigin(None, None, None, None)
+        state = controller.to_state()
+        return _AIActionOrigin(
+            controller=controller,
+            routing_generation=controller.routing_generation,
+            mode=state.mode,
+            session_id=state.session_id,
         )
-        if session_state is not None and session_state.mode is not None:
+
+    async def _execute_ai_actions(
+        self,
+        actions: list,
+        origin: _AIActionOrigin | None = None,
+    ) -> tuple[list, list, bool]:
+        """Route AI intent only within the generation where its turn began."""
+        if origin is None:
+            origin = self._capture_ai_action_origin()
+        controller = self.timeline_session
+        if origin.controller is not None:
             if (
-                session_state.mode == "autopilot"
-                and session_state.status.value == "running"
+                controller is not origin.controller
+                or controller.routing_generation != origin.routing_generation
             ):
-                await self.timeline_session.process_live_turn(actions)
+                return [], [], True
+            session_state = controller.to_state()
+            if origin.mode is not None:
+                if (
+                    origin.mode == "autopilot"
+                    and session_state.mode == "autopilot"
+                    and session_state.session_id == origin.session_id
+                    and session_state.status.value == "running"
+                ):
+                    await controller.process_live_turn(
+                        actions,
+                        expected_routing_generation=origin.routing_generation,
+                    )
+                return [], [], True
+            if session_state.mode is not None:
+                return [], [], True
+        elif controller is not None:
             return [], [], True
         executed, dropped = await self.execute_actions(actions)
         return executed, dropped, False
@@ -909,9 +967,11 @@ class GameLoop:
                 frames.extend(self._build_frames(cmd, client_id, slot_id))
             sent = all(await self._send_all(frames))
         async with self._autopilot_transition_lock:
-            await self._stop_autopilot_task()
-            if self.timeline_session is not None:
-                await self.timeline_session.stop()
+            try:
+                if self.timeline_session is not None:
+                    await self.timeline_session.stop()
+            finally:
+                await self._stop_autopilot_task()
         return {"estop": True, "sent": sent}
 
     async def resume(self) -> dict:
@@ -924,9 +984,11 @@ class GameLoop:
         self.patterns = {"A": None, "B": None}
         self.safety.record({"kind": "stop"})
         async with self._autopilot_transition_lock:
-            await self._stop_autopilot_task()
-            if self.timeline_session is not None:
-                await self.timeline_session.on_disconnect()
+            try:
+                if self.timeline_session is not None:
+                    await self.timeline_session.on_disconnect()
+            finally:
+                await self._stop_autopilot_task()
 
     # ---------- 设备反馈 ----------
     async def handle_feedback(self, action: int, client_id: str) -> None:

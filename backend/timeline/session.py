@@ -56,7 +56,8 @@ class SessionController:
         *,
         game_loop: Any,
         store: ReplayStore,
-        seed: int,
+        seed: int | None = None,
+        seed_factory: Callable[[], int] | None = None,
         frames: Mapping[str, Sequence[str]] | None = None,
         strength_jitter: int = 4,
         cycle_gap_policy: CycleGapPolicy | None = None,
@@ -68,6 +69,7 @@ class SessionController:
         replay_id_factory: Callable[[], str] | None = None,
         timestamp_factory: Callable[[], str] | None = None,
         manifest_metadata: Mapping[str, Any] | None = None,
+        manifest_metadata_factory: Callable[[], Mapping[str, Any]] | None = None,
         player_factory: Callable[..., RecordedCyclePlayer] = RecordedCyclePlayer,
     ) -> None:
         if not hasattr(game_loop, "execute_actions") or not hasattr(
@@ -76,8 +78,16 @@ class SessionController:
             raise TypeError("game_loop must provide execute_actions and clear_output")
         if not isinstance(store, ReplayStore):
             raise TypeError("store must be a ReplayStore")
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if seed is None and seed_factory is None:
+            raise ValueError("seed or seed_factory is required")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
             raise ValueError("seed must be an integer")
+        if seed_factory is not None and not callable(seed_factory):
+            raise TypeError("seed_factory must be callable")
+        if manifest_metadata_factory is not None and not callable(
+            manifest_metadata_factory
+        ):
+            raise TypeError("manifest_metadata_factory must be callable")
         if (
             isinstance(strength_jitter, bool)
             or not isinstance(strength_jitter, int)
@@ -92,7 +102,8 @@ class SessionController:
 
         self.game_loop = game_loop
         self.store = store
-        self.seed = seed
+        self.seed = 0 if seed is None else seed
+        self._seed_factory = seed_factory
         self.strength_jitter = strength_jitter
         self.policy = cycle_gap_policy or CycleGapPolicy()
         self._clock = clock
@@ -114,12 +125,14 @@ class SessionController:
             lambda: datetime.now(timezone.utc).isoformat()
         )
         self._manifest_metadata = dict(manifest_metadata or {})
+        self._manifest_metadata_factory = manifest_metadata_factory
         self._player_factory = player_factory
         self._frames = self._normalize_frames(frames)
         self._runner_executor = _RunnerExecutor(game_loop)
 
         self._lock = asyncio.Lock()
         self._turn_lock = asyncio.Lock()
+        self._routing_generation = 0
         self._status = SessionStatus.IDLE
         self._mode: str | None = None
         self._session_id: str | None = None
@@ -154,6 +167,10 @@ class SessionController:
     def recorded_cycles(self) -> tuple[CycleRecord, ...]:
         return tuple(self._cycle_records.values())
 
+    @property
+    def routing_generation(self) -> int:
+        return self._routing_generation
+
     async def start_live(self) -> SessionState:
         async with self._lock:
             self._require_estop_inactive()
@@ -163,7 +180,20 @@ class SessionController:
             if self._status is not SessionStatus.IDLE:
                 raise RuntimeError("a timeline session is already active")
 
-            self._status = SessionStatus.RUNNING
+            if self._seed_factory is not None:
+                next_seed = self._seed_factory()
+                if isinstance(next_seed, bool) or not isinstance(next_seed, int):
+                    raise ValueError("seed_factory must return an integer")
+                self.seed = next_seed
+            if self._manifest_metadata_factory is not None:
+                metadata = self._manifest_metadata_factory()
+                if not isinstance(metadata, Mapping):
+                    raise TypeError(
+                        "manifest_metadata_factory must return a mapping"
+                    )
+                self._manifest_metadata = dict(metadata)
+
+            self._set_status(SessionStatus.RUNNING)
             self._mode = "autopilot"
             self._session_id = self._require_id(
                 self._session_id_factory(), "session ID"
@@ -194,12 +224,18 @@ class SessionController:
         actions: Sequence[Mapping[str, Any]],
         *,
         scene_id: str | None = None,
-    ) -> PlotEvent:
+        expected_routing_generation: int | None = None,
+    ) -> PlotEvent | None:
         async with self._turn_lock:
             submissions: list[
                 tuple[str, ChannelCycleRunner, CycleDirective]
             ] = []
             async with self._lock:
+                if (
+                    expected_routing_generation is not None
+                    and self._routing_generation != expected_routing_generation
+                ):
+                    return None
                 if (
                     self._status is not SessionStatus.RUNNING
                     or self._mode != "autopilot"
@@ -289,7 +325,7 @@ class SessionController:
             if self._status is SessionStatus.REPLAYING:
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
-                self._status = SessionStatus.PAUSED
+                self._set_status(SessionStatus.PAUSED)
                 await self._player.pause()
                 return self.to_state()
             if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
@@ -316,7 +352,7 @@ class SessionController:
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
                 await self._player.resume(cursor)
-                self._status = SessionStatus.REPLAYING
+                self._set_status(SessionStatus.REPLAYING)
                 self._start_player_watcher_locked(self._player)
             elif self._mode == "autopilot":
                 await self._resume_live_locked()
@@ -332,7 +368,7 @@ class SessionController:
             ):
                 raise RuntimeError("no live session to finish")
             was_paused = self._status is SessionStatus.PAUSED
-            self._status = SessionStatus.FINISHING
+            self._set_status(SessionStatus.FINISHING)
             if not was_paused:
                 self._pause_started_at = self._clock()
             # A cancellation can arrive while watcher teardown is still pending.
@@ -344,7 +380,7 @@ class SessionController:
                 await self._quiesce_runners(runners, reason="finish", clear=True)
                 self._require_estop_inactive()
             except BaseException:
-                self._status = SessionStatus.PAUSED
+                self._set_status(SessionStatus.PAUSED)
                 raise
 
             session_id = self._session_id
@@ -365,7 +401,7 @@ class SessionController:
             try:
                 self.store.save(manifest, timeline)
             except Exception:
-                self._status = SessionStatus.PAUSED
+                self._set_status(SessionStatus.PAUSED)
                 raise
 
             summary = ReplaySummary.from_manifest(manifest)
@@ -382,7 +418,7 @@ class SessionController:
                 return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is not None:
-                    self._status = SessionStatus.PAUSED
+                    self._set_status(SessionStatus.PAUSED)
                     await self._player.pause()
                 return self.to_state()
             if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
@@ -407,7 +443,7 @@ class SessionController:
             player.validate_cursor(cursor)
             self._player = player
             self._mode = "replay"
-            self._status = SessionStatus.REPLAYING
+            self._set_status(SessionStatus.REPLAYING)
             self._session_id = bundle.manifest.session_id
             self._replay_id = bundle.manifest.replay_id
             self._current_event_id = None
@@ -431,7 +467,7 @@ class SessionController:
                             self._player_watcher, return_exceptions=True
                         )
                 if self._player is not None:
-                    self._status = SessionStatus.PAUSED
+                    self._set_status(SessionStatus.PAUSED)
                     await self._player.stop()
                 self._reset_idle()
                 return self.to_state()
@@ -482,9 +518,9 @@ class SessionController:
                 tuple(self._runners.values()), reason=reason, clear=True
             )
         except BaseException:
-            self._status = SessionStatus.PAUSED
+            self._set_status(SessionStatus.PAUSED)
             raise
-        self._status = SessionStatus.PAUSED
+        self._set_status(SessionStatus.PAUSED)
 
     async def _resume_live_locked(self) -> None:
         if self._live_clear_required:
@@ -496,7 +532,7 @@ class SessionController:
         )
         self._paused_total_ms += paused_ms
         self._pause_started_at = None
-        self._status = SessionStatus.RUNNING
+        self._set_status(SessionStatus.RUNNING)
         self._runners = {}
         for channel in _CHANNELS:
             runner = self._install_runner(channel)
@@ -638,7 +674,7 @@ class SessionController:
         except Exception:
             async with self._lock:
                 if self._player is player and self._status is SessionStatus.REPLAYING:
-                    self._status = SessionStatus.PAUSED
+                    self._set_status(SessionStatus.PAUSED)
             return
         async with self._lock:
             if self._player is player and self._status is SessionStatus.REPLAYING:
@@ -823,7 +859,7 @@ class SessionController:
         return normalized
 
     def _reset_idle(self) -> None:
-        self._status = SessionStatus.IDLE
+        self._set_status(SessionStatus.IDLE)
         self._mode = None
         self._session_id = None
         self._replay_id = None
@@ -844,6 +880,11 @@ class SessionController:
         self._paused_total_ms = 0
         self._safety_caps = {}
         self._live_clear_required = False
+
+    def _set_status(self, status: SessionStatus) -> None:
+        if self._status is not status:
+            self._routing_generation += 1
+        self._status = status
 
     @staticmethod
     def _require_id(value: object, name: str) -> str:
