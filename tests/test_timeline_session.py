@@ -1,0 +1,279 @@
+import asyncio
+import unittest
+
+from backend.timeline.models import SessionStatus
+from tests.timeline_fakes import SessionHarness, make_replay_bundle
+
+
+class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pause_clears_both_channels_but_does_not_save(self):
+        controller = SessionHarness.create(seed=9)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+
+        await controller.pause()
+
+        self.assertEqual(controller.clear_calls, [None])
+        self.assertEqual(controller.store.list(), [])
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+
+    async def test_finish_saves_generated_gaps_without_manual_pause_time(self):
+        controller = SessionHarness.create(seed=9)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.complete_cycles("A", gap_tenths=[0, 7, 20])
+        await controller.pause(manual_elapsed_ms=600000)
+        await controller.resume()
+
+        summary = await controller.finish()
+
+        timeline = controller.store.load(summary.replay_id).timeline
+        self.assertEqual([cycle.gap_tenths for cycle in timeline.cycles], [0, 7, 20])
+        self.assertTrue(
+            all(cycle.active_start_offset_ms < 600000 for cycle in timeline.cycles)
+        )
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+
+    async def test_disconnect_pauses_and_resume_starts_complete_cycle(self):
+        controller = SessionHarness.create(seed=10)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.begin_partial_cycle("A")
+        old_runner = controller.runners["A"]
+
+        await controller.on_disconnect()
+        await controller.resume()
+
+        self.assertIsNot(controller.runners["A"], old_runner)
+        self.assertEqual(controller.last_cycle_started_at_frame, 0)
+        self.assertEqual(controller.store.list(), [])
+
+    async def test_resume_reuses_cycle_rng_progress_without_duplicate_records(self):
+        controller = SessionHarness.create(seed=18)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        controller.gap_rngs["A"].feed([7, 20])
+        await controller.complete_next_cycle("A")
+        await controller.pause()
+        await controller.resume()
+        await controller.complete_next_cycle("A")
+
+        summary = await controller.finish()
+
+        cycles = controller.store.load(summary.replay_id).timeline.cycles
+        self.assertEqual([cycle.gap_tenths for cycle in cycles], [7, 20])
+        self.assertEqual(controller.gap_rngs["A"].calls, 2)
+        self.assertEqual(
+            len({(cycle.channel, cycle.cycle_index) for cycle in cycles}),
+            len(cycles),
+        )
+
+    async def test_duplicate_callback_delivery_upserts_one_archive_record(self):
+        controller = SessionHarness.create(seed=20)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        controller.gap_rngs["A"].feed([7])
+        await controller.complete_next_cycle("A")
+
+        controller.redeliver_latest_cycle("A")
+        summary = await controller.finish()
+
+        cycles = controller.store.load(summary.replay_id).timeline.cycles
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].gap_tenths, 7)
+
+    async def test_repeated_pause_and_disconnect_do_not_repeat_clear_or_save(self):
+        controller = SessionHarness.create(seed=11)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+
+        await controller.pause()
+        await controller.pause()
+        await controller.on_disconnect()
+
+        self.assertEqual(controller.clear_calls, [None])
+        self.assertEqual(controller.store.list(), [])
+
+    async def test_resume_does_not_bypass_existing_emergency_stop(self):
+        controller = SessionHarness.create(seed=17)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        await controller.pause()
+        controller.game_loop.safety.estop_active = True
+
+        with self.assertRaisesRegex(RuntimeError, "emergency stop"):
+            await controller.resume()
+        with self.assertRaisesRegex(RuntimeError, "emergency stop"):
+            await controller.start_live()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.clear_calls, [None])
+
+    async def test_pause_clears_during_an_in_flight_initial_submission(self):
+        controller = SessionHarness.create(seed=21)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        execute_actions = controller.game_loop.execute_actions
+        cycle_started = asyncio.Event()
+        release_cycle = asyncio.Event()
+
+        async def execute_with_blocked_cycle(actions):
+            if any(action.get("op") == "pulse_cycle" for action in actions):
+                cycle_started.set()
+                await release_cycle.wait()
+            return await execute_actions(actions)
+
+        controller.game_loop.execute_actions = execute_with_blocked_cycle
+        turn = asyncio.create_task(
+            controller.process_live_turn(
+                [{"op": "hold_strength", "channel": "A", "value": 20}]
+            )
+        )
+        await asyncio.wait_for(cycle_started.wait(), timeout=0.2)
+        pause = asyncio.create_task(controller.pause())
+        try:
+            for _ in range(20):
+                if controller.clear_calls:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(controller.clear_calls, [None])
+        finally:
+            release_cycle.set()
+            await asyncio.gather(turn, pause, return_exceptions=True)
+
+    async def test_runner_disconnect_escalates_to_session_pause_and_clear(self):
+        controller = SessionHarness.create(seed=12)
+        self.addAsyncCleanup(controller.close)
+        controller.game_loop.disconnect_on_cycle = 1
+        await controller.start_live()
+
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        for _ in range(20):
+            if controller.to_state().status is SessionStatus.PAUSED:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.clear_calls, [None])
+        self.assertEqual(controller.store.list(), [])
+
+    async def test_runner_executor_failure_clears_only_failed_channel(self):
+        controller = SessionHarness.create(seed=16)
+        self.addAsyncCleanup(controller.close)
+        controller.game_loop.fail_on_cycle = 1
+        await controller.start_live()
+
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        for _ in range(20):
+            if controller.clear_calls:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(controller.clear_calls, ["A"])
+        self.assertEqual(controller.to_state().status, SessionStatus.RUNNING)
+        self.assertEqual(controller.store.list(), [])
+
+    async def test_replacement_runner_waits_for_failed_channel_clear(self):
+        controller = SessionHarness.create(seed=19)
+        self.addAsyncCleanup(controller.close)
+        controller.game_loop.fail_on_cycle = 1
+        controller.game_loop.block_channel_clear = True
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        await asyncio.wait_for(controller.game_loop.clear_started.wait(), timeout=0.2)
+
+        replacement = asyncio.create_task(
+            controller.process_live_turn(
+                [{"op": "hold_strength", "channel": "A", "value": 21}]
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertFalse(replacement.done())
+        self.assertEqual(controller.game_loop.requested_cycle_actions, [])
+        controller.game_loop.release_clear.set()
+        await asyncio.wait_for(replacement, timeout=0.2)
+        self.assertEqual(
+            [action["channel"] for action in controller.game_loop.requested_cycle_actions],
+            ["A"],
+        )
+
+    async def test_plot_stop_clears_only_requested_channel_immediately(self):
+        controller = SessionHarness.create(seed=13)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "B", "value": 20}]
+        )
+
+        await controller.process_live_turn([{"op": "clear", "channel": "B"}])
+
+        self.assertEqual(controller.clear_calls, ["B"])
+        self.assertEqual(controller.to_state().status, SessionStatus.RUNNING)
+
+    async def test_replay_resume_keeps_completion_tracking(self):
+        controller = SessionHarness.create(seed=14)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0, 0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        await controller.start_replay(bundle.manifest.replay_id)
+        for _ in range(20):
+            if controller.player is not None and controller.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+
+        await controller.pause()
+        await controller.resume(cursor=1)
+        for _ in range(40):
+            if controller.to_state().status is SessionStatus.IDLE:
+                break
+            remaining = controller.clock.next_remaining_ms
+            if remaining is not None:
+                controller.clock.advance(remaining)
+            await asyncio.sleep(0)
+
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(len(controller.store.list()), 1)
+
+    async def test_replay_executor_failure_returns_to_paused_after_clear(self):
+        controller = SessionHarness.create(seed=15)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        controller.game_loop.fail_on_cycle = 1
+
+        await controller.start_replay(bundle.manifest.replay_id)
+        for _ in range(20):
+            if controller.to_state().status is SessionStatus.PAUSED:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.clear_calls, [None])
+        self.assertEqual(len(controller.store.list()), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
