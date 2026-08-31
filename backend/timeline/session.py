@@ -512,7 +512,10 @@ class SessionController:
                     self._set_status(SessionStatus.FINISHING)
                     await self._player.pause()
                     self._set_status(SessionStatus.PAUSED)
-                elif self._mode == "autopilot" and self._live_clear_required:
+                elif self._mode == "autopilot" and (
+                    self._live_clear_required
+                    or not self._output_clear_is_confirmed()
+                ):
                     await self._pause_live_locked("disconnect_retry")
                 return self.to_state()
             if self._status is SessionStatus.FINISHING:
@@ -939,6 +942,15 @@ class SessionController:
         require_clear = getattr(self.game_loop, "require_output_clear", None)
         if callable(require_clear):
             require_clear(tuple(channels))
+
+    def _output_clear_is_confirmed(self) -> bool:
+        is_confirmed = getattr(self.game_loop, "output_clear_is_confirmed", None)
+        if not callable(is_confirmed):
+            return True
+        try:
+            return bool(is_confirmed(_CHANNELS))
+        except Exception:
+            return False
 
     @staticmethod
     def _require_clear_result(result: object, channel: str | None = None) -> None:

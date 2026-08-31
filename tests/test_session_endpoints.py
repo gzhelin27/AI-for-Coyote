@@ -434,6 +434,62 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
                 ).clear_required
             )
 
+    async def test_paused_live_disconnect_confirms_new_pending_clear(self):
+        await self._start_physical_live(20)
+        paused = await self.client.post("/api/session/pause")
+        self.assertEqual(paused.status_code, 200)
+        for channel in ("A", "B"):
+            self.assertFalse(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
+        await self.state.on_relay_event("client_disconnected", {})
+
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.PAUSED,
+        )
+        for channel in ("A", "B"):
+            self.assertFalse(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
+    async def test_paused_live_disconnect_clear_failure_stays_retryable(self):
+        await self._start_physical_live(20)
+        paused = await self.client.post("/api/session/pause")
+        self.assertEqual(paused.status_code, 200)
+        self.harness.relay.fail_next_clear()
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await self.state.on_relay_event("client_disconnected", {})
+
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.FINISHING,
+        )
+        for channel in ("A", "B"):
+            self.assertTrue(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
+        await self.state.on_relay_event("client_disconnected", {})
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.PAUSED,
+        )
+        for channel in ("A", "B"):
+            self.assertFalse(
+                self.harness.loop.output_coordinator.pending(
+                    channel
+                ).clear_required
+            )
+
     async def test_cancelled_replay_pause_endpoint_finishes_physical_clear(self):
         await self._start_active_replay()
         clear_started = asyncio.Event()
@@ -619,7 +675,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             any(item[0] == "strength_delta" for item in operations)
         )
 
-    async def test_repeated_replay_manual_action_clears_previous_manual_output(self):
+    async def test_idle_manual_after_replay_takeover_keeps_unrelated_output(self):
         await self._start_active_replay()
         self.harness.safety.dry_run = False
         first = await self.client.post(
@@ -627,19 +683,51 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             json={"op": "hold_strength", "channel": "A", "value": 7},
         )
         self.assertEqual(first.status_code, 200)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.IDLE
+        )
         frame_count = len(self.harness.relay.sent_frames)
 
         second = await self.client.post(
             "/api/manual",
-            json={"op": "hold_strength", "channel": "A", "value": 6},
+            json={"op": "hold_strength", "channel": "B", "value": 6},
         )
 
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(self.harness.safety.current["A"], 6)
+        self.assertEqual(self.harness.safety.current, {"A": 7, "B": 6})
         operations = relay_output_operations(
             self.harness.relay.sent_frames[frame_count:]
         )
-        self.assertTrue(any(item[0] == "clear" for item in operations))
+        self.assertFalse(any(item[0] == "clear" for item in operations))
+        self.assertTrue(
+            any(item[0] == "strength_delta" for item in operations)
+        )
+
+    async def test_idle_manual_after_live_takeover_stop_keeps_unrelated_output(self):
+        await self._start_physical_live(20)
+        first = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 7},
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.PAUSED
+        )
+        stopped = await self.harness.loop.stop_timeline_session()
+        self.assertEqual(stopped.status, SessionStatus.IDLE)
+        frame_count = len(self.harness.relay.sent_frames)
+
+        second = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "B", "value": 6},
+        )
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(self.harness.safety.current, {"A": 7, "B": 6})
+        operations = relay_output_operations(
+            self.harness.relay.sent_frames[frame_count:]
+        )
+        self.assertFalse(any(item[0] == "clear" for item in operations))
         self.assertTrue(
             any(item[0] == "strength_delta" for item in operations)
         )

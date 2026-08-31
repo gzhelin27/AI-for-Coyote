@@ -102,7 +102,6 @@ class GameLoop:
             OutputIntentKind.MANUAL,
             None,
         )
-        self._manual_session_takeover = False
         self.on_ai_turn = None                 # 由 AppState 注入：把 AI 主动回合推送到页面
         self.timeline_session = None            # 由 AppState 注入：确定性会话/重放控制器
 
@@ -428,14 +427,14 @@ class GameLoop:
     async def execute_manual_action(self, action: dict) -> tuple[list, list]:
         """Quiesce recorded playback before issuing unrecorded manual output."""
         async with self._autopilot_transition_lock:
+            session_takeover_active = False
             controller = self.timeline_session
             if controller is not None:
                 session_state = controller.to_state()
-                if session_state.mode in ("autopilot", "replay"):
-                    # Persist ownership before the first await.  Subsequent
-                    # manual actions in this takeover must clear the previous
-                    # unrecorded output even after replay has reset to IDLE.
-                    self._manual_session_takeover = True
+                session_takeover_active = session_state.mode in (
+                    "autopilot",
+                    "replay",
+                )
                 if session_state.mode == "autopilot" and session_state.status.value in (
                     "running",
                     "paused",
@@ -466,7 +465,7 @@ class GameLoop:
                                 status_code=503,
                             ) from exc
                         raise
-            if self._manual_session_takeover:
+            if session_takeover_active:
                 if not self._global_clear_is_confirmed():
                     await self.clear_output()
                 if not self._global_clear_is_confirmed():
@@ -491,7 +490,6 @@ class GameLoop:
         self, channels=("A", "B")
     ) -> dict[str, int]:
         """Claim fresh coordinator generations for live or replay output."""
-        self._manual_session_takeover = False
         normalized = self._normalize_output_channels(channels)
         return {
             channel: self.output_coordinator.invalidate(
