@@ -306,7 +306,8 @@ class SessionController:
             if self._status is SessionStatus.REPLAYING:
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
-                self._player.validate_cursor(cursor)
+                if cursor is not None:
+                    self._player.validate_cursor(cursor)
                 return self.to_state()
             if self._status is not SessionStatus.PAUSED:
                 raise RuntimeError("no paused session to resume")
@@ -560,28 +561,48 @@ class SessionController:
         reason: str,
         clear: bool,
     ) -> None:
-        pause_error: BaseException | None = None
+        cleanup = asyncio.create_task(
+            self._terminalize_then_clear_runners(
+                runners, reason=reason, clear=clear
+            ),
+            name="timeline-session-runner-cleanup",
+        )
+        cancellation: asyncio.CancelledError | None = None
         try:
-            results = await asyncio.gather(
-                *(runner.pause(reason=reason) for runner in runners),
-                return_exceptions=True,
-            )
-            pause_error = next(
-                (result for result in results if isinstance(result, BaseException)),
-                None,
-            )
-        finally:
-            try:
-                if clear:
-                    await self._clear_live_output_locked()
-            finally:
-                await asyncio.gather(
-                    *(
-                        runner.stop(clear=False, reason=reason)
-                        for runner in runners
-                    ),
-                    return_exceptions=True,
-                )
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            await cleanup
+        if cancellation is not None:
+            raise cancellation
+
+    async def _terminalize_then_clear_runners(
+        self,
+        runners: Sequence[ChannelCycleRunner],
+        *,
+        reason: str,
+        clear: bool,
+    ) -> None:
+        pause_results = await asyncio.gather(
+            *(runner.pause(reason=reason) for runner in runners),
+            return_exceptions=True,
+        )
+        stop_results = await asyncio.gather(
+            *(runner.stop(clear=False, reason=reason) for runner in runners),
+            return_exceptions=True,
+        )
+        stop_error = next(
+            (result for result in stop_results if isinstance(result, BaseException)),
+            None,
+        )
+        if stop_error is not None:
+            raise stop_error
+        if clear:
+            await self._clear_live_output_locked()
+        pause_error = next(
+            (result for result in pause_results if isinstance(result, BaseException)),
+            None,
+        )
         if pause_error is not None:
             raise pause_error
 

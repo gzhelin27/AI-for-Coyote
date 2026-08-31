@@ -81,9 +81,7 @@ class RecordedCyclePlayer:
     def failure(self) -> ReplayPlaybackError | None:
         return self._failure
 
-    def validate_cursor(self, cursor: int | None) -> None:
-        if cursor is None:
-            return
+    def validate_cursor(self, cursor: int) -> None:
         if (
             isinstance(cursor, bool)
             or not isinstance(cursor, int)
@@ -161,7 +159,8 @@ class RecordedCyclePlayer:
         async with self._lock:
             if not self._loaded:
                 raise RuntimeError("no replay is loaded")
-            self.validate_cursor(cursor)
+            if cursor is not None:
+                self.validate_cursor(cursor)
             if self._stopped:
                 raise RuntimeError("cannot resume stopped playback")
             if self._running:

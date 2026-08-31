@@ -89,6 +89,67 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
             len(controller.game_loop.requested_cycle_actions), cycle_count
         )
 
+    async def test_cancel_during_runner_quiesce_clears_after_worker_terminal(self):
+        controller = SessionHarness.create(seed=35)
+        self.addAsyncCleanup(controller.close)
+        execute_actions = controller.game_loop.execute_actions
+        second_cycle_started = asyncio.Event()
+        cycle_calls = 0
+
+        async def cancellation_aware_execute(actions):
+            nonlocal cycle_calls
+            if any(action.get("op") == "pulse_cycle" for action in actions):
+                cycle_calls += 1
+                if cycle_calls == 2:
+                    second_cycle_started.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        await execute_actions(actions)
+                        raise
+            return await execute_actions(actions)
+
+        controller.game_loop.execute_actions = cancellation_aware_execute
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        remaining = controller.clock.next_remaining_ms
+        self.assertIsNotNone(remaining)
+        controller.clock.advance(remaining)
+        await asyncio.wait_for(second_cycle_started.wait(), timeout=0.2)
+        runner = controller.runners["A"]
+        await runner._lock.acquire()
+        pause_started = asyncio.Event()
+        runner_pause = runner.pause
+
+        async def signaled_pause(*, reason):
+            pause_started.set()
+            await runner_pause(reason=reason)
+
+        runner.pause = signaled_pause
+        pause = asyncio.create_task(controller.pause())
+        await asyncio.wait_for(pause_started.wait(), timeout=0.2)
+        pause.cancel()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if controller.clear_calls:
+                break
+        runner._lock.release()
+        result = await asyncio.gather(pause, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(
+            controller.game_loop.operation_log,
+            ["cycle:A", "cycle:A", "clear:*"],
+        )
+        self.assertEqual(controller.game_loop.safety.current["A"], 0)
+
+        await controller.pause()
+
+        self.assertEqual(controller.clear_calls, [None])
+
     async def test_cancelled_replacement_disconnect_settlement_retries_on_stop(self):
         controller = SessionHarness.create(seed=34)
         self.addAsyncCleanup(controller.close)
@@ -446,6 +507,22 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
         self.assertEqual(controller.clear_calls, [None])
+
+    async def test_start_replay_rejects_none_cursor_before_output(self):
+        controller = SessionHarness.create(seed=36)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+
+        result = await asyncio.gather(
+            controller.start_replay(bundle.manifest.replay_id, cursor=None),
+            return_exceptions=True,
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(controller.game_loop.requested_cycle_actions, [])
+        self.assertIsInstance(result[0], ValueError)
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
 
     async def test_replay_resume_at_end_replaces_completion_tracking(self):
         controller = SessionHarness.create(seed=28)
