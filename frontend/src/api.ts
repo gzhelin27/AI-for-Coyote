@@ -103,11 +103,10 @@ function mapReplaySummary(raw: BackendReplaySummary): ReplayHistoryItem {
   const profile = typeof raw.dlc_profile === "string" ? raw.dlc_profile : "";
   return {
     replayId: raw.replay_id,
-    title: `回放 ${raw.replay_id.slice(0, 8)}`,
+    title: typeof raw.title === "string" && raw.title.trim() ? raw.title : `回放 ${raw.replay_id.slice(0, 8)}`,
     completedAt: typeof raw.completed_at === "string" ? raw.completed_at : null,
     dlc: profile ? `${role} · ${profile}` : role,
-    // MVP1 的列表响应不含循环记录；保留空值而不是猜测或暴露归档内容。
-    cycleCount: null,
+    cycleCount: typeof raw.cycle_count === "number" && raw.cycle_count >= 0 ? raw.cycle_count : 0,
     status: "completed",
     exact: raw.adjusted !== true,
   };

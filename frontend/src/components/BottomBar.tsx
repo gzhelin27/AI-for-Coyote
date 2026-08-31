@@ -1,5 +1,7 @@
 import { Ban, Pause, Play } from "lucide-react";
+import { useEffect, useState } from "react";
 import { doEstop, doResume, run } from "../commands";
+import { bottomBarOffsets } from "../bottomBarLayout";
 import { useApp, useLayout } from "../store";
 
 export default function BottomBar() {
@@ -7,11 +9,18 @@ export default function BottomBar() {
   const estop = !!s?.estop;
   const sidebarW = useLayout((st) => st.sidebarW);
   const controlW = useLayout((st) => st.controlW);
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const updateWidth = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", updateWidth);
+    return () => window.removeEventListener("resize", updateWidth);
+  }, []);
+  const offsets = bottomBarOffsets(viewportWidth, sidebarW, controlW);
 
   return (
     <div
       className="fixed bottom-0 z-10 flex h-14 items-center gap-4 border-t border-line bg-ink2 px-5"
-      style={{ left: sidebarW, right: controlW }}
+      style={offsets}
     >
       <button
         className="rounded-[10px] border border-line bg-panel2 px-3.5 py-1.5 text-[13px] hover:border-line2"

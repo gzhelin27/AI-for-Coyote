@@ -195,7 +195,7 @@ export interface ReplayHistoryItem {
   title: string;
   completedAt: string | null;
   dlc: string;
-  cycleCount: number | null;
+  cycleCount: number;
   status: "completed";
   exact: boolean;
 }
@@ -203,6 +203,8 @@ export interface ReplayHistoryItem {
 export interface BackendReplaySummary {
   replay_id: string;
   status: string;
+  title: string;
+  cycle_count: number;
   completed_at?: string | null;
   dlc_role?: string;
   dlc_profile?: string;

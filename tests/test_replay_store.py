@@ -365,6 +365,33 @@ class ReplayStoreTests(unittest.TestCase):
             with self.assertRaises(ReplayStoreError):
                 store.load("replay-1")
 
+    def test_list_derives_safe_title_and_cycle_count_from_validated_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[0, 7, 20], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                dlc_role="测试角色",
+                dlc_profile="测试档",
+            )
+            store.save(manifest, bundle.timeline)
+
+            summary = store.list()[0]
+
+            self.assertEqual(summary.title, "测试角色 · 测试档")
+            self.assertEqual(summary.cycle_count, 3)
+
+    def test_list_uses_deterministic_fallback_title_for_legacy_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            store.save(bundle.manifest, bundle.timeline)
+
+            summary = store.list()[0]
+
+            self.assertEqual(summary.title, "回放 replay-1")
+            self.assertEqual(summary.cycle_count, 0)
+
     def test_failed_atomic_replace_leaves_store_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

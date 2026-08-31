@@ -12,9 +12,11 @@ import { api, mapFullState } from "./api";
 import type { BackendFullState } from "./types";
 import { useApp, useChat, useLayout } from "./store";
 import { doEstop } from "./commands";
+import { isTimelineStateActive } from "./timelineState";
 
 /** 空格长按触发急停的时长（毫秒，与进度条动画同步） */
 const ESTOP_HOLD_MS = 1000;
+const ACTIVE_STATE_POLL_MS = 1000;
 
 export default function App() {
   const [view, setView] = useState<ViewName>("control");
@@ -64,17 +66,55 @@ export default function App() {
   };
 
   useEffect(() => {
+    let pollTimer: number | null = null;
+    let polling = false;
+    let closed = false;
+    const clearPollTimer = () => {
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    };
+    const canPoll = () =>
+      !closed &&
+      document.visibilityState === "visible" &&
+      isTimelineStateActive(useApp.getState().state?.timeline);
+    const schedulePoll = () => {
+      clearPollTimer();
+      if (canPoll()) pollTimer = window.setTimeout(pollState, ACTIVE_STATE_POLL_MS);
+    };
+    const refreshState = async () => {
+      const state = await api.state();
+      useApp.getState().setState(state);
+      if (state.config_info?.title) document.title = state.config_info.title;
+      return state;
+    };
+    const pollState = async () => {
+      pollTimer = null;
+      if (!canPoll()) return;
+      if (polling) {
+        schedulePoll();
+        return;
+      }
+      polling = true;
+      try {
+        await refreshState();
+      } catch {
+        // Polling is passive; transition errors remain visible in their initiating control.
+      } finally {
+        polling = false;
+        schedulePoll();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void pollState();
+      else clearPollTimer();
+    };
+
     // 初始状态
-    api
-      .state()
-      .then((s) => {
-        useApp.getState().setState(s);
-        if (s.config_info?.title) document.title = s.config_info.title;
-      })
-      .catch(() => {});
+    refreshState().then(schedulePoll).catch(() => {});
     // WebSocket 实时同步
     let ws: WebSocket;
-    let closed = false;
     const connect = () => {
       if (closed) return;
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -83,6 +123,7 @@ export default function App() {
         const msg = JSON.parse(ev.data);
         if (msg.type === "state") {
           useApp.getState().setState(mapFullState(msg.data as BackendFullState));
+          schedulePoll();
         } else if (msg.type === "chat") {
           const extra: string[] = [];
           for (const e of msg.executed ?? []) extra.push("▶ " + e.label);
@@ -93,6 +134,7 @@ export default function App() {
       ws.onclose = () => setTimeout(connect, 2000);
     };
     connect();
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // 空格长按 1s 急停（防误触：松手 / 窗口失焦即取消；已急停时不重复触发）
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName ?? "").toUpperCase();
@@ -117,6 +159,8 @@ export default function App() {
     return () => {
       closed = true;
       ws?.close();
+      clearPollTimer();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);

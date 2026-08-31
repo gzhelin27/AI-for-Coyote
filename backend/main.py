@@ -124,6 +124,8 @@ def _replay_summary_payload(summary: ReplaySummary) -> dict:
         "dlc_role": summary.dlc_role,
         "dlc_profile": summary.dlc_profile,
         "dlc_version": summary.dlc_version,
+        "title": summary.title,
+        "cycle_count": summary.cycle_count,
     }
 
 

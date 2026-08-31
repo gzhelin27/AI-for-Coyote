@@ -114,9 +114,24 @@ class ReplaySummary:
     dlc_role: str
     dlc_profile: str
     dlc_version: str
+    title: str
+    cycle_count: int
 
     @classmethod
-    def from_manifest(cls, manifest: ReplayManifest) -> ReplaySummary:
+    def from_bundle(cls, bundle: ReplayBundle) -> ReplaySummary:
+        return cls.from_manifest(
+            bundle.manifest, cycle_count=len(bundle.timeline.cycles)
+        )
+
+    @classmethod
+    def from_manifest(
+        cls, manifest: ReplayManifest, *, cycle_count: int = 0
+    ) -> ReplaySummary:
+        role = manifest.dlc_role.strip()
+        profile = manifest.dlc_profile.strip()
+        title = " · ".join(part for part in (role, profile) if part)
+        if not title:
+            title = f"回放 {manifest.replay_id[:8]}"
         return cls(
             replay_id=manifest.replay_id,
             session_id=manifest.session_id,
@@ -131,6 +146,8 @@ class ReplaySummary:
             dlc_role=manifest.dlc_role,
             dlc_profile=manifest.dlc_profile,
             dlc_version=manifest.dlc_version,
+            title=title,
+            cycle_count=cycle_count,
         )
 
 
@@ -392,7 +409,11 @@ class ReplayStore:
             for path in self.root.glob(f"*{_ARCHIVE_SUFFIX}")
             if path.is_file()
         )
-        return [ReplaySummary.from_manifest(self.load(replay_id).manifest) for replay_id in replay_ids]
+        return [self.summary(replay_id) for replay_id in replay_ids]
+
+    def summary(self, replay_id: str) -> ReplaySummary:
+        """Derive public summary fields only from a fully validated replay bundle."""
+        return ReplaySummary.from_bundle(self.load(replay_id))
 
     def delete(self, replay_id: str) -> None:
         self._validate_replay_id(replay_id)

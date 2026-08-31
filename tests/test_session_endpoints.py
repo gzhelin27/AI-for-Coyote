@@ -156,12 +156,16 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.json()["status"], "running")
         self.assertEqual(finished.status_code, 200)
         self.assertEqual(finished.json()["status"], "completed")
+        self.assertIn("title", finished.json())
+        self.assertEqual(finished.json()["cycle_count"], 0)
         self.assertFalse(self.harness.loop.autopilot)
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(
             [item["replay_id"] for item in listed.json()],
             [finished.json()["replay_id"]],
         )
+        self.assertEqual(listed.json()[0]["title"], finished.json()["title"])
+        self.assertEqual(listed.json()[0]["cycle_count"], finished.json()["cycle_count"])
         self.assertEqual(
             self.state.set_sensors.await_args_list,
             [call(True), call(False), call(True), call(False)],

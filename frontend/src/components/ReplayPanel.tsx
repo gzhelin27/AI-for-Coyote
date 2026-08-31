@@ -153,7 +153,7 @@ export default function ReplayPanel({ historyOnly }: Props) {
                     <div className="truncate text-sm font-semibold text-text">{item.title}</div>
                     <div className="mt-1 text-xs text-muted">{formatDate(item.completedAt)} · DLC：{item.dlc}</div>
                     <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
-                      <span className="rounded-md border border-line bg-ink3 px-2 py-0.5 text-muted">循环数：{item.cycleCount ?? "—"}</span>
+                      <span className="rounded-md border border-line bg-ink3 px-2 py-0.5 text-muted">循环数：{item.cycleCount}</span>
                       <span className={`rounded-md border px-2 py-0.5 ${item.exact ? "border-line2 bg-accent/10 text-accent" : "border-warn/50 bg-warn/10 text-warn"}`}>
                         {item.exact ? "已完成 · 精确" : "已完成 · 已调整"}
                       </span>
