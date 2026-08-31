@@ -1,8 +1,10 @@
 import asyncio
 import random
 import unittest
+from dataclasses import replace
 
 from backend.timeline.cycle_runner import CycleDirective, RunnerPhase
+from backend.timeline.models import CycleRecord
 from backend.timeline.randomizer import derive_stream_seed
 from tests.timeline_fakes import (
     BlockingCycleCallback,
@@ -13,11 +15,140 @@ from tests.timeline_fakes import (
 )
 
 
+def cycle(index: int) -> CycleRecord:
+    """Build a literal durable record for record-delivery tests."""
+    return CycleRecord(
+        channel="A",
+        cycle_index=index,
+        plot_event_id="evt-1",
+        pattern="呼吸",
+        waveform_hash="wave-hash",
+        requested_strength=20,
+        effective_strength=20,
+        active_start_offset_ms=(index - 1) * 100,
+        raw_duration_ms=100,
+        gap_tenths=0,
+        planned_gap_ms=0,
+        actual_gap_ms=0,
+        completed=True,
+        interruption_reason=None,
+    )
+
+
+class DeliveryHarness:
+    """Drive retry ownership with a deterministic callback boundary."""
+
+    def __init__(self, *, failures: dict[int, int] | None = None) -> None:
+        self.delivered_indices: list[int] = []
+        self.delivered_records: list[CycleRecord] = []
+        self._first_delivery_started = asyncio.Event()
+        self._release_delivery = asyncio.Event()
+        self._block_first_delivery = False
+        self._callback_attempts: dict[int, int] = {}
+        self._failures = dict(failures or {})
+        self._cycle_harness = CycleHarness(
+            frames={"呼吸": ["f"]}, on_cycle=self._deliver
+        )
+        self.runner = self._cycle_harness.runner
+
+    @property
+    def pending_indices(self) -> list[int]:
+        return [record.cycle_index for record in self.runner.pending_records()]
+
+    async def _deliver(self, record: CycleRecord) -> None:
+        attempts = self._callback_attempts.get(record.cycle_index, 0) + 1
+        self._callback_attempts[record.cycle_index] = attempts
+        self.delivered_indices.append(record.cycle_index)
+        self.delivered_records.append(record)
+        if self._block_first_delivery and record.cycle_index == 1 and attempts == 1:
+            self._first_delivery_started.set()
+            await self._release_delivery.wait()
+        if self._failures.get(record.cycle_index, 0):
+            self._failures[record.cycle_index] -= 1
+            raise RuntimeError(f"injected persistence failure for {record.cycle_index}")
+
+    async def queue_records(self, records: list[CycleRecord]) -> None:
+        for record in records:
+            self.runner._pending_records[(record.channel, record.cycle_index)] = record
+
+    def block_first_delivery(self) -> None:
+        self._block_first_delivery = True
+
+    async def first_delivery_started(self) -> None:
+        await self._first_delivery_started.wait()
+
+    def release_delivery(self) -> None:
+        self._release_delivery.set()
+
+    async def retry(self) -> None:
+        await self.runner.retry_pending_records()
+
+    async def close(self) -> None:
+        await self._cycle_harness.close()
+
+
 class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
     def make_harness(self, **kwargs) -> CycleHarness:
         harness = CycleHarness(**kwargs)
         self.addAsyncCleanup(harness.close)
         return harness
+
+    async def test_waiting_retry_cannot_reinsert_stale_delivered_snapshot(self):
+        harness = DeliveryHarness()
+        self.addAsyncCleanup(harness.close)
+        await harness.queue_records([cycle(1), cycle(2)])
+        harness.block_first_delivery()
+        first = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
+        second = asyncio.create_task(harness.retry())
+        harness.release_delivery()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=0.2)
+
+        self.assertEqual(harness.delivered_indices, [1, 2])
+        self.assertEqual(harness.pending_indices, [])
+
+    async def test_pending_duplicate_key_is_upserted_before_owner_drains_it(self):
+        harness = DeliveryHarness()
+        self.addAsyncCleanup(harness.close)
+        await harness.queue_records([cycle(1)])
+        harness.block_first_delivery()
+        owner = asyncio.create_task(harness.retry())
+        await asyncio.wait_for(harness.first_delivery_started(), timeout=0.2)
+
+        original = cycle(2)
+        replacement = replace(original, plot_event_id="evt-replacement")
+        first_upsert = asyncio.create_task(harness.runner._deliver_record(original))
+        await asyncio.sleep(0)
+        second_upsert = asyncio.create_task(
+            harness.runner._deliver_record(replacement)
+        )
+        await asyncio.sleep(0)
+        harness.release_delivery()
+        await asyncio.wait_for(
+            asyncio.gather(owner, first_upsert, second_upsert), timeout=0.2
+        )
+
+        self.assertEqual(harness.delivered_indices, [1, 2])
+        self.assertEqual(
+            [record.plot_event_id for record in harness.delivered_records],
+            ["evt-1", "evt-replacement"],
+        )
+        self.assertEqual(harness.pending_indices, [])
+
+    async def test_failed_first_record_retries_before_later_record(self):
+        harness = DeliveryHarness(failures={1: 1})
+        self.addAsyncCleanup(harness.close)
+        await harness.queue_records([cycle(1), cycle(2)])
+
+        with self.assertRaisesRegex(RuntimeError, "persistence failure for 1"):
+            await harness.retry()
+        self.assertEqual(harness.delivered_indices, [1])
+        self.assertEqual(harness.pending_indices, [1, 2])
+
+        await harness.retry()
+
+        self.assertEqual(harness.delivered_indices, [1, 1, 2])
+        self.assertEqual(harness.pending_indices, [])
 
     async def test_one_cycle_uses_complete_raw_frame_count(self):
         harness = self.make_harness(frames={"呼吸": ["f"] * 12}, gap_tenths=[7])
