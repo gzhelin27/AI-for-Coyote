@@ -81,6 +81,16 @@ class RecordedCyclePlayer:
     def failure(self) -> ReplayPlaybackError | None:
         return self._failure
 
+    def validate_cursor(self, cursor: int | None) -> None:
+        if cursor is None:
+            return
+        if (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or not 0 <= cursor <= len(self._ordered_cycles)
+        ):
+            raise ValueError("cursor is outside the recorded cycle range")
+
     def load(self, replay: Any) -> None:
         """Load one validated completed replay bundle or timeline while idle."""
         if self._task is not None and not self._task.done():
@@ -151,8 +161,7 @@ class RecordedCyclePlayer:
         async with self._lock:
             if not self._loaded:
                 raise RuntimeError("no replay is loaded")
-            if cursor is not None:
-                self._validate_cursor(cursor)
+            self.validate_cursor(cursor)
             if self._stopped:
                 raise RuntimeError("cannot resume stopped playback")
             if self._running:
@@ -304,14 +313,6 @@ class RecordedCyclePlayer:
             ),
             default=0,
         )
-
-    def _validate_cursor(self, cursor: int) -> None:
-        if (
-            isinstance(cursor, bool)
-            or not isinstance(cursor, int)
-            or not 0 <= cursor <= len(self._ordered_cycles)
-        ):
-            raise ValueError("cursor is outside the recorded cycle range")
 
     @staticmethod
     def _effective_for(

@@ -284,7 +284,7 @@ class SessionController:
                 if self._mode == "replay" and self._player is not None:
                     await self._player.pause()
                 elif self._mode == "autopilot" and self._live_clear_required:
-                    await self._clear_live_output_locked()
+                    await self._pause_live_locked("operator_pause_retry")
                 return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is None:
@@ -306,7 +306,7 @@ class SessionController:
             if self._status is SessionStatus.REPLAYING:
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
-                await self._player.resume(cursor)
+                self._player.validate_cursor(cursor)
                 return self.to_state()
             if self._status is not SessionStatus.PAUSED:
                 raise RuntimeError("no paused session to resume")
@@ -373,7 +373,7 @@ class SessionController:
                 if self._mode == "replay" and self._player is not None:
                     await self._player.pause()
                 elif self._mode == "autopilot" and self._live_clear_required:
-                    await self._clear_live_output_locked()
+                    await self._pause_live_locked("disconnect_retry")
                 return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is not None:
@@ -399,12 +399,7 @@ class SessionController:
                 sleeper=self._sleeper,
             )
             player.load(bundle)
-            if (
-                isinstance(cursor, bool)
-                or not isinstance(cursor, int)
-                or not 0 <= cursor <= len(player.ordered_cycles)
-            ):
-                raise ValueError("cursor is outside the recorded cycle range")
+            player.validate_cursor(cursor)
             self._player = player
             self._mode = "replay"
             self._status = SessionStatus.REPLAYING
@@ -439,7 +434,7 @@ class SessionController:
             if self._status is SessionStatus.RUNNING:
                 await self._pause_live_locked("stop")
             elif self._status is SessionStatus.PAUSED and self._live_clear_required:
-                await self._clear_live_output_locked()
+                await self._pause_live_locked("stop")
             await self._cancel_runner_watchers_locked()
             await asyncio.gather(
                 *(
@@ -475,6 +470,7 @@ class SessionController:
     async def _pause_live_locked(self, reason: str) -> None:
         if self._pause_started_at is None:
             self._pause_started_at = self._clock()
+        self._live_clear_required = True
         try:
             await self._cancel_runner_watchers_locked()
             await self._quiesce_runners(
