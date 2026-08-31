@@ -64,6 +64,17 @@ DEFAULTS = {
         "loop_batch_s": 30,
         "loop_overlap_s": 0.3,
     },
+    "timeline": {
+        "strength_jitter": 4,
+        "waveform_policy": "all_allowed",
+        "cycle_gap": {
+            "zero_weight": 40,
+            "short_weight": 30,
+            "long_weight": 30,
+            "frame_ms": 100,
+        },
+        "replay_dir": "data/replays",
+    },
     "ui": {
         "quick_strengths": [20, 40, 60, 80],
         "baseline_strength": {"A": 15, "B": 5},
@@ -134,6 +145,18 @@ def load_config(path: Path | None = None) -> Config:
         path = fallback
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     cfg = Config(_deep_merge(DEFAULTS, raw))
+
+    # Timeline replay is deliberately governed by one validated project-wide policy.
+    from .timeline.models import CycleGapPolicy
+
+    timeline = cfg["timeline"]
+    if timeline.get("waveform_policy") != "all_allowed":
+        raise ValueError("timeline waveform_policy must be all_allowed")
+    if isinstance(timeline.get("strength_jitter"), bool) or not isinstance(timeline.get("strength_jitter"), int):
+        raise ValueError("timeline strength_jitter must be an integer")
+    if timeline["strength_jitter"] != 4:
+        raise ValueError("timeline strength_jitter must remain 4")
+    timeline["cycle_gap"] = CycleGapPolicy.from_dict(timeline.get("cycle_gap")).to_dict()
 
     # dry_run 可用环境变量覆盖（联调用）：DGLAB_DRY_RUN=false
     env_dry = os.environ.get("DGLAB_DRY_RUN", "").strip().lower()
