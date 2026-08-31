@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 from backend.config import DEFAULTS
 from backend.game_loop import GameLoop
+from backend.output_coordinator import OutputIntentKind, TransportOutcome
 from backend.safety import DeviceOutputError, SafetyManager
 
 
@@ -87,6 +88,7 @@ class GatedPhysicalRelay(ConnectedRelay):
     def __init__(self) -> None:
         super().__init__()
         self.physical_strength = {0: 0, 1: 0}
+        self.strength_sent = {0: asyncio.Event(), 1: asyncio.Event()}
         self.successful_send = asyncio.Event()
         self.release_send = asyncio.Event()
         self._blocked_key = None
@@ -109,6 +111,7 @@ class GatedPhysicalRelay(ConnectedRelay):
                 self.physical_strength[channel] = max(
                     0, self.physical_strength[channel] + delta
                 )
+                self.strength_sent[channel].set()
             elif "clear" in frame and frame["clear"] in (0, 1):
                 self.physical_strength[frame["clear"]] = 0
             elif "reset" in frame and frame["reset"] in (0, 1):
@@ -168,6 +171,14 @@ async def activate_strength(loop, channel, value):
     loop.safety.pulse_until[channel] = 0
     loop.ops.strength_deltas.clear()
     loop.relay.sent_frames.clear()
+
+
+async def wait_for_condition(predicate, *, timeout=1):
+    async def observe():
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(observe(), timeout=timeout)
 
 
 class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
@@ -614,6 +625,40 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             loop.output_coordinator.pending("A").target_strength
         )
 
+    async def test_b_report_reconciles_while_a_transport_is_stalled(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        await activate_strength(loop, "B", 30)
+        relay.arm("strength")
+
+        stalled_a = asyncio.create_task(loop.set_runtime_cap("A", 20))
+        await asyncio.wait_for(relay.successful_send.wait(), timeout=1)
+        relay.strength_sent[1].clear()
+        b_report = asyncio.create_task(
+            loop.update_device_state(
+                None,
+                {"channelB": {"comfortLimit": {"overheat": True}}},
+            )
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(relay.strength_sent[1].wait()), timeout=0.2
+            )
+            b_result = await asyncio.wait_for(
+                asyncio.shield(b_report), timeout=0.2
+            )
+            self.assertEqual(b_result["B"]["dropped"], [])
+            self.assertEqual(relay.physical_strength[1], 20)
+            self.assertEqual(
+                loop.output_coordinator.confirmed("B").strength, 20
+            )
+            self.assertEqual(loop.safety.current["B"], 20)
+        finally:
+            relay.release_send.set()
+            await asyncio.gather(stalled_a, b_report, return_exceptions=True)
+
     async def test_disable_serializes_against_inflight_channel_floor_start(self):
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(relay=relay)
@@ -653,6 +698,114 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             loop.output_coordinator.confirmed("A").waveform_mode, "finite"
         )
+
+    async def test_disable_invalidates_queued_floor_strength_before_exceptional_clear(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.turn_count = 2
+        loop.last_strength = {"A": 0, "B": 2}
+        loop.last_wave = {"A": 2, "B": 2}
+        loop.safety.pulse_until = {"A": float("inf"), "B": float("inf")}
+        loop.safety.current["B"] = 5
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def block_channel(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": int(state.strength or 0)},
+            )
+
+        blocker = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, block_channel
+            )
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        relay.arm("strength")
+        relay.fail_next_clear("A", OSError("clear exploded"))
+
+        floor = asyncio.create_task(loop._apply_channel_floor())
+        await asyncio.sleep(0)
+        disabling = asyncio.create_task(loop.set_channel_enabled("A", False))
+        await wait_for_condition(
+            lambda: loop.output_coordinator.pending("A").clear_required
+        )
+        release_blocker.set()
+        relay.release_send.set()
+        blocker_result, floor_result, disable_result = await asyncio.gather(
+            blocker, floor, disabling, return_exceptions=True
+        )
+
+        self.assertTrue(blocker_result.sent)
+        self.assertIsNone(floor_result)
+        self.assertIsInstance(disable_result, DeviceOutputError)
+        self.assertEqual(loop.ops.strength_deltas, [])
+        self.assertEqual(relay.physical_strength[0], 0)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 0)
+        self.assertEqual(loop.safety.current["A"], 0)
+        self.assertTrue(loop.output_coordinator.pending("A").clear_required)
+        self.assertNotIn("A", loop.loop_tasks)
+
+        retry = await loop.reconcile_runtime_safety("A")
+
+        self.assertEqual(retry["A"]["dropped"], [])
+        self.assertFalse(loop.output_coordinator.pending("A").clear_required)
+        self.assertEqual(relay.physical_strength[0], 0)
+        self.assertFalse(loop.safety.enabled["A"])
+
+    async def test_stale_successful_floor_strength_is_retained_until_clear_retry(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.turn_count = 2
+        loop.last_strength = {"A": 0, "B": 2}
+        loop.last_wave = {"A": 2, "B": 2}
+        loop.safety.pulse_until = {"A": float("inf"), "B": float("inf")}
+        loop.safety.current["B"] = 5
+        relay.arm("strength")
+        relay.fail_next_clear("A", OSError("clear exploded"))
+
+        floor = asyncio.create_task(loop._apply_channel_floor())
+        await asyncio.wait_for(relay.successful_send.wait(), timeout=1)
+        disabling = asyncio.create_task(loop.set_channel_enabled("A", False))
+        await wait_for_condition(
+            lambda: loop.output_coordinator.pending("A").clear_required
+        )
+        relay.release_send.set()
+        floor_result, disable_result = await asyncio.gather(
+            floor, disabling, return_exceptions=True
+        )
+
+        self.assertIsNone(floor_result)
+        self.assertIsInstance(disable_result, DeviceOutputError)
+        self.assertEqual(relay.physical_strength[0], 15)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 15)
+        self.assertEqual(loop.safety.current["A"], 15)
+        self.assertTrue(loop.output_coordinator.pending("A").clear_required)
+        self.assertNotIn("A", loop.loop_tasks)
+        frames_after_failure = len(relay.sent_frames)
+
+        executed, dropped = await loop.execute_actions(
+            [{"op": "hold_strength", "channel": "A", "value": 5}]
+        )
+
+        self.assertEqual(executed, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(len(relay.sent_frames), frames_after_failure)
+
+        retry = await loop.reconcile_runtime_safety("A")
+
+        self.assertEqual(retry["A"]["dropped"], [])
+        self.assertEqual(relay.physical_strength[0], 0)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 0)
+        self.assertEqual(loop.safety.current["A"], 0)
+        self.assertFalse(loop.output_coordinator.pending("A").clear_required)
+        self.assertFalse(loop.safety.enabled["A"])
 
     async def test_comfort_cap_reduces_confirmed_physical_strength(self):
         relay = GatedPhysicalRelay()
@@ -739,6 +892,43 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loop.safety.cap_for("A"), 10)
         self.assertEqual(loop.ops.strength_deltas, [(0, -20)])
         self.assertEqual(relay.physical_strength[0], 10)
+
+    async def test_infinite_app_cap_does_not_abort_overheat_pending_reconciliation(self):
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        await activate_strength(loop, "A", 30)
+        relay.fail_next_strength_delta("A", OSError("delta exploded"))
+        report = {
+            "channelA": {
+                "comfortLimit": {
+                    "overheat": True,
+                    "comfortMax": float("inf"),
+                }
+            }
+        }
+
+        first = await loop.update_device_state(None, report)
+
+        self.assertTrue(loop.safety.overheat["A"])
+        self.assertIsNone(loop.safety.app_caps["A"])
+        self.assertTrue(first["A"]["dropped"])
+        self.assertEqual(relay.physical_strength[0], 30)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 30)
+        self.assertEqual(loop.safety.current["A"], 30)
+        self.assertEqual(
+            loop.output_coordinator.pending("A").target_strength, 20
+        )
+
+        second = await loop.update_device_state(None, report)
+
+        self.assertEqual(second["A"]["dropped"], [])
+        self.assertEqual(relay.physical_strength[0], 20)
+        self.assertEqual(loop.output_coordinator.confirmed("A").strength, 20)
+        self.assertEqual(loop.safety.current["A"], 20)
+        self.assertIsNone(
+            loop.output_coordinator.pending("A").target_strength
+        )
 
     async def test_clear_output_does_not_enter_estop(self):
         loop = make_game_loop_for_test()

@@ -259,6 +259,35 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(completed[-1].effective_strength, 20)
 
+    async def test_infinite_app_cap_report_does_not_abort_endpoint_overheat_path(self):
+        await self._start_physical_live(30)
+        self.harness.relay.clients = {
+            "client-test": {
+                "props": {},
+                "slotState": {
+                    "channelA": {
+                        "comfortLimit": {
+                            "overheat": True,
+                            "comfortMax": float("inf"),
+                        }
+                    }
+                },
+            }
+        }
+
+        await self.state.on_relay_event("slots_patch", {})
+
+        self.assertTrue(self.harness.safety.overheat["A"])
+        self.assertIsNone(self.harness.safety.app_caps["A"])
+        self.assertEqual(self.harness.safety.current["A"], 20)
+        self.assertEqual(
+            self.harness.loop.output_coordinator.confirmed("A").strength,
+            20,
+        )
+        self.assertIsNone(
+            self.harness.loop.output_coordinator.pending("A").target_strength
+        )
+
     async def test_cap_transport_exception_returns_safe_retryable_service_error(self):
         await self._start_physical_live(30)
         self.harness.relay.fail_next_strength_delta(

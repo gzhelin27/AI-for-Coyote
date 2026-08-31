@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import TypeAlias, TypeVar
 
 
 _CHANNELS = ("A", "B")
@@ -90,6 +90,7 @@ class _ChannelSlot:
     confirmed: ConfirmedChannelOutput = field(default_factory=ConfirmedChannelOutput)
     pending: PendingSafetyWork = field(default_factory=PendingSafetyWork)
     generation: int = 0
+    revision: int = 0
     minimum_priority: OutputIntentKind = OutputIntentKind.MANUAL
     estop_latched: bool = False
 
@@ -124,6 +125,57 @@ class DeviceOutputCoordinator:
             waveform_mode=_optional_text(waveform_mode, "waveform_mode"),
             enabled=_enabled(enabled),
         )
+        slot.revision += 1
+
+    def revision(self, channel: str) -> int:
+        """Return the monotonic confirmed-output revision for one channel."""
+        return self._slot(channel).revision
+
+    async def confirm_reported_strength(
+        self,
+        channel: str,
+        strength: int,
+        *,
+        expected_revision: int | None = None,
+    ) -> ConfirmedChannelOutput:
+        """Order an authoritative report with transport on the channel lock.
+
+        ``expected_revision`` makes a locally mirrored snapshot conditional, so
+        it cannot overwrite transport that settled after the snapshot was read.
+        """
+        slot = self._slot(channel)
+        reported_strength = _strength(strength)
+        if reported_strength is None:
+            raise ValueError("reported strength cannot be None")
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected revision must be a non-negative integer")
+        task = asyncio.create_task(
+            self._confirm_reported_strength_locked(
+                slot, reported_strength, expected_revision
+            )
+        )
+        return await _await_cleanup(task)
+
+    @staticmethod
+    async def _confirm_reported_strength_locked(
+        slot: _ChannelSlot,
+        strength: int,
+        expected_revision: int | None,
+    ) -> ConfirmedChannelOutput:
+        async with slot.lock:
+            if (
+                expected_revision is not None
+                and slot.revision != expected_revision
+            ):
+                return slot.confirmed
+            slot.confirmed = replace(slot.confirmed, strength=strength)
+            slot.revision += 1
+            slot.generation += 1
+            return slot.confirmed
 
     def generation(self, channel: str) -> int:
         return self._slot(channel).generation
@@ -372,6 +424,7 @@ class DeviceOutputCoordinator:
         changes = self._effective_changes(effective)
         if changes:
             slot.confirmed = replace(slot.confirmed, **changes)
+        slot.revision += 1
 
         pending = slot.pending
         if kind >= OutputIntentKind.CLEAR_OR_DISABLE:
@@ -433,7 +486,10 @@ class DeviceOutputCoordinator:
         return self._slots[channel]
 
 
-async def _await_cleanup(task: asyncio.Task[TransportOutcome]) -> TransportOutcome:
+_CleanupResult = TypeVar("_CleanupResult")
+
+
+async def _await_cleanup(task: asyncio.Task[_CleanupResult]) -> _CleanupResult:
     """Shield coordinator-owned transport cleanup from caller cancellation."""
 
     caller_cancelled = False

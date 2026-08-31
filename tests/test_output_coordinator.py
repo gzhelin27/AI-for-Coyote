@@ -69,6 +69,59 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(coordinator.is_current("A", started))
 
+    async def test_reported_strength_waits_for_active_transport_then_wins(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=30, enabled=True)
+        transport_started = asyncio.Event()
+        release_transport = asyncio.Event()
+
+        async def reduce(state):
+            transport_started.set()
+            await release_transport.wait()
+            return TransportOutcome(sent=True, effective={"strength": 20})
+
+        active = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.MANUAL, reduce)
+        )
+        await asyncio.wait_for(transport_started.wait(), timeout=0.2)
+        report = asyncio.create_task(
+            coordinator.confirm_reported_strength("A", 40)
+        )
+        release_transport.set()
+
+        await asyncio.wait_for(asyncio.gather(active, report), timeout=0.2)
+
+        self.assertEqual(coordinator.confirmed("A").strength, 40)
+
+    async def test_conditional_local_snapshot_cannot_overwrite_newer_transport(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=30, enabled=True)
+        observed_revision = coordinator.revision("A")
+        transport_started = asyncio.Event()
+        release_transport = asyncio.Event()
+
+        async def reduce(state):
+            transport_started.set()
+            await release_transport.wait()
+            return TransportOutcome(sent=True, effective={"strength": 20})
+
+        active = asyncio.create_task(
+            coordinator.run("A", OutputIntentKind.MANUAL, reduce)
+        )
+        await asyncio.wait_for(transport_started.wait(), timeout=0.2)
+        local_snapshot = asyncio.create_task(
+            coordinator.confirm_reported_strength(
+                "A", 30, expected_revision=observed_revision
+            )
+        )
+        release_transport.set()
+
+        await asyncio.wait_for(
+            asyncio.gather(active, local_snapshot), timeout=0.2
+        )
+
+        self.assertEqual(coordinator.confirmed("A").strength, 20)
+
     async def test_queued_normal_work_is_rejected_after_safety_invalidation(self):
         coordinator = DeviceOutputCoordinator()
         first_started = asyncio.Event()

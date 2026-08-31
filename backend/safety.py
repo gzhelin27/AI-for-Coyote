@@ -10,6 +10,7 @@
 6. op 白名单：强度、波形（含单周期）、清除和停止操作。
 """
 import logging
+import math
 import time
 
 logger = logging.getLogger("ai-for-coyote.safety")
@@ -408,11 +409,11 @@ class SafetyManager:
                 if (
                     isinstance(value, (int, float))
                     and not isinstance(value, bool)
+                    and (not isinstance(value, float) or math.isfinite(value))
                     and value > 0
                 ):
-                    parsed = int(value)
-                    if parsed > 0:
-                        self._app_policy_caps[ch][field] = parsed
+                    parsed = max(1, int(min(value, self.caps[ch])))
+                    self._app_policy_caps[ch][field] = parsed
             confirmed_caps = [
                 value
                 for value in self._app_policy_caps[ch].values()
