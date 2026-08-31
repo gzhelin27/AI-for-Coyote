@@ -31,6 +31,23 @@ class _AIActionOrigin:
     session_id: str | None
 
 
+async def _await_owned_group(group):
+    """Let report reconciliation settle before propagating caller cancellation."""
+    caller_cancelled = False
+    while not group.done():
+        try:
+            await asyncio.shield(group)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is None or not current.cancelling():
+                raise
+            caller_cancelled = True
+    results = group.result()
+    if caller_cancelled:
+        raise asyncio.CancelledError
+    return results
+
+
 class GameLoop:
     def __init__(self, cfg, llm, safety: SafetyManager, relay, camera=None, audio=None) -> None:
         self.cfg = cfg
@@ -766,11 +783,20 @@ class GameLoop:
                 )
             if not ready:
                 return TransportOutcome(sent=False, error="device is not connected")
-            sent = all(
-                await self._send_all(
-                    self._build_frames(cmd, client_id, slot_id)
-                )
+            delta = effective_strength - current
+            frames = (
+                [
+                    self.ops.add_strength(
+                        client_id,
+                        slot_id,
+                        CHANNEL[channel],
+                        delta,
+                    )
+                ]
+                if delta
+                else []
             )
+            sent = all(await self._send_all(frames))
             return TransportOutcome(
                 sent=sent,
                 effective={"strength": effective_strength} if sent else None,
@@ -822,6 +848,7 @@ class GameLoop:
                 CHANNEL[channel],
                 channel,
                 cmd,
+                owner_generation=generation,
             )
             stale = not self._floor_generation_is_current(channel, generation)
             if stale:
@@ -983,7 +1010,7 @@ class GameLoop:
         if not affected:
             return {}
 
-        channel_results = await asyncio.gather(
+        report_group = asyncio.gather(
             *(
                 self._reconcile_device_report_channel(
                     channel,
@@ -994,6 +1021,7 @@ class GameLoop:
                 for channel in affected
             )
         )
+        channel_results = await _await_owned_group(report_group)
         return {
             channel: result
             for channel, result in zip(affected, channel_results)
@@ -1695,7 +1723,14 @@ class GameLoop:
 
     # ---------- 循环波形（无时间约束，直到清除/急停） ----------
     async def _start_pulse_loop(
-        self, client_id: str, slot_id: str, ch: int, ch_name: str, cmd: dict
+        self,
+        client_id: str,
+        slot_id: str,
+        ch: int,
+        ch_name: str,
+        cmd: dict,
+        *,
+        owner_generation: int | None = None,
     ) -> bool:
         """分批下发波形实现无限循环，批间提前覆盖消除真空期。
 
@@ -1741,6 +1776,13 @@ class GameLoop:
                 except asyncio.TimeoutError:
                     pass
                 if self.safety.estop_active:
+                    break
+                if (
+                    owner_generation is not None
+                    and not self._floor_generation_is_current(
+                        ch_name, owner_generation
+                    )
+                ):
                     break
                 await self._send_all([next_frame()])
             logger.info("%s 通道循环波形结束：%s", ch_name, cmd["pattern"])
