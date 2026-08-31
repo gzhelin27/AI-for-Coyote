@@ -202,9 +202,14 @@ class GameLoop:
 
     def _character_for_turn(self) -> dict:
         if self._timeline_character is not None:
-            return self._timeline_character
-        if Path(str(self.cfg.get("character_file") or "")).exists():
-            reload_character(self.cfg)
+            if (
+                self.timeline_session is not None
+                and self.timeline_session.to_state().mode == "autopilot"
+                and self.timeline_session.to_state().status.value != "idle"
+            ):
+                return self._timeline_character
+            self._timeline_character = None
+        reload_character(self.cfg)
         return self.cfg["character"]
 
     async def handle_user_message(self, text: str) -> dict:
@@ -393,12 +398,20 @@ class GameLoop:
 
     async def _start_live_session(self):
         """Reload once, then freeze the exact character input for this session."""
+        state = self.timeline_session.to_state()
+        if state.mode == "autopilot" and state.status.value == "paused":
+            return await self.timeline_session.start_live()
+        if state.status.value != "idle":
+            return await self.timeline_session.start_live()
+
+        previous_character = self.cfg["character"]
         if Path(str(self.cfg.get("character_file") or "")).exists():
             reload_character(self.cfg)
         character = deepcopy(self.cfg["character"])
         try:
             result = await self.timeline_session.start_live()
         except Exception:
+            self.cfg["character"] = previous_character
             self._timeline_character = None
             raise
         self._timeline_character = character
@@ -2727,6 +2740,7 @@ class GameLoop:
                     await self._await_timeline_lifecycle(
                         self.timeline_session.stop
                     )
+                    self._clear_timeline_character_if_idle()
             finally:
                 await self._stop_autopilot_task()
         sent = bool(transaction["sent"])

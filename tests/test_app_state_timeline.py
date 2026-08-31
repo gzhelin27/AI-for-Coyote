@@ -112,6 +112,25 @@ class ProductionAppStateTimelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             yield
 
+    def _write_character(self, prompt: str, example: str) -> None:
+        Path(self.cfg["character_file"]).write_text(
+            f"""role: role-one
+profile: profile-one
+prompt: {prompt}
+roles:
+  role-one:
+    name: Loaded DLC
+    title: owner
+    profiles:
+      profile-one:
+        level: 中
+        examples:
+          - user: {example} user
+            assistant: {example} assistant
+""",
+            encoding="utf-8",
+        )
+
     async def test_real_app_state_refreshes_seed_and_manifest_metadata_per_session(self):
         with (
             self._fake_external_dependencies(),
@@ -327,6 +346,76 @@ roles:
         )
         self.assertEqual(manifest.dlc_fingerprint, expected)
 
+    async def test_paused_session_resume_keeps_original_character_and_new_session_uses_reload(self):
+        self.cfg["character"].pop("dlc_version")
+        self._write_character("prompt A", "A")
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+            await state.loop.start_timeline_session()
+            character_a = deepcopy(state.loop._timeline_character)
+            expected_a_cfg = deepcopy(self.cfg)
+            expected_a_cfg["character"] = character_a
+
+            await state.loop.set_autopilot(False)
+            self._write_character("prompt B", "B")
+            await state.loop.start_timeline_session()
+            await state.loop._autopilot_turn()
+            first = await state.loop.finish_timeline_session()
+
+            await state.loop.start_timeline_session()
+            await state.loop._autopilot_turn()
+            second = await state.loop.finish_timeline_session()
+
+        first_manifest = state.replay_store.load(first.replay_id).manifest
+        second_manifest = state.replay_store.load(second.replay_id).manifest
+        self.assertEqual(self.llm.chat.await_args_list[0].args[0]["prompt"], "prompt A")
+        self.assertEqual(self.llm.chat.await_args_list[1].args[0]["prompt"], "prompt B")
+        self.assertEqual(
+            first_manifest.dlc_fingerprint,
+            main_module._dlc_provenance(expected_a_cfg),
+        )
+        self.assertEqual(second_manifest.dlc_fingerprint, main_module._dlc_provenance(self.cfg))
+
+    async def test_estop_terminal_state_discards_frozen_character_before_normal_turn(self):
+        self._write_character("prompt A", "A")
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+            await state.loop.start_timeline_session()
+            await state.loop.estop()
+            self.assertEqual(state.timeline_session.to_state().status.value, "idle")
+            await state.loop.resume()
+
+            self._write_character("prompt B", "B")
+            await state.loop.handle_user_message("normal turn")
+
+        self.assertEqual(self.llm.chat.await_args.args[0]["prompt"], "prompt B")
+
+    async def test_direct_timeline_stop_discards_frozen_character_before_normal_turn(self):
+        self._write_character("prompt A", "A")
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+            await state.loop.start_timeline_session()
+            await state.timeline_session.stop()
+            self.assertEqual(state.timeline_session.to_state().status.value, "idle")
+
+            self._write_character("prompt B", "B")
+            await state.loop.handle_user_message("normal turn")
+
+        self.assertEqual(self.llm.chat.await_args.args[0]["prompt"], "prompt B")
+
+    async def test_missing_character_file_outside_session_reloads_default_character(self):
+        self._write_character("prompt A", "A")
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+            await state.loop.handle_user_message("loads file")
+            Path(self.cfg["character_file"]).unlink()
+
+            await state.loop.handle_user_message("must reload")
+
+        self.assertEqual(
+            self.llm.chat.await_args.args[0]["prompt"],
+            "你是一个有趣的互动角色。",
+        )
     async def test_manifest_uses_controller_waveform_policy_after_config_drift(self):
         self.cfg["character"].pop("dlc_version")
         with self._fake_external_dependencies():
