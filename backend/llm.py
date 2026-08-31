@@ -252,6 +252,7 @@ class LLM:
         self.temperature = float(llm_cfg["temperature"])
         self.max_tokens = int(llm_cfg["max_tokens"])
         self.json_mode = bool(llm_cfg.get("json_mode", True))
+        self.reasoning_effort = str(llm_cfg.get("reasoning_effort") or "").strip()
         self.client = httpx.AsyncClient(timeout=float(llm_cfg["timeout_s"]))
 
         # 视觉任务独立端点（如本地 Ollama 的 Qwen2.5-VL）；留空则与主模型相同
@@ -297,6 +298,13 @@ class LLM:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        if self.reasoning_effort:
+            # OpenRouter 统一推理参数。低推理量为最终 JSON 保留足够 token，
+            # exclude 只隐藏推理文本，不会关闭模型内部推理。
+            payload["reasoning"] = {
+                "effort": self.reasoning_effort,
+                "exclude": True,
+            }
         # 部分模型不支持 response_format 参数；json_mode=false 时走文本+兜底解析
         if self.json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -317,6 +325,9 @@ class LLM:
             if not content:
                 # 推理型模型偶发把答案全塞进 reasoning_content（content 为空）
                 content = str(message.get("reasoning_content") or "").strip()
+            if not content:
+                # OpenRouter 当前统一字段名是 reasoning，reasoning_content 是兼容别名。
+                content = str(message.get("reasoning") or "").strip()
             if not content:
                 raise RuntimeError("模型返回空内容（content 与 reasoning_content 均为空）")
 
