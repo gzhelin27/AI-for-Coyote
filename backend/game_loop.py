@@ -650,6 +650,10 @@ class GameLoop:
         return True
 
     async def _apply_channel_floor(self) -> None:
+        async with self._action_lock:
+            await self._apply_channel_floor_locked()
+
+    async def _apply_channel_floor_locked(self) -> None:
         """双通道保底：两轮后 A/B 都必须有波形且强度≠0；每 2 轮内强度与波形至少各调一次。"""
         if not (self.safety.enabled.get("A") and self.safety.enabled.get("B")):
             return
@@ -664,6 +668,7 @@ class GameLoop:
             pending = self.output_coordinator.pending(ch)
             if pending.clear_required or pending.target_strength is not None:
                 continue
+            generation = self.output_coordinator.generation(ch)
             base = int(self.cfg["device_channels"].get(ch, {}).get("baseline", 15 if ch == "A" else 5))
             wave_active = (ch in self.loop_tasks) or bool(self.safety.pulse_active().get(ch))
             strength = self.safety.current.get(ch, 0)
@@ -672,6 +677,9 @@ class GameLoop:
             if self.turn_count >= 2:
                 if not wave_active:
                     await self._ensure_default_wave(ch, client_id, slot_id, ready, self.safety.dry_run)
+                    if not self._floor_generation_is_current(ch, generation):
+                        self._cancel_loops(ch, reset_pulse=False)
+                        continue
                     self.last_wave[ch] = self.turn_count
                     fixed = True
                 if strength <= 0:
@@ -684,6 +692,8 @@ class GameLoop:
                     if ready and not self.safety.dry_run:
                         await self._send_all(self._build_frames(cmd, client_id, slot_id))
                     self.safety.record(cmd)
+                    if not self._floor_generation_is_current(ch, generation):
+                        continue
                     self.last_strength[ch] = self.turn_count
                     fixed = True
             # 规则 2：每 2 轮内，强度与波形至少各调整一次
@@ -698,14 +708,28 @@ class GameLoop:
                 if ready and not self.safety.dry_run:
                     await self._send_all(self._build_frames(cmd, client_id, slot_id))
                 self.safety.record(cmd)
+                if not self._floor_generation_is_current(ch, generation):
+                    continue
                 self.last_strength[ch] = self.turn_count
                 fixed = True
             if self.turn_count - self.last_wave.get(ch, 0) >= 2:
                 await self._ensure_default_wave(ch, client_id, slot_id, ready, self.safety.dry_run)
+                if not self._floor_generation_is_current(ch, generation):
+                    self._cancel_loops(ch, reset_pulse=False)
+                    continue
                 self.last_wave[ch] = self.turn_count
                 fixed = True
             if fixed:
                 logger.info("通道保底：%s 通道强度/波形已自动补齐（第 %d 轮）", ch, self.turn_count)
+
+    def _floor_generation_is_current(self, channel: str, generation: int) -> bool:
+        pending = self.output_coordinator.pending(channel)
+        return (
+            self.output_coordinator.is_current(channel, generation)
+            and not pending.clear_required
+            and pending.target_strength is None
+            and self.safety.desired_enabled[channel]
+        )
 
     async def set_runtime_cap(self, channel: str, value: int) -> dict:
         """Apply desired cap policy and publish strength only after delivery."""
@@ -785,6 +809,7 @@ class GameLoop:
             )
 
         async with self._action_lock:
+            self._sync_output_coordinator_channel(channel)
             reconciled = await self._reconcile_runtime_safety_locked((channel,))
 
         if (
@@ -805,19 +830,21 @@ class GameLoop:
         self, props: dict | None, slot_state: dict | None
     ) -> dict[str, dict]:
         """Apply device feedback and retry every pending safety transition."""
-        self.safety.update_device_policy(slot_state)
-        self.safety.update_reported_strength(props)
-
         reconcile_channels: list[str] = []
-        for channel in ("A", "B"):
-            self._sync_output_coordinator_channel(channel)
-            confirmed_strength = self.output_coordinator.confirmed(channel).strength
-            cap = self.safety.cap_for(channel)
-            if confirmed_strength is not None and confirmed_strength > cap:
-                self.output_coordinator.mark_reduction(channel, cap)
-            pending = self.output_coordinator.pending(channel)
-            if pending.clear_required or pending.target_strength is not None:
-                reconcile_channels.append(channel)
+        async with self._action_lock:
+            self.safety.update_device_policy(slot_state)
+            self.safety.update_reported_strength(props)
+            for channel in ("A", "B"):
+                self._sync_output_coordinator_channel(channel)
+                confirmed_strength = (
+                    self.output_coordinator.confirmed(channel).strength
+                )
+                cap = self.safety.cap_for(channel)
+                if confirmed_strength is not None and confirmed_strength > cap:
+                    self.output_coordinator.mark_reduction(channel, cap)
+                pending = self.output_coordinator.pending(channel)
+                if pending.clear_required or pending.target_strength is not None:
+                    reconcile_channels.append(channel)
 
         controller = self.timeline_session
         restart: dict[str, bool] = {}
@@ -918,7 +945,7 @@ class GameLoop:
         executed: list[dict] = []
         if pending.clear_required:
             self._cancel_loops(channel, reset_pulse=False)
-            outcome = await coordinator.run(
+            outcome = await self._run_coordinated_safety(
                 channel,
                 OutputIntentKind.CLEAR_OR_DISABLE,
                 lambda snapshot: self._transport_safety_clear(
@@ -938,7 +965,7 @@ class GameLoop:
         pending = coordinator.pending(channel)
         if pending.target_strength is not None:
             target = pending.target_strength
-            outcome = await coordinator.run(
+            outcome = await self._run_coordinated_safety(
                 channel,
                 OutputIntentKind.SAFETY_REDUCE,
                 lambda snapshot: self._transport_safety_strength_delta(
@@ -956,7 +983,7 @@ class GameLoop:
 
         confirmed = coordinator.confirmed(channel)
         if desired_enabled and not confirmed.enabled:
-            outcome = await coordinator.run(
+            outcome = await self._run_coordinated_safety(
                 channel,
                 OutputIntentKind.CLEAR_OR_DISABLE,
                 lambda snapshot: self._confirmed_local_enable(snapshot),
@@ -971,6 +998,23 @@ class GameLoop:
             )
 
         return {"executed": executed, "dropped": []}
+
+    async def _run_coordinated_safety(self, channel, kind, operation):
+        """Publish coordinator state before propagating transport cancellation."""
+        try:
+            return await self.output_coordinator.run(channel, kind, operation)
+        finally:
+            self._publish_coordinator_confirmed(channel)
+
+    def _publish_coordinator_confirmed(self, channel: str) -> None:
+        """Synchronously mirror the coordinator's committed channel snapshot."""
+        confirmed = self.output_coordinator.confirmed(channel)
+        if confirmed.strength is not None:
+            self.safety.confirm_strength(channel, confirmed.strength)
+        self.safety.confirm_channel_enabled(channel, confirmed.enabled)
+        self.patterns[channel] = confirmed.waveform
+        if confirmed.waveform is None and confirmed.waveform_mode is None:
+            self.safety.pulse_until[channel] = 0.0
 
     async def _transport_safety_strength_delta(
         self, channel: str, target: int, confirmed

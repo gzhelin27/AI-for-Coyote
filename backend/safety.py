@@ -63,6 +63,10 @@ class SafetyManager:
         self.current = {"A": 0, "B": 0}       # 本地跟踪的通道基础强度（跟随设备上报）
         self.requested = {"A": None, "B": None}  # 最近一次请求的强度值（用于对照显示）
         self.app_caps = {"A": None, "B": None}   # App 舒适强度上限（设备实际允许的最大值）
+        self._app_policy_caps = {
+            ch: {"comfortMax": None, "absoluteMax": None}
+            for ch in ("A", "B")
+        }
         self.pulse_until = {"A": 0.0, "B": 0.0}  # 波形播放结束时刻（monotonic）
         self.overheat = {"A": False, "B": False}
         self.enabled = {"A": True, "B": True}    # 通道开关（页面可手动开闭）
@@ -86,6 +90,9 @@ class SafetyManager:
 
     def cap_for(self, ch: str) -> int:
         cap = min(self.caps[ch], self.user_caps.get(ch, self.caps[ch]))
+        app_cap = self.app_caps.get(ch)
+        if isinstance(app_cap, int) and not isinstance(app_cap, bool) and app_cap > 0:
+            cap = min(cap, app_cap)
         if self.overheat[ch]:
             return min(cap, self.overheat_reduce_to)
         return cap
@@ -389,17 +396,33 @@ class SafetyManager:
             comfort = ch_state.get("comfortLimit")
             if not isinstance(comfort, dict):
                 continue
-            if "overheat" in comfort:
-                overheat = bool(comfort["overheat"])
+            if isinstance(comfort.get("overheat"), bool):
+                overheat = comfort["overheat"]
                 if self.overheat[ch] != overheat:
                     changed.add(ch)
                 self.overheat[ch] = overheat
-            # App 舒适强度上限：comfortMax 优先，其次 absoluteMax
+            # Both values are upper bounds. Preserve the last confirmed bound
+            # when a report omits them or contains malformed values.
             for field in ("comfortMax", "absoluteMax"):
                 value = comfort.get(field)
-                if isinstance(value, (int, float)) and value > 0:
-                    self.app_caps[ch] = int(value)
-                    break
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value > 0
+                ):
+                    parsed = int(value)
+                    if parsed > 0:
+                        self._app_policy_caps[ch][field] = parsed
+            confirmed_caps = [
+                value
+                for value in self._app_policy_caps[ch].values()
+                if value is not None
+            ]
+            if confirmed_caps:
+                app_cap = min(confirmed_caps)
+                if self.app_caps[ch] != app_cap:
+                    changed.add(ch)
+                self.app_caps[ch] = app_cap
         return changed
 
     def update_device_state(self, props: dict | None, slot_state: dict | None) -> None:

@@ -52,6 +52,42 @@ class SafetyTargetTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(cmd["value"], 5)
 
+    def test_app_user_overheat_and_absolute_caps_use_strictest_limit(self):
+        safety = make_safety(cap=100)
+        safety.set_user_cap("A", 60)
+        safety.update_device_policy(
+            {
+                "channelA": {
+                    "comfortLimit": {"comfortMax": 50, "absoluteMax": 40}
+                }
+            }
+        )
+
+        self.assertEqual(safety.cap_for("A"), 40)
+
+        safety.overheat["A"] = True
+        self.assertEqual(safety.cap_for("A"), 20)
+
+        safety.set_user_cap("A", 5)
+        self.assertEqual(safety.cap_for("A"), 5)
+
+    def test_missing_absolute_policy_does_not_relax_last_absolute_cap(self):
+        safety = make_safety(cap=100)
+        safety.update_device_policy(
+            {
+                "channelA": {
+                    "comfortLimit": {"comfortMax": 25, "absoluteMax": 10}
+                }
+            }
+        )
+
+        safety.update_device_policy(
+            {"channelA": {"comfortLimit": {"comfortMax": 50}}}
+        )
+
+        self.assertEqual(safety.app_caps["A"], 10)
+        self.assertEqual(safety.cap_for("A"), 10)
+
 
 if __name__ == "__main__":
     unittest.main()
