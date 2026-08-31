@@ -129,6 +129,8 @@ class ChannelCycleRunner:
         self._pending_records: dict[tuple[str, int], CycleRecord] = {}
         self._worker: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
+        self._stop_clear_task: asyncio.Task[None] | None = None
+        self._stop_invalidation: asyncio.Future[None] | None = None
         self._cancel_reasons: dict[asyncio.Task[None], str] = {}
         self._gap_sleep: asyncio.Task[None] | None = None
         self._generation = 0
@@ -218,34 +220,72 @@ class ChannelCycleRunner:
         async with self._lock:
             stop_task = self._stop_task
             if stop_task is None or stop_task.done():
+                invalidation = asyncio.get_running_loop().create_future()
                 stop_task = asyncio.create_task(
-                    self._finish_stop(clear=clear, reason=reason),
+                    self._finish_stop(reason=reason, invalidation=invalidation),
                     name=f"timeline-stop-{self.channel}",
                 )
                 self._stop_task = stop_task
+                self._stop_invalidation = invalidation
+                self._stop_clear_task = None
                 stop_task.add_done_callback(self._stop_finished)
+            else:
+                invalidation = self._stop_invalidation
+                if invalidation is None:
+                    raise RuntimeError("active stop is missing invalidation state")
+            clear_task = self._stop_clear_task
+            if clear and clear_task is None:
+                clear_task = asyncio.create_task(
+                    self._clear_after_invalidation(invalidation),
+                    name=f"timeline-clear-{self.channel}",
+                )
+                self._stop_clear_task = clear_task
+        if clear_task is not None:
+            await asyncio.shield(clear_task)
         await asyncio.shield(stop_task)
 
-    async def _finish_stop(self, *, clear: bool, reason: str) -> None:
-        worker = await self._invalidate_worker(RunnerPhase.STOPPED, reason)
+    async def _finish_stop(
+        self, *, reason: str, invalidation: asyncio.Future[None]
+    ) -> None:
+        worker: asyncio.Task[None] | None = None
         try:
-            if clear:
-                executed, dropped = await self._executor.execute(
-                    [{"op": "clear", "channel": self.channel}]
-                )
-                if dropped or not self._action_was_executed(
-                    executed, {"op": "clear", "channel": self.channel}
-                ):
-                    self._failure = self._format_rejection(dropped, "clear was not executed")
-                    self._disconnected = self._is_disconnect(dropped)
-        except Exception as exc:  # the stopped phase remains authoritative
-            self._failure = str(exc) or type(exc).__name__
-            self._disconnected = isinstance(exc, ConnectionError) or self._is_disconnect(exc)
+            worker = await self._invalidate_worker(RunnerPhase.STOPPED, reason)
+            if not invalidation.done():
+                invalidation.set_result(None)
+            clear_task = self._stop_clear_task
+            if clear_task is not None:
+                await asyncio.shield(clear_task)
+            await self._wait_worker(worker)
         finally:
             try:
-                await self._wait_worker(worker)
+                if not invalidation.done():
+                    invalidation.set_result(None)
+                late_clear_task = self._stop_clear_task
+                if late_clear_task is not None:
+                    await asyncio.shield(late_clear_task)
             finally:
                 self._stopped.set()
+
+    async def _clear_after_invalidation(
+        self, invalidation: asyncio.Future[None]
+    ) -> None:
+        await asyncio.shield(invalidation)
+        try:
+            executed, dropped = await self._executor.execute(
+                [{"op": "clear", "channel": self.channel}]
+            )
+            if dropped or not self._action_was_executed(
+                executed, {"op": "clear", "channel": self.channel}
+            ):
+                self._failure = self._format_rejection(
+                    dropped, "clear was not executed"
+                )
+                self._disconnected = self._is_disconnect(dropped)
+        except Exception as exc:  # the stopped phase remains authoritative
+            self._failure = str(exc) or type(exc).__name__
+            self._disconnected = isinstance(
+                exc, ConnectionError
+            ) or self._is_disconnect(exc)
 
     async def wait_stopped(self) -> RunnerState:
         await self._stopped.wait()
@@ -355,6 +395,17 @@ class ChannelCycleRunner:
 
                 if not await self._generation_is_current(generation):
                     return
+                if self._needs_activation:
+                    try:
+                        self._effective_strength = self._read_effective_strength(
+                            executed
+                        )
+                    except ValueError as exc:
+                        self._resolve_startup(startup)
+                        attempt = None
+                        await self._stop_for_failure(exc)
+                        return
+                    attempt.effective_strength = self._effective_strength
                 if dropped or not all(
                     self._action_was_executed(executed, action) for action in actions
                 ) or not self._action_was_executed(executed, pulse):
@@ -372,19 +423,6 @@ class ChannelCycleRunner:
                     )
                     return
 
-                if self._needs_activation:
-                    try:
-                        self._effective_strength = self._read_effective_strength(
-                            executed
-                        )
-                    except ValueError as exc:
-                        self._resolve_startup(startup)
-                        attempt = None
-                        await self._stop_for_failure(
-                            exc,
-                        )
-                        return
-                    attempt.effective_strength = self._effective_strength
                 self._needs_activation = False
                 self._resolve_startup(startup)
 
@@ -626,6 +664,8 @@ class ChannelCycleRunner:
     def _stop_finished(self, stop_task: asyncio.Task[None]) -> None:
         if self._stop_task is stop_task:
             self._stop_task = None
+            self._stop_clear_task = None
+            self._stop_invalidation = None
         if not stop_task.cancelled():
             stop_task.exception()
 

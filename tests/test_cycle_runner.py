@@ -119,6 +119,32 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.worker_active)
         self.assertEqual(harness.clear_calls, ["A"])
 
+    async def test_concurrent_estop_upgrades_active_stop_to_one_clear(self):
+        callback = BlockingCycleCallback()
+        harness = self.make_harness(
+            frames={"呼吸": ["f"] * 12}, on_cycle=callback
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+
+        stop_task = asyncio.create_task(
+            harness.runner.stop(clear=False, reason="operator_stop")
+        )
+        await asyncio.wait_for(callback.entered.wait(), timeout=0.2)
+        estop_task = asyncio.create_task(
+            harness.runner.stop(clear=True, reason="estop")
+        )
+        try:
+            await harness.flush()
+            self.assertEqual(harness.clear_calls, ["A"])
+        finally:
+            callback.release.set()
+            await asyncio.wait_for(
+                asyncio.gather(stop_task, estop_task), timeout=0.2
+            )
+
+        self.assertEqual(harness.clear_calls, ["A"])
+        self.assertEqual(harness.runner.state().phase, RunnerPhase.STOPPED)
+
     async def test_cancelled_record_callback_stops_with_record_preserved(self):
         async def cancel_callback(record):
             raise asyncio.CancelledError
@@ -406,6 +432,26 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
                     harness.runner.state().phase, RunnerPhase.STOPPED
                 )
                 state = await harness.runner.wait_stopped()
+                self.assertIn("effective_strength", state.failure or "")
+                self.assertEqual(harness.records, [])
+                self.assertEqual(harness.runner.pending_records(), ())
+
+    async def test_invalid_activation_result_takes_precedence_over_rejection_record(self):
+        cases = (
+            {"omit_effective_strength": True, "fail_on_cycle": 1},
+            {"invalid_effective_strength": True, "fail_on_cycle": 1},
+        )
+        for index, executor_case in enumerate(cases, 1):
+            with self.subTest(executor_case=executor_case):
+                harness = self.make_harness(
+                    frames={"呼吸": ["f"]}, **executor_case
+                )
+                await harness.runner.submit(
+                    CycleDirective("A", f"evt-rejected-{index}", "呼吸", 20)
+                )
+
+                state = await harness.runner.wait_stopped()
+                self.assertEqual(state.phase, RunnerPhase.STOPPED)
                 self.assertIn("effective_strength", state.failure or "")
                 self.assertEqual(harness.records, [])
                 self.assertEqual(harness.runner.pending_records(), ())
