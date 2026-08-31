@@ -11,6 +11,7 @@ import re
 import tempfile
 from typing import Any
 import zipfile
+import zlib
 
 from .models import SCHEMA_VERSION, ReplayManifest, SessionStatus, Timeline
 
@@ -27,6 +28,14 @@ _MAX_MEMBER_SIZES = {
 _MAX_SOURCE_SIZE = 32 * 1024 * 1024
 _MAX_TOTAL_SIZE = 48 * 1024 * 1024
 _MAX_ENTRY_COUNT = 4
+_MAX_COMPRESSED_MEMBER_SIZES = {
+    "manifest.json": 512 * 1024,
+    "timeline.json": 17 * 1024 * 1024,
+    "scenes.json": 17 * 1024 * 1024,
+}
+_MAX_COMPRESSED_SOURCE_SIZE = 33 * 1024 * 1024
+_MAX_ARCHIVE_SIZE = 50 * 1024 * 1024
+_ALLOWED_COMPRESSION_METHODS = frozenset((zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED))
 
 
 class ReplayStoreError(Exception):
@@ -141,11 +150,11 @@ class ReplayStore:
                 delete=False,
             ) as temporary:
                 temporary_path = Path(temporary.name)
-            with zipfile.ZipFile(
-                temporary_path, "w", compression=zipfile.ZIP_DEFLATED
-            ) as archive:
-                for name, payload in archive_payloads.items():
-                    archive.writestr(name, payload)
+                with zipfile.ZipFile(
+                    temporary, "w", compression=zipfile.ZIP_DEFLATED
+                ) as archive:
+                    for name, payload in archive_payloads.items():
+                        archive.writestr(name, payload)
             temporary_path.replace(final_path)
             return final_path
         except (OSError, zipfile.BadZipFile) as exc:
@@ -156,8 +165,11 @@ class ReplayStore:
 
     def load(self, replay_id: str) -> ReplayBundle:
         self._validate_replay_id(replay_id)
+        archive_path = self._path(replay_id)
         try:
-            with zipfile.ZipFile(self._path(replay_id), "r") as archive:
+            if archive_path.stat().st_size > _MAX_ARCHIVE_SIZE:
+                raise ReplayStoreError("replay archive size exceeds limit")
+            with zipfile.ZipFile(archive_path, "r") as archive:
                 infos = archive.infolist()
                 if len(infos) > _MAX_ENTRY_COUNT:
                     raise ReplayStoreError("replay archive has too many entries")
@@ -165,6 +177,12 @@ class ReplayStore:
                     _validate_member_path(info.filename)
                     if not _is_allowed_member(info.filename):
                         raise ReplayStoreError("replay archive contains an unexpected member")
+                    if info.flag_bits & 1:
+                        raise ReplayStoreError("replay archive contains an encrypted member")
+                    if info.compress_type not in _ALLOWED_COMPRESSION_METHODS:
+                        raise ReplayStoreError(
+                            "replay archive uses an unsupported compression method"
+                        )
                 names = [info.filename for info in infos]
                 if len(names) != len(set(names)):
                     raise ReplayStoreError("replay archive contains a duplicate member")
@@ -178,7 +196,19 @@ class ReplayStore:
                 manifest_data = json.loads(payloads["manifest.json"])
         except ReplayStoreError:
             raise
-        except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (
+            EOFError,
+            KeyError,
+            NotImplementedError,
+            OSError,
+            OverflowError,
+            RuntimeError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+            zlib.error,
+        ) as exc:
             raise ReplayStoreError("could not load replay archive") from exc
 
         try:
@@ -301,9 +331,20 @@ def _member_size_limit(name: str) -> int:
     return _MAX_MEMBER_SIZES[name]
 
 
+def _compressed_member_size_limit(name: str) -> int:
+    if name.startswith("source."):
+        return _MAX_COMPRESSED_SOURCE_SIZE
+    return _MAX_COMPRESSED_MEMBER_SIZES[name]
+
+
 def _validate_member_sizes(infos: list[zipfile.ZipInfo]) -> None:
     total = 0
     for info in infos:
+        if (
+            info.compress_size < 0
+            or info.compress_size > _compressed_member_size_limit(info.filename)
+        ):
+            raise ReplayStoreError("replay archive member exceeds compressed size limit")
         if info.file_size < 0 or info.file_size > _member_size_limit(info.filename):
             raise ReplayStoreError("replay archive member exceeds size limit")
         total += info.file_size

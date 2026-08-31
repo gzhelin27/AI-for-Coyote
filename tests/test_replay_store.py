@@ -22,7 +22,74 @@ def rewrite_members(path: Path, replacements: dict[str, bytes]) -> None:
     temporary.replace(path)
 
 
+def rewrite_member_metadata(
+    path: Path,
+    member_name: str,
+    *,
+    encrypted: bool = False,
+    compression: int | None = None,
+    compressed_size: int | None = None,
+) -> None:
+    data = bytearray(path.read_bytes())
+    layouts = (
+        (b"PK\x03\x04", 6, 8, 18, 26, 30),
+        (b"PK\x01\x02", 8, 10, 20, 28, 46),
+    )
+    matches = 0
+    for signature, flags_at, method_at, size_at, name_length_at, name_at in layouts:
+        offset = 0
+        while (offset := data.find(signature, offset)) >= 0:
+            name_length = int.from_bytes(
+                data[offset + name_length_at : offset + name_length_at + 2],
+                "little",
+            )
+            name = bytes(data[offset + name_at : offset + name_at + name_length])
+            if name.decode("utf-8") == member_name:
+                if encrypted:
+                    flags = int.from_bytes(
+                        data[offset + flags_at : offset + flags_at + 2],
+                        "little",
+                    )
+                    data[offset + flags_at : offset + flags_at + 2] = (
+                        flags | 1
+                    ).to_bytes(2, "little")
+                if compression is not None:
+                    data[offset + method_at : offset + method_at + 2] = (
+                        compression.to_bytes(2, "little")
+                    )
+                if compressed_size is not None:
+                    data[offset + size_at : offset + size_at + 4] = (
+                        compressed_size.to_bytes(4, "little")
+                    )
+                matches += 1
+            offset += len(signature)
+    if matches != 2:
+        raise AssertionError(f"expected local and central metadata for {member_name}")
+    path.write_bytes(data)
+
+
 class ReplayStoreTests(unittest.TestCase):
+    def test_save_writes_zip_through_open_exclusive_temp_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[7], status="completed")
+            real_zip_file = zipfile.ZipFile
+
+            def require_open_file_object(target, *args, **kwargs):
+                if kwargs.get("mode", args[0] if args else "r") == "w":
+                    if not hasattr(target, "write") or target.closed:
+                        raise AssertionError("ZIP writer reopened the temporary path")
+                return real_zip_file(target, *args, **kwargs)
+
+            with patch(
+                "backend.timeline.replay_store.zipfile.ZipFile",
+                side_effect=require_open_file_object,
+            ):
+                path = store.save(bundle.manifest, bundle.timeline)
+
+            self.assertEqual(store.load(bundle.manifest.replay_id).timeline, bundle.timeline)
+            self.assertEqual(path, Path(tmp, "replay-1.coyote-replay"))
+
     def test_round_trip_preserves_cycle_gap_tenths(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ReplayStore(Path(tmp))
@@ -253,6 +320,68 @@ class ReplayStoreTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ReplayStoreError, "duplicate cycle"):
                 store.load(bundle.manifest.replay_id)
+
+    def test_rejects_encrypted_allowed_member_before_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            path = store.save(bundle.manifest, bundle.timeline)
+            rewrite_member_metadata(path, "timeline.json", encrypted=True)
+
+            with self.assertRaisesRegex(ReplayStoreError, "encrypted"):
+                store.load(bundle.manifest.replay_id)
+
+    def test_rejects_unsupported_compression_before_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            path = store.save(bundle.manifest, bundle.timeline)
+            rewrite_member_metadata(path, "timeline.json", compression=99)
+
+            with self.assertRaisesRegex(ReplayStoreError, "compression"):
+                store.load(bundle.manifest.replay_id)
+
+    def test_rejects_unreasonable_compressed_member_size_before_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            path = store.save(bundle.manifest, bundle.timeline)
+            rewrite_member_metadata(
+                path,
+                "timeline.json",
+                compressed_size=18 * 1024 * 1024,
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "compressed size"):
+                store.load(bundle.manifest.replay_id)
+
+    def test_rejects_unreasonable_outer_archive_size_before_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            path = store.save(bundle.manifest, bundle.timeline)
+            with path.open("r+b") as archive_file:
+                archive_file.truncate(50 * 1024 * 1024 + 1)
+
+            with self.assertRaisesRegex(ReplayStoreError, "archive size"):
+                store.load(bundle.manifest.replay_id)
+
+    def test_normalizes_zip_read_runtime_and_unsupported_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            store.save(bundle.manifest, bundle.timeline)
+
+            for error in (
+                RuntimeError("encrypted payload"),
+                NotImplementedError("unsupported compression"),
+            ):
+                with self.subTest(error=type(error).__name__), patch.object(
+                    zipfile.ZipFile,
+                    "read",
+                    side_effect=error,
+                ), self.assertRaises(ReplayStoreError):
+                    store.load(bundle.manifest.replay_id)
 
 
 if __name__ == "__main__":
