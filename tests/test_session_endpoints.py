@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import suppress
+from copy import deepcopy
 import io
 import json
 from pathlib import Path
@@ -269,7 +270,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(
                 self.harness.store,
-                "open_validated",
+                "_open_contained",
                 return_value=archive_file,
             ):
                 response = await download_route.endpoint(replay_id)
@@ -444,12 +445,76 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(switched.status_code, 200)
-        self.assertEqual(reload_states, [SessionStatus.IDLE])
+        self.assertEqual(reload_states, [SessionStatus.RUNNING])
         self.assertEqual(self.harness.controller.to_state().status, SessionStatus.IDLE)
         self.assertEqual(len(self.harness.store.list()), 1)
         self.assertEqual(self.harness.cfg["character"]["role"], "新角色")
         self.assertEqual(self.harness.cfg["character"]["profile"], "新风格")
         self.state.set_sensors.assert_awaited_with(False)
+
+    async def _assert_invalid_profile_request_preserves_live_state(
+        self, body, *, reload_side_effect=None
+    ):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        self.state.sensors_on = True
+        before_state = (await self.client.get("/api/state")).json()
+        before_character = deepcopy(self.harness.cfg["character"])
+        runtime_path = self.replay_root / "character_runtime.yaml"
+        self.state.set_sensors.reset_mock()
+        self.state.broadcast.reset_mock()
+
+        with (
+            patch.object(
+                main_module,
+                "reload_character",
+                side_effect=reload_side_effect,
+            ),
+            patch("backend.config.CHARACTER_RUNTIME_FILE", runtime_path),
+        ):
+            response = await self.client.post(
+                "/api/character/profile", json=body
+            )
+
+        after_state = (await self.client.get("/api/state")).json()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(after_state, before_state)
+        self.assertEqual(
+            self.harness.controller.to_state().status,
+            SessionStatus.RUNNING,
+        )
+        self.assertTrue(self.harness.loop.autopilot)
+        self.assertTrue(self.state.sensors_on)
+        self.assertEqual(self.harness.store.list(), [])
+        self.assertEqual(self.harness.cfg["character"], before_character)
+        self.assertFalse(runtime_path.exists())
+        self.state.set_sensors.assert_not_awaited()
+        self.state.broadcast.assert_not_awaited()
+        return response
+
+    async def test_invalid_role_does_not_finish_or_mutate_live_session(self):
+        response = await self._assert_invalid_profile_request_preserves_live_state(
+            {"role": "不存在", "profile": "纯爱"}
+        )
+        self.assertIn("未知角色", response.json()["error"])
+
+    async def test_invalid_profile_does_not_finish_or_mutate_live_session(self):
+        response = await self._assert_invalid_profile_request_preserves_live_state(
+            {"role": "触手", "profile": "不存在"}
+        )
+        self.assertIn("未知风格", response.json()["error"])
+
+    async def test_unavailable_dlc_does_not_finish_or_mutate_live_session(self):
+        def mark_dlc_unavailable(candidate_cfg):
+            for role in candidate_cfg["character"]["roles"]:
+                if role["name"] == "装置":
+                    role["profiles"][0]["available"] = False
+
+        response = await self._assert_invalid_profile_request_preserves_live_state(
+            {"role": "装置", "profile": "调教"},
+            reload_side_effect=mark_dlc_unavailable,
+        )
+        self.assertEqual(response.json()["detail"], "dlc_missing")
 
     async def test_estop_aborts_live_session_without_archive_or_implicit_reset(self):
         started = await self.client.post("/api/session/start")
@@ -664,7 +729,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(switched.status_code, 200)
         self.assertEqual(restarted.status_code, 200)
-        self.assertEqual(reload_states, [SessionStatus.IDLE])
+        self.assertEqual(reload_states, [SessionStatus.RUNNING])
         self.assertEqual(save_states, [SessionStatus.IDLE])
 
 

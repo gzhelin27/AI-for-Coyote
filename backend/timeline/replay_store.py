@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -211,34 +212,49 @@ class ReplayStore:
                 temporary_path.unlink(missing_ok=True)
 
     def load(self, replay_id: str) -> ReplayBundle:
-        with self._open_contained(replay_id) as archive_file:
-            return self._load_opened(replay_id, archive_file)
+        _, bundle = self._read_validated_snapshot(replay_id)
+        return bundle
 
     def open_validated(self, replay_id: str) -> BinaryIO:
-        """Return the exact opened archive after validating that same handle."""
-        archive_file = self._open_contained(replay_id)
-        try:
-            self._load_opened(replay_id, archive_file)
-            archive_file.seek(0)
-            return archive_file
-        except BaseException:
-            archive_file.close()
-            raise
+        """Return an in-memory handle over the exact validated snapshot."""
+        return io.BytesIO(self.read_validated(replay_id))
 
     def read_validated(self, replay_id: str) -> bytes:
-        """Read bounded immutable bytes from a validated handle, then close it."""
-        archive_file = self.open_validated(replay_id)
+        """Return the same bounded immutable snapshot that passed validation."""
+        payload, _ = self._read_validated_snapshot(replay_id)
+        return payload
+
+    def _read_validated_snapshot(
+        self, replay_id: str
+    ) -> tuple[bytes, ReplayBundle]:
+        payload = self._read_contained_bytes(replay_id)
+        with io.BytesIO(payload) as archive_file:
+            bundle = self._load_opened(replay_id, archive_file)
+        return payload, bundle
+
+    def _read_contained_bytes(self, replay_id: str) -> bytes:
+        archive_file = self._open_contained(replay_id)
+        chunks: list[bytes] = []
+        total = 0
         try:
-            payload = archive_file.read(_MAX_ARCHIVE_SIZE + 1)
-            if len(payload) > _MAX_ARCHIVE_SIZE:
-                raise ReplayStoreError("replay archive size exceeds limit")
-            return payload
+            while True:
+                remaining = _MAX_ARCHIVE_SIZE + 1 - total
+                chunk = archive_file.read(min(64 * 1024, remaining))
+                if chunk == b"":
+                    break
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise ReplayStoreError("could not load replay archive")
+                total += len(chunk)
+                if total > _MAX_ARCHIVE_SIZE:
+                    raise ReplayStoreError("replay archive size exceeds limit")
+                chunks.append(bytes(chunk))
         except ReplayStoreError:
             raise
         except OSError as exc:
             raise ReplayStoreError("could not load replay archive") from exc
         finally:
             archive_file.close()
+        return b"".join(chunks)
 
     def _open_contained(self, replay_id: str) -> BinaryIO:
         self._validate_replay_id(replay_id)
@@ -269,6 +285,9 @@ class ReplayStore:
         ):
             archive_file.close()
             raise ReplayStoreError("replay archive changed while opening")
+        if opened.st_size > _MAX_ARCHIVE_SIZE:
+            archive_file.close()
+            raise ReplayStoreError("replay archive size exceeds limit")
         return archive_file
 
     def _load_opened(

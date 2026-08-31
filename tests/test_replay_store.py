@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -153,6 +154,90 @@ class ReplayStoreTests(unittest.TestCase):
                 self.assertRaisesRegex(ReplayStoreError, "unsafe"),
             ):
                 store.open_validated(bundle.manifest.replay_id)
+
+    def test_read_validated_returns_the_same_bytes_it_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[7], status="completed")
+            archive_path = store.save(bundle.manifest, bundle.timeline)
+            original_bytes = archive_path.read_bytes()
+            unvalidated_bytes = b"UNVALIDATED_AFTER_SCHEMA_CHECK"
+            source = io.BytesIO(original_bytes)
+            load_opened = store._load_opened
+
+            def validate_then_mutate(replay_id, archive_file):
+                result = load_opened(replay_id, archive_file)
+                if archive_file is source:
+                    source.seek(0)
+                    source.truncate()
+                    source.write(unvalidated_bytes)
+                    source.seek(0)
+                return result
+
+            with (
+                patch.object(store, "_open_contained", return_value=source),
+                patch.object(
+                    store,
+                    "_load_opened",
+                    side_effect=validate_then_mutate,
+                ),
+            ):
+                downloaded_bytes = store.read_validated(
+                    bundle.manifest.replay_id
+                )
+
+            self.assertEqual(downloaded_bytes, original_bytes)
+            self.assertNotEqual(downloaded_bytes, unvalidated_bytes)
+            self.assertTrue(source.closed)
+
+    def test_read_validated_accumulates_short_reads_until_eof(self):
+        class ArtificialShortReader:
+            def __init__(self, payload: bytes) -> None:
+                self.buffer = io.BytesIO(payload)
+                self.validation_mode = False
+                self.short_read_calls = 0
+
+            def read(self, size: int = -1) -> bytes:
+                if not self.validation_mode:
+                    self.short_read_calls += 1
+                    size = 7 if size < 0 else min(size, 7)
+                return self.buffer.read(size)
+
+            def __getattr__(self, name):
+                return getattr(self.buffer, name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[7], status="completed")
+            archive_path = store.save(bundle.manifest, bundle.timeline)
+            original_bytes = archive_path.read_bytes()
+            source = ArtificialShortReader(original_bytes)
+            load_opened = store._load_opened
+
+            def validate_with_regular_reads(replay_id, archive_file):
+                if archive_file is source:
+                    source.validation_mode = True
+                    try:
+                        return load_opened(replay_id, archive_file)
+                    finally:
+                        source.validation_mode = False
+                return load_opened(replay_id, archive_file)
+
+            with (
+                patch.object(store, "_open_contained", return_value=source),
+                patch.object(
+                    store,
+                    "_load_opened",
+                    side_effect=validate_with_regular_reads,
+                ),
+            ):
+                downloaded_bytes = store.read_validated(
+                    bundle.manifest.replay_id
+                )
+
+            self.assertEqual(downloaded_bytes, original_bytes)
+            self.assertGreater(source.short_read_calls, 1)
+            self.assertTrue(source.closed)
 
     def test_rejects_path_unsafe_archive_before_reading_payload(self):
         with tempfile.TemporaryDirectory() as tmp:

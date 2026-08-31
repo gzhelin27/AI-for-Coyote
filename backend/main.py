@@ -8,6 +8,7 @@
 """
 import asyncio
 import contextlib
+from copy import deepcopy
 import io
 import os
 import re
@@ -755,20 +756,16 @@ def make_app() -> FastAPI:
         requested_profile = str(body.get("profile") or "").strip()
         try:
             async with state.timeline_transition_lock:
-                session_state = state.timeline_session.to_state()
-                if (
-                    session_state.mode == "autopilot"
-                    and session_state.status.value != "idle"
-                ):
-                    await state.loop.finish_timeline_session()
-                    await state.set_sensors(False)
-                reload_character(cfg)
+                candidate_cfg = deepcopy(cfg)
+                reload_character(candidate_cfg)
                 roles = {
                     item["name"]: item
-                    for item in (cfg["character"].get("roles") or [])
+                    for item in (
+                        candidate_cfg["character"].get("roles") or []
+                    )
                 }
                 role = requested_role or str(
-                    cfg["character"].get("role") or ""
+                    candidate_cfg["character"].get("role") or ""
                 )
                 if role not in roles:
                     return JSONResponse(
@@ -796,6 +793,13 @@ def make_app() -> FastAPI:
                         },
                         status_code=400,
                     )
+                session_state = state.timeline_session.to_state()
+                if (
+                    session_state.mode == "autopilot"
+                    and session_state.status.value != "idle"
+                ):
+                    await state.loop.finish_timeline_session()
+                    await state.set_sensors(False)
                 save_character_runtime(cfg, role=role, profile=profile)
                 payload = {
                     "ok": True,
