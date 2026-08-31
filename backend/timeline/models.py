@@ -44,6 +44,13 @@ def _optional_strength(value: object, name: str) -> int | None:
     return strength
 
 
+def _required_strength(value: object, name: str) -> int:
+    strength = _optional_strength(value, name)
+    if strength is None:
+        raise ValueError(f"{name} must be in 0..200")
+    return strength
+
+
 @dataclass(frozen=True)
 class CycleGapPolicy:
     """The one project-wide, integer-tenths cycle-gap distribution."""
@@ -218,8 +225,8 @@ class CycleRecord:
         for value, name in ((self.plot_event_id, "plot_event_id"), (self.pattern, "pattern"), (self.waveform_hash, "waveform_hash")):
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{name} must be a non-empty string")
-        _optional_strength(self.requested_strength, "requested_strength")
-        _optional_strength(self.effective_strength, "effective_strength")
+        _required_strength(self.requested_strength, "requested_strength")
+        _required_strength(self.effective_strength, "effective_strength")
         _require_non_negative_int(self.active_start_offset_ms, "active_start_offset_ms")
         if isinstance(self.raw_duration_ms, bool) or not isinstance(self.raw_duration_ms, int) or self.raw_duration_ms <= 0:
             raise ValueError("raw_duration_ms must be positive")
@@ -345,6 +352,37 @@ class ReplayManifest:
             raise ValueError("seed must be an integer")
         if not isinstance(self.status, SessionStatus):
             raise ValueError("status must be a SessionStatus")
+        for value, name in (
+            (self.app_commit, "app_commit"),
+            (self.model, "model"),
+            (self.dlc_role, "dlc_role"),
+            (self.dlc_profile, "dlc_profile"),
+            (self.dlc_version, "dlc_version"),
+            (self.created_at, "created_at"),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string")
+        for value, name in ((self.completed_at, "completed_at"), (self.source_hash, "source_hash")):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{name} must be a string when provided")
+        for value, name in (
+            (self.random_profile, "random_profile"),
+            (self.safety_caps, "safety_caps"),
+            (self.checksums, "checksums"),
+        ):
+            if value is not None:
+                mapping = _require_mapping(value, name)
+                if not all(isinstance(key, str) for key in mapping):
+                    raise ValueError(f"{name} keys must be strings")
+        if self.safety_caps is not None and any(
+            isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= 200
+            for cap in self.safety_caps.values()
+        ):
+            raise ValueError("safety_caps values must be strengths in 0..200")
+        if self.checksums is not None and any(
+            not isinstance(checksum, str) for checksum in self.checksums.values()
+        ):
+            raise ValueError("checksums values must be strings")
         if not isinstance(self.adjusted, bool):
             raise ValueError("adjusted must be a boolean")
 
@@ -378,14 +416,21 @@ class ReplayManifest:
             status = SessionStatus(data["status"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("replay manifest has an invalid status") from exc
-        values = {field: data.get(field) for field in cls.__dataclass_fields__}
-        values.update(
-            schema_version=data["schema_version"],
-            status=status,
-            random_profile=data.get("random_profile") or {},
-            safety_caps=data.get("safety_caps") or {},
-            checksums=data.get("checksums") or {},
-        )
+        values = {
+            "schema_version": data["schema_version"],
+            "replay_id": data.get("replay_id"),
+            "session_id": data.get("session_id"),
+            "seed": data.get("seed"),
+            "status": status,
+            "mode": data.get("mode"),
+        }
+        for field in (
+            "app_commit", "model", "dlc_role", "dlc_profile", "dlc_version",
+            "random_profile", "safety_caps", "created_at", "completed_at",
+            "source_hash", "checksums", "adjusted",
+        ):
+            if field in data:
+                values[field] = data[field]
         return cls(**values)
 
 
