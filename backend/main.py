@@ -16,7 +16,6 @@ import os
 import re
 import secrets
 import socket
-import subprocess
 import sys
 import urllib.parse
 import zipfile
@@ -46,6 +45,7 @@ from .config import (
 from .game_loop import GameLoop
 from .llm import LLM
 from .logging_utils import setup_logging
+from .provenance import runtime_content_fingerprint
 from .relay_client import RelayClient
 from .safety import DeviceOutputError, SafetyManager
 from .timeline.models import CycleGapPolicy
@@ -59,71 +59,39 @@ else:
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
-_RUNTIME_FINGERPRINT_FILES = (
-    "backend/__init__.py",
-    "backend/audio.py",
-    "backend/camera.py",
-    "backend/config.py",
-    "backend/device_ops.py",
-    "backend/game_loop.py",
-    "backend/llm.py",
-    "backend/logging_utils.py",
-    "backend/main.py",
-    "backend/output_coordinator.py",
-    "backend/relay_client.py",
-    "backend/safety.py",
-    "backend/timeline/__init__.py",
-    "backend/timeline/cycle_runner.py",
-    "backend/timeline/models.py",
-    "backend/timeline/player.py",
-    "backend/timeline/randomizer.py",
-    "backend/timeline/replay_store.py",
-    "backend/timeline/session.py",
-    "backend/waveforms.py",
-)
-
-
 def _release_version() -> str:
-    """Return a stable released or source-control version when available."""
+    """Return only a safe release label suitable for public display."""
     f = PROJECT_ROOT / "version.txt"
     if f.exists():
         v = f.read_text(encoding="utf-8").strip().lstrip("\ufeff")
-        if v:
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", v)
+            and not re.fullmatch(r"[0-9a-fA-F]{40,64}", v)
+        ):
             return v
-    configured = str(os.environ.get("AI_COYOTE_APP_COMMIT") or "").strip()
-    if configured:
-        return configured
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=PROJECT_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        commit = result.stdout.strip()
-        if re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
-            return commit.lower()
-    except (OSError, subprocess.SubprocessError):
-        pass
     return ""
 
 
+def _bundled_runtime_content_fingerprint() -> str:
+    """Read the build-generated content identity embedded beside this module."""
+    resource_path = Path(__file__).with_name("runtime_fingerprint.json")
+    try:
+        payload = json.loads(resource_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("bundled runtime fingerprint is unavailable") from exc
+    fingerprint = payload.get("content_fingerprint") if isinstance(payload, dict) else None
+    if not isinstance(fingerprint, str) or not re.fullmatch(
+        r"source-sha256:[0-9a-f]{64}", fingerprint
+    ):
+        raise RuntimeError("bundled runtime fingerprint is invalid")
+    return fingerprint
+
+
 def _runtime_content_fingerprint() -> str:
-    """Hash the allowlisted runtime sources with unambiguous path boundaries."""
-    digest = hashlib.sha256()
-    for relative_path in _RUNTIME_FINGERPRINT_FILES:
-        source_path = PROJECT_ROOT / relative_path
-        try:
-            source_bytes = source_path.read_bytes()
-        except OSError:
-            continue
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(source_bytes)
-        digest.update(b"\0")
-    return f"source-sha256:{digest.hexdigest()}"
+    """Return loose-source identity or the embedded onefile build identity."""
+    if getattr(sys, "frozen", False):
+        return _bundled_runtime_content_fingerprint()
+    return runtime_content_fingerprint(PROJECT_ROOT)
 
 
 def _app_version() -> str:
@@ -138,7 +106,9 @@ def _public_app_version() -> str:
     return _release_version() or "development"
 
 
-def _dlc_provenance(cfg: dict) -> str:
+def _dlc_provenance(
+    cfg: dict, *, waveform_policy: str | None = None
+) -> str:
     character = cfg.get("character") or {}
     prompt_file = str(character.get("prompt_file") or "")
     prompt_path = Path(prompt_file)
@@ -155,10 +125,12 @@ def _dlc_provenance(cfg: dict) -> str:
             character.get("dlc_version") or character.get("name") or "default"
         ),
         "prompt": str(character.get("prompt") or ""),
-        "examples": character.get("examples") or [],
+        "examples": list(character.get("examples") or [])[:8],
         "prompt_file_sha256": prompt_file_sha256,
         "waveform_policy": str(
-            (cfg.get("timeline") or {}).get("waveform_policy") or ""
+            waveform_policy
+            if waveform_policy is not None
+            else (cfg.get("timeline") or {}).get("waveform_policy") or ""
         ),
     }
     encoded = json.dumps(
@@ -308,7 +280,9 @@ class AppState:
     def _timeline_manifest_metadata(self) -> dict[str, str]:
         """Snapshot provenance when a new live session actually begins."""
         app_fingerprint = _app_version()
-        dlc_fingerprint = _dlc_provenance(self.cfg)
+        dlc_fingerprint = _dlc_provenance(
+            self.cfg, waveform_policy=self.timeline_session.waveform_policy
+        )
         dlc_version = str(
             self.cfg["character"].get("dlc_version") or dlc_fingerprint
         )

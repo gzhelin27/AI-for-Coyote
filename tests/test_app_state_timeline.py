@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -197,21 +198,145 @@ class ProductionAppStateTimelineTests(unittest.IsolatedAsyncioTestCase):
         waveform_policy["timeline"]["waveform_policy"] = "changed-policy"
         self.assertNotEqual(main_module._dlc_provenance(waveform_policy), baseline)
 
+    def test_dlc_fingerprint_uses_only_examples_the_llm_consumes(self):
+        self.cfg["character"].pop("dlc_version")
+        self.cfg["character"]["examples"] = [
+            {"user": f"user {index}", "assistant": f"assistant {index}"}
+            for index in range(9)
+        ]
+        baseline = main_module._dlc_provenance(self.cfg)
+
+        unused_example = deepcopy(self.cfg)
+        unused_example["character"]["examples"][8]["assistant"] = "changed unused"
+        self.assertEqual(main_module._dlc_provenance(unused_example), baseline)
+
+        used_example = deepcopy(self.cfg)
+        used_example["character"]["examples"][7]["assistant"] = "changed used"
+        self.assertNotEqual(main_module._dlc_provenance(used_example), baseline)
+
     def test_app_fingerprint_tracks_allowlisted_runtime_sources_beyond_main(self):
         source_root = self.root / "source"
         (source_root / "backend").mkdir(parents=True)
         (source_root / "backend" / "main.py").write_bytes(b"main")
         safety = source_root / "backend" / "safety.py"
         safety.write_bytes(b"safety one")
-        with (
-            patch.object(main_module, "PROJECT_ROOT", source_root),
-            patch.object(main_module.subprocess, "run", side_effect=OSError("no git")),
-        ):
+        with patch.object(main_module, "PROJECT_ROOT", source_root):
             baseline = main_module._app_version()
             safety.write_bytes(b"safety two")
             changed = main_module._app_version()
 
         self.assertNotEqual(changed, baseline)
+
+    def test_app_fingerprint_tracks_runtime_configuration_schema_files(self):
+        source_root = self.root / "source"
+        (source_root / "backend").mkdir(parents=True)
+        (source_root / "backend" / "main.py").write_bytes(b"main")
+        config = source_root / "config"
+        config.mkdir()
+        waveforms = config / "waveforms.yaml"
+        waveforms.write_bytes(b"presets: {one: {}}")
+        with patch.object(main_module, "PROJECT_ROOT", source_root):
+            baseline = main_module._app_version()
+            waveforms.write_bytes(b"presets: {two: {}}")
+            changed = main_module._app_version()
+
+        self.assertNotEqual(changed, baseline)
+
+    def test_frozen_runtime_uses_bundled_fingerprint_without_loose_sources(self):
+        source_root = self.root / "frozen-root"
+        source_root.mkdir()
+        bundle_backend = self.root / "bundle" / "backend"
+        bundle_backend.mkdir(parents=True)
+        bundled = "source-sha256:" + "a" * 64
+        (bundle_backend / "runtime_fingerprint.json").write_text(
+            json.dumps({"content_fingerprint": bundled}), encoding="utf-8"
+        )
+        with (
+            patch.object(main_module, "PROJECT_ROOT", source_root),
+            patch.object(main_module.sys, "frozen", True, create=True),
+            patch.object(main_module, "__file__", str(bundle_backend / "main.py")),
+        ):
+            self.assertEqual(main_module._runtime_content_fingerprint(), bundled)
+
+    def test_frozen_runtime_without_any_fingerprint_content_fails_closed(self):
+        source_root = self.root / "frozen-root"
+        source_root.mkdir()
+        bundle_backend = self.root / "bundle" / "backend"
+        bundle_backend.mkdir(parents=True)
+        with (
+            patch.object(main_module, "PROJECT_ROOT", source_root),
+            patch.object(main_module.sys, "frozen", True, create=True),
+            patch.object(main_module, "__file__", str(bundle_backend / "main.py")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                main_module._runtime_content_fingerprint()
+
+    def test_public_and_provenance_versions_ignore_commit_environment_and_git(self):
+        source_root = self.root / "source"
+        (source_root / "backend").mkdir(parents=True)
+        (source_root / "backend" / "main.py").write_bytes(b"main")
+        commit = "a" * 40
+        with (
+            patch.object(main_module, "PROJECT_ROOT", source_root),
+            patch.dict(os.environ, {"AI_COYOTE_APP_COMMIT": commit}),
+        ):
+            self.assertEqual(main_module._public_app_version(), "development")
+            self.assertNotIn(commit, main_module._app_version())
+            with self._fake_external_dependencies():
+                state = main_module.AppState(self.cfg)
+            config_info = state.build_state()["config_info"]
+            self.assertEqual(config_info["version"], "development")
+            self.assertNotIn(commit, json.dumps(config_info))
+
+    async def test_live_session_fingerprint_matches_the_character_passed_to_llm(self):
+        self.cfg["character"].pop("dlc_version")
+        Path(self.cfg["character_file"]).write_text(
+            """role: role-one
+profile: profile-one
+prompt: loaded prompt
+roles:
+  role-one:
+    name: Loaded DLC
+    title: owner
+    profiles:
+      profile-one:
+        level: 中
+        examples:
+          - user: loaded user
+            assistant: loaded assistant
+""",
+            encoding="utf-8",
+        )
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+            await state.loop.start_timeline_session()
+            try:
+                await state.loop._autopilot_turn()
+                actual_character = self.llm.chat.await_args.args[0]
+                expected = main_module._dlc_provenance(state.cfg)
+                summary = await state.loop.finish_timeline_session()
+            finally:
+                if state.timeline_session.to_state().status.value != "idle":
+                    await state.loop.stop_timeline_session()
+
+        manifest = state.replay_store.load(summary.replay_id).manifest
+        self.assertEqual(actual_character["prompt"], "loaded prompt")
+        self.assertEqual(
+            actual_character["examples"],
+            [{"user": "loaded user", "assistant": "loaded assistant"}],
+        )
+        self.assertEqual(manifest.dlc_fingerprint, expected)
+
+    async def test_manifest_uses_controller_waveform_policy_after_config_drift(self):
+        self.cfg["character"].pop("dlc_version")
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+        baseline = state._timeline_manifest_metadata()["dlc_fingerprint"]
+        self.cfg["timeline"]["waveform_policy"] = "invalid-after-construction"
+
+        self.assertEqual(
+            state._timeline_manifest_metadata()["dlc_fingerprint"], baseline
+        )
 
     def test_public_state_and_replay_summaries_redact_provenance_hashes(self):
         with (
@@ -238,17 +363,13 @@ class ProductionAppStateTimelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("sha256", encoded)
             self.assertNotIn("\"seed\"", encoded)
 
-    def test_source_app_version_fallback_is_a_fingerprint_not_dev(self):
+    def test_source_app_version_fails_closed_without_any_allowlisted_content(self):
         source_root = self.root / "source"
         source_root.mkdir()
         (source_root / "version.txt").unlink(missing_ok=True)
-        with (
-            patch.object(main_module, "PROJECT_ROOT", source_root),
-            patch.object(main_module.subprocess, "run", side_effect=OSError("no git")),
-        ):
-            version = main_module._app_version()
-
-        self.assertRegex(version, r"^source-sha256:[0-9a-f]{64}$")
+        with patch.object(main_module, "PROJECT_ROOT", source_root):
+            with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                main_module._app_version()
 
     async def test_real_app_lifespan_stops_active_replay_without_archive_when_auto_clear_off(self):
         self.cfg["safety"]["auto_clear_on_disconnect"] = False

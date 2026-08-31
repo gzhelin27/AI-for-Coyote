@@ -619,6 +619,41 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(state.adjusted)
 
+    async def test_failed_replay_setup_leaves_idle_state_without_adjustment(self):
+        controller = SessionHarness.create(seed=143)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([20], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+
+        with patch.object(
+            controller.controller,
+            "_set_player_output_generations",
+            side_effect=ValueError("setup failed"),
+        ), self.assertRaisesRegex(ValueError, "setup failed"):
+            await controller.start_replay(bundle.manifest.replay_id)
+
+        state = controller.to_state()
+        self.assertEqual(state.status, SessionStatus.IDLE)
+        self.assertFalse(state.adjusted)
+
+    async def test_matching_replay_provenance_remains_exact(self):
+        controller = SessionHarness.create(seed=144)
+        self.addAsyncCleanup(controller.close)
+        controller._manifest_metadata.update(
+            {"app_fingerprint": "current-app", "dlc_fingerprint": "current-dlc"}
+        )
+        bundle = make_replay_bundle([20], "completed")
+        manifest = replace(
+            bundle.manifest,
+            app_fingerprint="current-app",
+            dlc_fingerprint="current-dlc",
+        )
+        controller.store.save(manifest, bundle.timeline)
+
+        state = await controller.start_replay(manifest.replay_id)
+
+        self.assertFalse(state.adjusted)
+
     async def test_empty_replay_clears_then_returns_controller_to_idle(self):
         controller = SessionHarness.create(seed=27)
         self.addAsyncCleanup(controller.close)

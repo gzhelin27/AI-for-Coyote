@@ -550,22 +550,27 @@ class SessionController:
                 clock=self._clock,
                 sleeper=self._sleeper,
             )
-            player.load(bundle)
-            player.validate_cursor(cursor)
-            self._replay_identity_adjusted = not self._provenance_matches(
-                bundle.manifest, self._current_manifest_metadata()
-            )
-            self._set_player_output_generations(player)
-            self._player = player
-            self._mode = "replay"
-            self._set_status(SessionStatus.REPLAYING)
-            self._session_id = bundle.manifest.session_id
-            self._replay_id = bundle.manifest.replay_id
-            self._current_event_id = None
-            if cursor:
-                await player.resume(cursor)
-            else:
-                await player.start()
+            try:
+                player.load(bundle)
+                player.validate_cursor(cursor)
+                identity_adjusted = not self._provenance_matches(
+                    bundle.manifest, self._current_manifest_metadata()
+                )
+                self._set_player_output_generations(player)
+                self._player = player
+                self._mode = "replay"
+                self._set_status(SessionStatus.REPLAYING)
+                self._session_id = bundle.manifest.session_id
+                self._replay_id = bundle.manifest.replay_id
+                self._current_event_id = None
+                if cursor:
+                    await player.resume(cursor)
+                else:
+                    await player.start()
+            except Exception:
+                self._reset_idle()
+                raise
+            self._replay_identity_adjusted = identity_adjusted
             self._start_player_watcher_locked(player)
             return self.to_state()
 

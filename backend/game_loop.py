@@ -8,10 +8,12 @@ AddIntensity（相对增减）是最可靠的原语。因此所有强度命令�
 「AddIntensity(目标 - 当前)」实现绝对控制，设备上报值即最终强度。
 """
 import asyncio
+from copy import deepcopy
 import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import reload_character
 from .device_ops import CHANNEL, DeviceOps
@@ -104,6 +106,7 @@ class GameLoop:
         )
         self.on_ai_turn = None                 # 由 AppState 注入：把 AI 主动回合推送到页面
         self.timeline_session = None            # 由 AppState 注入：确定性会话/重放控制器
+        self._timeline_character: dict | None = None
 
         # 双通道保底：轮次计数 + 每通道最近一次强度/波形调整轮次
         self.turn_count = 0
@@ -137,6 +140,7 @@ class GameLoop:
             self.rage_rounds = 0
 
     def build_state(self) -> dict:
+        character = self._timeline_character or self.cfg["character"]
         relay_state = self.relay.to_state()
         state = self.safety.to_state()
         state["relay_status"] = relay_state["status"]
@@ -167,16 +171,16 @@ class GameLoop:
             except (TypeError, ValueError):
                 value = 15 if ch == "A" else 5
             state["baseline_strength"][ch] = max(0, min(100, value))
-        state["rage_rounds"] = self.rage_rounds + int(self.cfg["character"].get("rage_baseline") or 0)
+        state["rage_rounds"] = self.rage_rounds + int(character.get("rage_baseline") or 0)
         state["rage_triggered"] = self.rage_triggered
         # 角色与风格版本（多角色两级：角色 → 风格档），页面切换用
-        state["role"] = str(self.cfg["character"].get("role") or "触手")
-        state["role_title"] = str(self.cfg["character"].get("role_title") or "主人")
-        state["roles"] = list(self.cfg["character"].get("roles") or [])
-        state["profile"] = str(self.cfg["character"].get("profile") or "纯爱")
-        state["profiles"] = list(self.cfg["character"].get("profiles") or ["纯爱"])
-        state["profile_available"] = dict(self.cfg["character"].get("profile_available") or {})
-        state["profile_level"] = str(self.cfg["character"].get("profile_level") or "中")
+        state["role"] = str(character.get("role") or "触手")
+        state["role_title"] = str(character.get("role_title") or "主人")
+        state["roles"] = list(character.get("roles") or [])
+        state["profile"] = str(character.get("profile") or "纯爱")
+        state["profiles"] = list(character.get("profiles") or ["纯爱"])
+        state["profile_available"] = dict(character.get("profile_available") or {})
+        state["profile_level"] = str(character.get("profile_level") or "中")
         state["autopilot"] = bool(self.autopilot)
         state["autopilot_interval_s"] = self.autopilot_interval
         # 安全层内部需要原始波形帧，但 HTTP/WebSocket 状态只公开显示元数据。
@@ -196,12 +200,19 @@ class GameLoop:
         self.history.clear()
         logger.info("对话历史已清空")
 
+    def _character_for_turn(self) -> dict:
+        if self._timeline_character is not None:
+            return self._timeline_character
+        if Path(str(self.cfg.get("character_file") or "")).exists():
+            reload_character(self.cfg)
+        return self.cfg["character"]
+
     async def handle_user_message(self, text: str) -> dict:
         text = (text or "").strip()
         if not text:
             return {"line": "", "executed": [], "dropped": []}
         action_origin = self._capture_ai_action_origin()
-        reload_character(self.cfg)  # 角色设定热加载：改完保存，下一条消息生效
+        character = self._character_for_turn()
 
         self.history.append({"role": "user", "content": text})
         self.history = self.history[-self.keep:]
@@ -213,7 +224,7 @@ class GameLoop:
             error = None
             try:
                 line, actions = await self.llm.chat(
-                    self.cfg["character"], self.history, state,
+                    character, self.history, state,
                     image_b64=self._latest_image(),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -249,7 +260,7 @@ class GameLoop:
     async def auto_open(self) -> dict:
         """场景开始：AI 主动开口挑逗并给出第一个轻微试探。"""
         action_origin = self._capture_ai_action_origin()
-        reload_character(self.cfg)
+        character = self._character_for_turn()
         self._note_rage()
         state = self.build_state()
         prompt_msg = {
@@ -267,7 +278,7 @@ class GameLoop:
         try:
             try:
                 line, actions = await self.llm.chat(
-                    self.cfg["character"], self.history, state,
+                    character, self.history, state,
                     image_b64=self._latest_image(),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -335,7 +346,7 @@ class GameLoop:
     async def _auto_observe_turn(self) -> dict | None:
         """观察最新画面，决定是否调整，并把台词推给页面（由调用方广播）。"""
         action_origin = self._capture_ai_action_origin()
-        reload_character(self.cfg)
+        character = self._character_for_turn()
         self._note_rage()
         state = self.build_state()
         prompt_msg = {
@@ -353,7 +364,7 @@ class GameLoop:
         try:
             try:
                 line, actions = await self.llm.chat(
-                    self.cfg["character"], self.history, state,
+                    character, self.history, state,
                     image_b64=self._latest_image(),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -376,9 +387,29 @@ class GameLoop:
         async with self._autopilot_transition_lock:
             if self.timeline_session is None:
                 raise RuntimeError("timeline session is unavailable")
-            session_state = await self.timeline_session.start_live()
+            session_state = await self._start_live_session()
             self._start_autopilot_task()
             return session_state
+
+    async def _start_live_session(self):
+        """Reload once, then freeze the exact character input for this session."""
+        if Path(str(self.cfg.get("character_file") or "")).exists():
+            reload_character(self.cfg)
+        character = deepcopy(self.cfg["character"])
+        try:
+            result = await self.timeline_session.start_live()
+        except Exception:
+            self._timeline_character = None
+            raise
+        self._timeline_character = character
+        return result
+
+    def _clear_timeline_character_if_idle(self) -> None:
+        if (
+            self.timeline_session is not None
+            and self.timeline_session.to_state().status.value == "idle"
+        ):
+            self._timeline_character = None
 
     async def resume_timeline_session(self, cursor: int | None = None):
         """Atomically resume live recording and its automatic turn task."""
@@ -538,7 +569,10 @@ class GameLoop:
                     if session_state.mode not in (None, "autopilot"):
                         raise RuntimeError("replay playback is active")
                     if session_state.status.value in ("idle", "paused"):
-                        await self.timeline_session.start_live()
+                        if session_state.status.value == "idle":
+                            await self._start_live_session()
+                        else:
+                            await self.timeline_session.start_live()
                     elif session_state.status.value != "running":
                         raise RuntimeError("live session transition is already in progress")
                 self._start_autopilot_task()
@@ -568,9 +602,11 @@ class GameLoop:
             if self.timeline_session is None:
                 raise RuntimeError("timeline session is unavailable")
             try:
-                return await self._await_timeline_lifecycle(
+                result = await self._await_timeline_lifecycle(
                     self.timeline_session.finish
                 )
+                self._clear_timeline_character_if_idle()
+                return result
             finally:
                 await self._stop_autopilot_task()
 
@@ -580,9 +616,11 @@ class GameLoop:
             try:
                 if self.timeline_session is None:
                     raise RuntimeError("timeline session is unavailable")
-                return await self._await_timeline_lifecycle(
+                result = await self._await_timeline_lifecycle(
                     self.timeline_session.stop
                 )
+                self._clear_timeline_character_if_idle()
+                return result
             finally:
                 await self._stop_autopilot_task()
 
@@ -644,7 +682,7 @@ class GameLoop:
 
     async def _autopilot_turn(self) -> dict | None:
         action_origin = self._capture_ai_action_origin()
-        reload_character(self.cfg)
+        character = self._character_for_turn()
         self._note_rage()
         state = self.build_state()
         has_ai = any(m["role"] == "assistant" for m in self.history)
@@ -667,7 +705,7 @@ class GameLoop:
         try:
             try:
                 line, actions = await self.llm.chat(
-                    self.cfg["character"], self.history, state,
+                    character, self.history, state,
                     image_b64=self._latest_image(),
                 )
             except Exception as exc:  # noqa: BLE001
