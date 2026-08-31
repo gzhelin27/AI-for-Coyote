@@ -7,6 +7,8 @@ export default function ChatPanel() {
   const messages = useChat((st) => st.messages);
   const pushMsg = useChat((st) => st.push);
   const clearChat = useChat((st) => st.clear);
+  const busy = useChat((st) => st.busy);
+  const setBusy = useChat((st) => st.setBusy);
   const autopilot = useApp((st) => st.state?.autopilot ?? false);
   const relay = useApp((st) => st.state?.relay);
   const paired = relay?.status === "paired";
@@ -15,6 +17,8 @@ export default function ChatPanel() {
   const profile = useApp((st) => st.state?.profile ?? "纯爱");
   const level = useApp((st) => st.state?.profile_level ?? "中");
   const [pairUrl, setPairUrl] = useState("");
+  const [input, setInput] = useState("");
+  const [sendError, setSendError] = useState("");
   const boxRef = useRef<HTMLDivElement>(null);
 
   // 切换角色/风格档时插一条系统分隔消息，防上下文串戏
@@ -47,6 +51,30 @@ export default function ChatPanel() {
       await api.setAutopilot(!autopilot);
     } catch {
       /* 状态由 ws 推送刷新 */
+    }
+  };
+
+  const send = async () => {
+    const message = input.trim();
+    if (!message || busy) return;
+    setInput("");
+    setSendError("");
+    pushMsg({ role: "user", text: message });
+    setBusy(true);
+    try {
+      const result = await api.chat(message);
+      const actions = (result.executed ?? []).map((item) => item.label).filter(Boolean);
+      pushMsg({
+        role: "ai",
+        text: result.line || "（AI 没有返回文字）",
+        actions: actions.join("\n"),
+      });
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "发送失败";
+      setSendError(text);
+      pushMsg({ role: "sys", text: `发送失败：${text}` });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -154,6 +182,34 @@ export default function ChatPanel() {
               )}
             </div>
           ))}
+        </div>
+      )}
+      {paired && (
+        <div className="flex-none border-t border-line p-3">
+          <div className="flex items-end gap-2">
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+              placeholder="输入你想对 AI 说的话…（Enter 发送，Shift+Enter 换行）"
+              rows={2}
+              disabled={busy}
+              className="min-h-[58px] flex-1 resize-none rounded-lg border border-line bg-ink3 px-3 py-2 text-[13px] text-text outline-none placeholder:text-faint focus:border-accent disabled:opacity-60"
+            />
+            <button
+              onClick={() => void send()}
+              disabled={busy || !input.trim()}
+              className="h-[58px] rounded-lg bg-accent px-4 text-[13px] font-semibold text-ink transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {busy ? "生成中…" : "发送"}
+            </button>
+          </div>
+          {sendError && <div className="mt-1.5 text-[11px] text-bad">{sendError}</div>}
         </div>
       )}
     </aside>
