@@ -20,6 +20,62 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.store.list(), [])
         self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
 
+    async def test_pause_clear_failure_blocks_output_until_pause_retries(self):
+        controller = SessionHarness.create(seed=22)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        controller.game_loop.clear_failures_remaining = 1
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.pause()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.resume()
+        await controller.pause()
+        await controller.resume()
+        self.assertEqual(controller.clear_calls, [None, None])
+        self.assertEqual(controller.to_state().status, SessionStatus.RUNNING)
+
+    async def test_finish_clear_failure_can_retry_finish_without_early_save(self):
+        controller = SessionHarness.create(seed=23)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        controller.game_loop.clear_failures_remaining = 1
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.finish()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.store.list(), [])
+        summary = await controller.finish()
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(
+            [item.replay_id for item in controller.store.list()],
+            [summary.replay_id],
+        )
+        self.assertEqual(controller.clear_calls, [None, None])
+
+    async def test_stop_retries_clear_after_failed_finish_before_idle(self):
+        controller = SessionHarness.create(seed=24)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        controller.game_loop.clear_failures_remaining = 2
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.finish()
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.stop()
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        await controller.stop()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(controller.clear_calls, [None, None, None])
+        self.assertEqual(controller.store.list(), [])
+
     async def test_finish_saves_generated_gaps_without_manual_pause_time(self):
         controller = SessionHarness.create(seed=9)
         self.addAsyncCleanup(controller.close)
@@ -192,6 +248,42 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.to_state().status, SessionStatus.RUNNING)
         self.assertEqual(controller.store.list(), [])
 
+    async def test_replacement_cannot_cancel_pending_failed_runner_clear(self):
+        controller = SessionHarness.create(seed=25)
+        self.addAsyncCleanup(controller.close)
+        controller.game_loop.fail_on_cycle = 1
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        controller.game_loop.fail_on_cycle = None
+        self.assertEqual(controller.game_loop.operation_log, [])
+
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 21}]
+        )
+
+        self.assertEqual(controller.game_loop.operation_log, ["clear:A", "cycle:A"])
+
+    async def test_replacement_cannot_cancel_pending_disconnect_pause(self):
+        controller = SessionHarness.create(seed=26)
+        self.addAsyncCleanup(controller.close)
+        controller.game_loop.disconnect_on_cycle = 1
+        await controller.start_live()
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 20}]
+        )
+        controller.game_loop.disconnect_on_cycle = None
+        self.assertEqual(controller.game_loop.operation_log, [])
+
+        await controller.process_live_turn(
+            [{"op": "hold_strength", "channel": "A", "value": 21}]
+        )
+
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(controller.game_loop.operation_log, ["clear:*"])
+        self.assertEqual(controller.game_loop.requested_cycle_actions, [])
+
     async def test_replacement_runner_waits_for_failed_channel_clear(self):
         controller = SessionHarness.create(seed=19)
         self.addAsyncCleanup(controller.close)
@@ -257,6 +349,60 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
         self.assertEqual(len(controller.store.list()), 1)
 
+    async def test_empty_replay_clears_then_returns_controller_to_idle(self):
+        controller = SessionHarness.create(seed=27)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+
+        await controller.start_replay(bundle.manifest.replay_id)
+        for _ in range(20):
+            if controller.to_state().status is SessionStatus.IDLE:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(controller.clear_calls, [None])
+
+    async def test_replay_resume_at_end_replaces_completion_tracking(self):
+        controller = SessionHarness.create(seed=28)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0, 0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        await controller.start_replay(bundle.manifest.replay_id)
+        for _ in range(20):
+            if controller.player is not None and controller.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+        await controller.pause()
+
+        await controller.resume(cursor=2)
+        for _ in range(20):
+            if controller.to_state().status is SessionStatus.IDLE:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(controller.clear_calls, [None, None])
+
+    async def test_running_controller_still_validates_replay_cursor(self):
+        controller = SessionHarness.create(seed=29)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0, 0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        await controller.start_replay(bundle.manifest.replay_id)
+
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            await controller.resume(cursor=3)
+
+    async def test_running_live_controller_rejects_replay_cursor(self):
+        controller = SessionHarness.create(seed=30)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            await controller.resume(cursor=0)
+
     async def test_replay_executor_failure_returns_to_paused_after_clear(self):
         controller = SessionHarness.create(seed=15)
         self.addAsyncCleanup(controller.close)
@@ -273,6 +419,27 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
         self.assertEqual(controller.clear_calls, [None])
         self.assertEqual(len(controller.store.list()), 1)
+
+    async def test_replay_stop_retries_failed_clear_before_idle(self):
+        controller = SessionHarness.create(seed=31)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        controller.game_loop.fail_on_cycle = 1
+        controller.game_loop.clear_failures_remaining = 2
+        await controller.start_replay(bundle.manifest.replay_id)
+        for _ in range(20):
+            if controller.to_state().status is SessionStatus.PAUSED:
+                break
+            await asyncio.sleep(0)
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await controller.stop()
+        self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+        await controller.stop()
+
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(controller.clear_calls, [None, None, None])
 
 
 if __name__ == "__main__":

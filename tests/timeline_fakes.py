@@ -436,6 +436,7 @@ class FakeTimelineGameLoop:
         self.requested_cycle_actions: list[dict[str, Any]] = []
         self.cycle_start_frames: list[int] = []
         self.clear_calls: list[str | None] = []
+        self.operation_log: list[str] = []
         self.clear_failures_remaining = 0
         self.block_channel_clear = False
         self.clear_started = asyncio.Event()
@@ -498,6 +499,7 @@ class FakeTimelineGameLoop:
                         {"action": dict(action), "reason": "device disconnected"}
                     )
                     continue
+                self.operation_log.append(f"cycle:{channel}")
                 requested = dict(action)
                 self.requested_cycle_actions.append(requested)
                 self.cycle_start_frames.append(0)
@@ -532,6 +534,7 @@ class FakeTimelineGameLoop:
         self, channel: str | None = None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         self.clear_calls.append(channel)
+        self.operation_log.append(f"clear:{channel or '*'}")
         if channel is not None and self.block_channel_clear:
             self.clear_started.set()
             await self.release_clear.wait()

@@ -6,6 +6,16 @@ from tests.timeline_fakes import ReplayHarness
 
 
 class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_replay_runs_terminal_clear(self):
+        harness = ReplayHarness([])
+        self.addAsyncCleanup(harness.close)
+
+        await harness.player.start()
+        await harness.player.wait()
+
+        self.assertFalse(harness.player.running)
+        self.assertEqual(harness.executor.clear_calls, [None])
+
     async def test_replay_uses_recorded_cycle_starts_without_rng(self):
         harness = ReplayHarness.from_cycles(gap_tenths=[0, 7, 20])
         self.addAsyncCleanup(harness.close)
@@ -92,6 +102,121 @@ class RecordedCyclePlayerTests(unittest.IsolatedAsyncioTestCase):
             [action["channel"] for action in harness.executor.requested_cycle_actions],
             ["A", "A"],
         )
+
+    async def test_resume_at_end_creates_terminal_clear_task(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if harness.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+        await harness.player.pause()
+
+        await harness.player.resume(len(harness.player.ordered_cycles))
+        result = await asyncio.gather(harness.player.wait(), return_exceptions=True)
+
+        self.assertIsNone(result[0])
+        self.assertFalse(harness.player.running)
+        self.assertEqual(harness.executor.clear_calls, [None, None])
+
+    async def test_running_replay_still_validates_replacement_cursor(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+
+        with self.assertRaisesRegex(ValueError, "cursor"):
+            await harness.player.resume(3)
+
+    async def test_pause_quiesces_in_flight_executor_before_final_clear(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        execute_actions = harness.executor.execute_actions
+        clear_output = harness.executor.clear_output
+        executor_started = asyncio.Event()
+        order: list[str] = []
+
+        async def cancellation_aware_execute(actions):
+            if any(action.get("op") == "pulse_cycle" for action in actions):
+                executor_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    order.append("executor_terminal")
+                    raise
+            return await execute_actions(actions)
+
+        async def ordered_clear(channel=None):
+            order.append("clear")
+            return await clear_output(channel)
+
+        harness.executor.execute_actions = cancellation_aware_execute
+        harness.executor.clear_output = ordered_clear
+        await harness.player.start()
+        await asyncio.wait_for(executor_started.wait(), timeout=0.2)
+
+        await harness.player.pause()
+
+        self.assertEqual(order, ["executor_terminal", "clear"])
+
+    async def test_failed_pause_clear_is_retryable_by_pause(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if harness.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+        harness.executor.clear_failures_remaining = 1
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await harness.player.pause()
+        await harness.player.pause()
+
+        self.assertEqual(harness.executor.clear_calls, [None, None])
+
+    async def test_failed_stop_clear_is_retryable_by_stop(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if harness.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+        harness.executor.clear_failures_remaining = 1
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await harness.player.stop()
+        await harness.player.stop()
+
+        self.assertEqual(harness.executor.clear_calls, [None, None])
+
+    async def test_load_after_pause_drops_the_cancelled_task(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0, 0], controlled=True)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        for _ in range(20):
+            if harness.player.cursor == 1:
+                break
+            await asyncio.sleep(0)
+        await harness.player.pause()
+
+        harness.player.load(harness.bundle)
+        result = await asyncio.gather(harness.player.wait(), return_exceptions=True)
+
+        self.assertIsNone(result[0])
+
+    async def test_load_after_failure_drops_the_failed_task(self):
+        harness = ReplayHarness.from_cycles(gap_tenths=[0], fail_on_cycle=1)
+        self.addAsyncCleanup(harness.close)
+        await harness.player.start()
+        with self.assertRaises(ReplayPlaybackError):
+            await harness.player.wait()
+
+        harness.player.load(harness.bundle)
+        result = await asyncio.gather(harness.player.wait(), return_exceptions=True)
+
+        self.assertIsNone(result[0])
 
     async def test_simultaneous_channel_starts_keep_archive_tie_order(self):
         harness = ReplayHarness.from_channel_cycles(

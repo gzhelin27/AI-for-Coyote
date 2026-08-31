@@ -85,6 +85,8 @@ class RecordedCyclePlayer:
         """Load one validated completed replay bundle or timeline while idle."""
         if self._task is not None and not self._task.done():
             raise RuntimeError("cannot load replay while playback is active")
+        if self._task is not None and not self._task.cancelled():
+            self._task.exception()
         manifest = getattr(replay, "manifest", None)
         timeline = getattr(replay, "timeline", replay)
         if (
@@ -97,6 +99,7 @@ class RecordedCyclePlayer:
 
         completed = [cycle for cycle in timeline.cycles if cycle.completed]
         self._ordered_cycles = self._order_cycles(completed)
+        self._task = None
         self._cursor = 0
         self._adjusted = False
         self._loaded = True
@@ -116,8 +119,6 @@ class RecordedCyclePlayer:
                 return
             if self._stopped:
                 raise RuntimeError("stopped playback must be loaded again")
-            if self._cursor >= len(self._ordered_cycles):
-                return
             self._paused = False
             self._running = True
             self._cleared = False
@@ -128,39 +129,43 @@ class RecordedCyclePlayer:
             )
 
     async def pause(self) -> int:
-        task: asyncio.Task[None] | None
         async with self._lock:
-            if self._paused or self._stopped or not self._running:
+            if self._stopped and self._cleared:
                 return self._cursor
-            self._capture_active_elapsed()
-            self._paused = True
-            self._running = False
             task = self._task
-            if task is not None and not task.done():
-                task.cancel()
-        await self._clear_once()
-        await self._await_cancelled(task)
-        return self._cursor
+            if self._paused and self._cleared:
+                return self._cursor
+            if task is None and not self._running:
+                return self._cursor
+            if not self._paused:
+                self._capture_active_elapsed()
+                self._paused = True
+                self._running = False
+                if task is not None and not task.done():
+                    task.cancel()
+            await self._await_terminal(task)
+            await self._clear_once()
+            return self._cursor
 
     async def resume(self, cursor: int | None = None) -> None:
         async with self._lock:
             if not self._loaded:
                 raise RuntimeError("no replay is loaded")
+            if cursor is not None:
+                self._validate_cursor(cursor)
             if self._stopped:
                 raise RuntimeError("cannot resume stopped playback")
             if self._running:
                 return
+            if self._task is not None and not self._cleared:
+                raise RuntimeError("playback output clear is still pending")
             if cursor is not None:
-                self._validate_cursor(cursor)
                 self._cursor = cursor
                 self._active_elapsed_ms = (
                     self._ordered_cycles[cursor].active_start_offset_ms
                     if cursor < len(self._ordered_cycles)
                     else self._playback_end_offset_ms()
                 )
-            if self._cursor >= len(self._ordered_cycles):
-                self._paused = False
-                return
             self._paused = False
             self._running = True
             self._cleared = False
@@ -171,19 +176,19 @@ class RecordedCyclePlayer:
             )
 
     async def stop(self) -> None:
-        task: asyncio.Task[None] | None
         async with self._lock:
-            if self._stopped:
+            if self._stopped and self._cleared:
                 return
-            self._capture_active_elapsed()
-            self._running = False
-            self._paused = False
-            self._stopped = True
             task = self._task
-            if task is not None and not task.done():
-                task.cancel()
-        await self._clear_once()
-        await self._await_cancelled(task)
+            if not self._stopped:
+                self._capture_active_elapsed()
+                self._running = False
+                self._paused = False
+                self._stopped = True
+                if task is not None and not task.done():
+                    task.cancel()
+            await self._await_terminal(task)
+            await self._clear_once()
 
     async def wait(self) -> None:
         task = self._task
@@ -370,7 +375,7 @@ class RecordedCyclePlayer:
         return tuple(ordered)
 
     @staticmethod
-    async def _await_cancelled(task: asyncio.Task[None] | None) -> None:
+    async def _await_terminal(task: asyncio.Task[None] | None) -> None:
         if task is None:
             return
         try:

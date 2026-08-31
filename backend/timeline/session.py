@@ -140,6 +140,7 @@ class SessionController:
         self._pause_started_at: float | None = None
         self._paused_total_ms = 0
         self._safety_caps: dict[str, int] = {}
+        self._live_clear_required = False
 
     @property
     def runners(self) -> Mapping[str, ChannelCycleRunner]:
@@ -182,6 +183,7 @@ class SessionController:
             self._pause_started_at = None
             self._paused_total_ms = 0
             self._safety_caps = self._current_caps()
+            self._live_clear_required = False
             self._runners = {}
             for channel in _CHANNELS:
                 self._install_runner(channel)
@@ -245,7 +247,12 @@ class SessionController:
                     )
                     self._retained[channel] = cycle_directive
                     runner = self._runners.get(channel)
-                    if runner is None or runner.state().phase is RunnerPhase.STOPPED:
+                    if runner is not None and runner.state().phase is RunnerPhase.STOPPED:
+                        await self._settle_stopped_runner_locked(channel, runner)
+                        if self._status is not SessionStatus.RUNNING:
+                            continue
+                        runner = self._runners.get(channel)
+                    if runner is None:
                         runner = self._install_runner(channel)
                     submissions.append((channel, runner, cycle_directive))
 
@@ -274,12 +281,16 @@ class SessionController:
     async def pause(self) -> SessionState:
         async with self._lock:
             if self._status is SessionStatus.PAUSED:
+                if self._mode == "replay" and self._player is not None:
+                    await self._player.pause()
+                elif self._mode == "autopilot" and self._live_clear_required:
+                    await self._clear_live_output_locked()
                 return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is None:
                     raise RuntimeError("replay player is unavailable")
-                await self._player.pause()
                 self._status = SessionStatus.PAUSED
+                await self._player.pause()
                 return self.to_state()
             if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
                 raise RuntimeError("no running session to pause")
@@ -288,9 +299,14 @@ class SessionController:
 
     async def resume(self, cursor: int | None = None) -> SessionState:
         async with self._lock:
+            if self._mode == "autopilot" and cursor is not None:
+                raise ValueError("live sessions do not accept a replay cursor")
             if self._status is SessionStatus.RUNNING and self._mode == "autopilot":
                 return self.to_state()
             if self._status is SessionStatus.REPLAYING:
+                if self._player is None:
+                    raise RuntimeError("replay player is unavailable")
+                await self._player.resume(cursor)
                 return self.to_state()
             if self._status is not SessionStatus.PAUSED:
                 raise RuntimeError("no paused session to resume")
@@ -302,8 +318,6 @@ class SessionController:
                 self._status = SessionStatus.REPLAYING
                 self._start_player_watcher_locked(self._player)
             elif self._mode == "autopilot":
-                if cursor is not None:
-                    raise ValueError("live sessions do not accept a replay cursor")
                 await self._resume_live_locked()
             else:
                 raise RuntimeError("paused session has no mode")
@@ -322,7 +336,11 @@ class SessionController:
                 self._pause_started_at = self._clock()
             await self._cancel_runner_watchers_locked()
             runners = tuple(self._runners.values())
-            await self._quiesce_runners(runners, reason="finish", clear=True)
+            try:
+                await self._quiesce_runners(runners, reason="finish", clear=True)
+            except BaseException:
+                self._status = SessionStatus.PAUSED
+                raise
 
             session_id = self._session_id
             if session_id is None:
@@ -352,11 +370,15 @@ class SessionController:
     async def on_disconnect(self) -> SessionState:
         async with self._lock:
             if self._status is SessionStatus.PAUSED:
+                if self._mode == "replay" and self._player is not None:
+                    await self._player.pause()
+                elif self._mode == "autopilot" and self._live_clear_required:
+                    await self._clear_live_output_locked()
                 return self.to_state()
             if self._status is SessionStatus.REPLAYING:
                 if self._player is not None:
+                    self._status = SessionStatus.PAUSED
                     await self._player.pause()
-                self._status = SessionStatus.PAUSED
                 return self.to_state()
             if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
                 return self.to_state()
@@ -409,12 +431,15 @@ class SessionController:
                             self._player_watcher, return_exceptions=True
                         )
                 if self._player is not None:
+                    self._status = SessionStatus.PAUSED
                     await self._player.stop()
                 self._reset_idle()
                 return self.to_state()
 
             if self._status is SessionStatus.RUNNING:
                 await self._pause_live_locked("stop")
+            elif self._status is SessionStatus.PAUSED and self._live_clear_required:
+                await self._clear_live_output_locked()
             await self._cancel_runner_watchers_locked()
             await asyncio.gather(
                 *(
@@ -450,13 +475,19 @@ class SessionController:
     async def _pause_live_locked(self, reason: str) -> None:
         if self._pause_started_at is None:
             self._pause_started_at = self._clock()
-        await self._cancel_runner_watchers_locked()
-        await self._quiesce_runners(
-            tuple(self._runners.values()), reason=reason, clear=True
-        )
+        try:
+            await self._cancel_runner_watchers_locked()
+            await self._quiesce_runners(
+                tuple(self._runners.values()), reason=reason, clear=True
+            )
+        except BaseException:
+            self._status = SessionStatus.PAUSED
+            raise
         self._status = SessionStatus.PAUSED
 
     async def _resume_live_locked(self) -> None:
+        if self._live_clear_required:
+            raise RuntimeError("live output clear is still pending")
         if self._pause_started_at is None:
             raise RuntimeError("paused live session has no pause timestamp")
         paused_ms = max(
@@ -473,9 +504,10 @@ class SessionController:
                 await runner.submit(directive)
 
     def _install_runner(self, channel: str) -> ChannelCycleRunner:
-        previous = self._runner_watchers.pop(channel, None)
+        previous = self._runner_watchers.get(channel)
         if previous is not None and not previous.done():
-            previous.cancel()
+            raise RuntimeError("runner cleanup must finish before replacement")
+        self._runner_watchers.pop(channel, None)
         base_index = max(
             (
                 record.cycle_index
@@ -522,6 +554,8 @@ class SessionController:
         if runner is None:
             return
         await self._quiesce_runners((runner,), reason=reason, clear=False)
+        if self._runners.get(channel) is runner:
+            self._runners.pop(channel, None)
 
     async def _quiesce_runners(
         self,
@@ -543,7 +577,7 @@ class SessionController:
         finally:
             try:
                 if clear:
-                    await self.game_loop.clear_output()
+                    await self._clear_live_output_locked()
             finally:
                 await asyncio.gather(
                     *(
@@ -560,22 +594,16 @@ class SessionController:
     ) -> None:
         try:
             state = await runner.wait_stopped()
-            if (
-                state.disconnected
-                and self._status is SessionStatus.RUNNING
-                and self._mode == "autopilot"
-                and self._runners.get(channel) is runner
-            ):
-                await self.on_disconnect()
-            elif state.failure is not None:
-                async with self._lock:
-                    if (
-                        self._status is SessionStatus.RUNNING
-                        and self._mode == "autopilot"
-                        and self._runners.get(channel) is runner
-                    ):
-                        await self.game_loop.clear_output(channel)
+            async with self._lock:
+                if (
+                    self._status is SessionStatus.RUNNING
+                    and self._mode == "autopilot"
+                    and self._runners.get(channel) is runner
+                ):
+                    await self._settle_stopped_runner_locked(channel, runner, state)
         except asyncio.CancelledError:
+            pass
+        except Exception:
             pass
         finally:
             if self._runner_watchers.get(channel) is asyncio.current_task():
@@ -619,6 +647,43 @@ class SessionController:
             for channel, watcher in self._runner_watchers.items()
             if watcher is current and not watcher.done()
         }
+
+    async def _settle_stopped_runner_locked(
+        self,
+        channel: str,
+        runner: ChannelCycleRunner,
+        state: Any | None = None,
+    ) -> None:
+        if self._runners.get(channel) is not runner:
+            return
+        state = runner.state() if state is None else state
+        if state.disconnected:
+            await self._pause_live_locked("disconnect")
+            return
+        if state.failure is not None:
+            try:
+                await self.game_loop.clear_output(channel)
+            except Exception:
+                await self._pause_live_locked("runner_clear_failure")
+                return
+        await self._discard_runner_locked(channel, runner)
+
+    async def _discard_runner_locked(
+        self, channel: str, runner: ChannelCycleRunner
+    ) -> None:
+        if self._runners.get(channel) is runner:
+            self._runners.pop(channel, None)
+        watcher = self._runner_watchers.pop(channel, None)
+        if watcher is None or watcher is asyncio.current_task():
+            return
+        if not watcher.done():
+            watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _clear_live_output_locked(self) -> None:
+        self._live_clear_required = True
+        await self.game_loop.clear_output()
+        self._live_clear_required = False
 
     def _completed_cycle_records(self) -> tuple[CycleRecord, ...]:
         records = [record for record in self._cycle_records.values() if record.completed]
@@ -757,6 +822,7 @@ class SessionController:
         self._pause_started_at = None
         self._paused_total_ms = 0
         self._safety_caps = {}
+        self._live_clear_required = False
 
     @staticmethod
     def _require_id(value: object, name: str) -> str:
