@@ -1,9 +1,15 @@
+import asyncio
 import random
 import unittest
 
 from backend.timeline.cycle_runner import CycleDirective, RunnerPhase
 from backend.timeline.randomizer import derive_stream_seed
-from tests.timeline_fakes import CycleHarness, SequenceGapRandom
+from tests.timeline_fakes import (
+    BlockingCycleCallback,
+    CycleHarness,
+    DeferredRunnerStart,
+    SequenceGapRandom,
+)
 
 
 class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
@@ -68,6 +74,56 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(harness.records[0].completed)
         self.assertEqual(harness.runner.state().phase, RunnerPhase.STOPPED)
 
+    async def test_stop_clears_before_waiting_for_blocked_record_callback(self):
+        callback = BlockingCycleCallback()
+        harness = self.make_harness(
+            frames={"呼吸": ["f"] * 12}, on_cycle=callback
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+
+        stop_task = asyncio.create_task(
+            harness.runner.stop(clear=True, reason="estop")
+        )
+        try:
+            await asyncio.wait_for(callback.entered.wait(), timeout=0.2)
+            self.assertEqual(harness.clear_calls, ["A"])
+            self.assertFalse(stop_task.done())
+        finally:
+            callback.release.set()
+            await asyncio.wait_for(stop_task, timeout=0.2)
+
+    async def test_cancelled_record_callback_stops_with_record_preserved(self):
+        async def cancel_callback(record):
+            raise asyncio.CancelledError
+
+        harness = self.make_harness(
+            frames={"呼吸": ["f"]}, gap_tenths=[0], on_cycle=cancel_callback
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        harness.sleeper.advance(100)
+        await harness.flush()
+
+        state = harness.runner.state()
+        self.assertEqual(len(harness.records), 1)
+        self.assertEqual(state.phase, RunnerPhase.STOPPED)
+        self.assertIn("callback", (state.failure or "").lower())
+
+    async def test_record_callback_exception_surfaces_as_stopped_failure(self):
+        async def fail_callback(record):
+            raise RuntimeError("recorder failed")
+
+        harness = self.make_harness(
+            frames={"呼吸": ["f"]}, gap_tenths=[0], on_cycle=fail_callback
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        harness.sleeper.advance(100)
+        await harness.flush()
+
+        state = await asyncio.wait_for(harness.runner.wait_stopped(), timeout=0.2)
+        self.assertEqual(len(harness.records), 1)
+        self.assertEqual(state.phase, RunnerPhase.STOPPED)
+        self.assertIn("recorder failed", state.failure or "")
+
     async def test_latest_pending_normal_change_wins(self):
         harness = self.make_harness(
             frames={"呼吸": ["f"], "潮汐": ["g"], "律动": ["h"]}
@@ -79,6 +135,40 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         await harness.complete_cycle()
 
         self.assertEqual(harness.sent_patterns, ["呼吸", "律动"])
+
+    async def test_zero_gap_boundary_rechecks_pending_before_next_pulse(self):
+        callback = BlockingCycleCallback()
+        harness = self.make_harness(
+            frames={"呼吸": ["f"], "潮汐": ["g"]},
+            gap_tenths=[0],
+            on_cycle=callback,
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        harness.sleeper.advance(100)
+        await asyncio.wait_for(callback.entered.wait(), timeout=0.2)
+
+        await harness.runner.submit(CycleDirective("A", "evt-2", "潮汐", 22))
+        callback.release.set()
+        await harness.flush()
+
+        self.assertEqual(harness.sent_patterns[:2], ["呼吸", "潮汐"])
+
+    async def test_directive_during_callback_supersedes_older_boundary_pending(self):
+        callback = BlockingCycleCallback()
+        harness = self.make_harness(
+            frames={"呼吸": ["f"], "潮汐": ["g"], "律动": ["h"]},
+            on_cycle=callback,
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        await harness.runner.submit(CycleDirective("A", "evt-2", "潮汐", 22))
+        harness.sleeper.advance(100)
+        await asyncio.wait_for(callback.entered.wait(), timeout=0.2)
+
+        await harness.runner.submit(CycleDirective("A", "evt-3", "律动", 24))
+        callback.release.set()
+        await harness.flush()
+
+        self.assertEqual(harness.sent_patterns[:2], ["呼吸", "律动"])
 
     async def test_executor_rejection_stops_runner_and_records_failure(self):
         harness = self.make_harness(
@@ -92,6 +182,47 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.phase, RunnerPhase.STOPPED)
         self.assertIn("injected rejection", state.failure or "")
         self.assertEqual(harness.records[0].interruption_reason, "executor_rejected")
+
+    async def test_stop_before_worker_first_step_releases_initial_submit(self):
+        harness = self.make_harness(frames={"呼吸": ["f"]})
+        loop = asyncio.get_running_loop()
+        deferred_start = DeferredRunnerStart()
+        previous_factory = loop.get_task_factory()
+        loop.set_task_factory(deferred_start)
+        self.addCleanup(loop.set_task_factory, previous_factory)
+        submit_task = asyncio.create_task(
+            harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        )
+        await asyncio.wait_for(deferred_start.created.wait(), timeout=0.2)
+
+        stop_task = asyncio.create_task(
+            harness.runner.stop(clear=False, reason="concurrent_stop")
+        )
+        results = await asyncio.wait_for(
+            asyncio.gather(submit_task, stop_task, return_exceptions=True),
+            timeout=0.2,
+        )
+
+        self.assertNotIsInstance(results[0], asyncio.TimeoutError)
+        self.assertEqual(harness.runner.state().phase, RunnerPhase.STOPPED)
+        with self.assertRaisesRegex(RuntimeError, "stopped"):
+            await harness.runner.submit(CycleDirective("A", "evt-2", "呼吸", 20))
+
+    async def test_stopped_after_rejection_is_terminal_across_pause_resume(self):
+        harness = self.make_harness(frames={"呼吸": ["f"]}, fail_on_cycle=1)
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        await harness.runner.wait_stopped()
+        stopped_state = harness.runner.state()
+
+        await harness.runner.pause(reason="late_pause")
+        with self.assertRaisesRegex(RuntimeError, "stopped"):
+            await harness.runner.resume()
+
+        final_state = harness.runner.state()
+        self.assertEqual(final_state.phase, RunnerPhase.STOPPED)
+        self.assertEqual(final_state.failure, stopped_state.failure)
+        self.assertEqual(final_state.disconnected, stopped_state.disconnected)
+        self.assertEqual(harness.sent_patterns, [])
 
     async def test_executor_exception_stops_runner_and_records_failure(self):
         harness = self.make_harness(
@@ -160,6 +291,30 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
             [record.effective_strength for record in harness.records[:2]],
             [18, 18],
         )
+
+    async def test_missing_or_invalid_effective_strength_stops_runner(self):
+        cases = (
+            {"omit_effective_strength": True},
+            {"invalid_effective_strength": True},
+        )
+        for index, executor_case in enumerate(cases, 1):
+            with self.subTest(executor_case=executor_case):
+                harness = self.make_harness(
+                    frames={"呼吸": ["f"]}, **executor_case
+                )
+                await harness.runner.submit(
+                    CycleDirective("A", f"evt-{index}", "呼吸", 20)
+                )
+
+                self.assertEqual(
+                    harness.runner.state().phase, RunnerPhase.STOPPED
+                )
+                state = await harness.runner.wait_stopped()
+                self.assertIn("effective_strength", state.failure or "")
+                self.assertEqual(
+                    harness.records[-1].interruption_reason,
+                    "executor_invalid_result",
+                )
 
     async def test_ab_gap_stream_is_independent_of_extra_a_cycle(self):
         session_seed = 0

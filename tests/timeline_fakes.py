@@ -95,6 +95,47 @@ class SequenceGapRandom:
         return value
 
 
+class DeferredRunnerStart:
+    """Task factory that holds ChannelCycleRunner._run before its first step."""
+
+    def __init__(self) -> None:
+        self.created = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __call__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        coro: Any,
+        context: Any = None,
+    ) -> asyncio.Task[Any]:
+        if getattr(getattr(coro, "cr_code", None), "co_name", None) == "_run":
+            original_coro = coro
+
+            async def deferred() -> Any:
+                self.created.set()
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    original_coro.close()
+                    raise
+                return await original_coro
+
+            coro = deferred()
+        return asyncio.Task(coro, loop=loop, context=context)
+
+
+class BlockingCycleCallback:
+    """Expose deterministic entry/release points for an async record callback."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, record: CycleRecord) -> None:
+        self.entered.set()
+        await self.release.wait()
+
+
 class FakeCycleExecutor:
     """Resolve high-level actions without touching a relay or safety state."""
 
@@ -106,12 +147,16 @@ class FakeCycleExecutor:
         disconnect_on_cycle: int | None = None,
         raise_on_cycle: int | None = None,
         effective_strength: int | None = None,
+        omit_effective_strength: bool = False,
+        invalid_effective_strength: bool = False,
     ) -> None:
         self.frames = {name: tuple(values) for name, values in frames.items()}
         self.fail_on_cycle = fail_on_cycle
         self.disconnect_on_cycle = disconnect_on_cycle
         self.raise_on_cycle = raise_on_cycle
         self.effective_strength = effective_strength
+        self.omit_effective_strength = omit_effective_strength
+        self.invalid_effective_strength = invalid_effective_strength
         self.sent_cycles: list[tuple[str, str, int]] = []
         self.sent_patterns: list[str] = []
         self.strength_calls: list[tuple[str, int]] = []
@@ -136,17 +181,16 @@ class FakeCycleExecutor:
                 )
                 self._strengths[channel] = effective_value
                 self.strength_calls.append((channel, value))
-                executed.append(
-                    {
-                        "action": action,
-                        "effective": {
-                            "op": op,
-                            "channel": channel,
-                            "requested_strength": value,
-                            "effective_strength": effective_value,
-                        },
-                    }
-                )
+                effective = {
+                    "op": op,
+                    "channel": channel,
+                    "requested_strength": value,
+                }
+                if not self.omit_effective_strength:
+                    effective["effective_strength"] = (
+                        "invalid" if self.invalid_effective_strength else effective_value
+                    )
+                executed.append({"action": action, "effective": effective})
                 continue
             if op == "clear":
                 self.clear_calls.append(channel)
@@ -200,6 +244,9 @@ class CycleHarness:
         disconnect_on_cycle: int | None = None,
         raise_on_cycle: int | None = None,
         effective_strength: int | None = None,
+        omit_effective_strength: bool = False,
+        invalid_effective_strength: bool = False,
+        on_cycle: Any = None,
     ) -> None:
         self.sleeper = ControlledSleeper()
         self.rng = rng if rng is not None else SequenceGapRandom(gap_tenths)
@@ -209,8 +256,15 @@ class CycleHarness:
             disconnect_on_cycle=disconnect_on_cycle,
             raise_on_cycle=raise_on_cycle,
             effective_strength=effective_strength,
+            omit_effective_strength=omit_effective_strength,
+            invalid_effective_strength=invalid_effective_strength,
         )
         self.records: list[CycleRecord] = []
+
+        def capture_record(record: CycleRecord) -> Any:
+            self.records.append(record)
+            return None if on_cycle is None else on_cycle(record)
+
         self.runner = ChannelCycleRunner(
             channel=channel,
             policy=CycleGapPolicy(),
@@ -219,7 +273,7 @@ class CycleHarness:
             executor=self.executor,
             clock=lambda: self.sleeper.now_ms / 1000,
             sleeper=self.sleeper,
-            on_cycle=self.records.append,
+            on_cycle=capture_record,
         )
 
     @property
