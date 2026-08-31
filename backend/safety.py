@@ -7,14 +7,17 @@
 3. 单次波形/临时强度时长不超过配置上限（默认 10s），到点自动归零；
 4. 设备过热时，该通道上限临时降到 overheat_reduce_to；
 5. 急停（estop）：清零全部通道 + 清波形 + 暂停 AI 循环；
-6. op 白名单：temp_strength / add_strength / pulse / clear / stop。
+6. op 白名单：强度、波形（含单周期）、清除和停止操作。
 """
 import logging
 import time
 
 logger = logging.getLogger("ai-for-coyote.safety")
 
-VALID_OPS = {"temp_strength", "hold_strength", "add_strength", "pulse", "pulse_hold", "clear", "stop"}
+VALID_OPS = {
+    "temp_strength", "hold_strength", "add_strength", "pulse", "pulse_hold",
+    "pulse_cycle", "clear", "stop",
+}
 
 
 class SafetyError(Exception):
@@ -106,6 +109,8 @@ class SafetyManager:
                 return self._validate_pulse(action)
             if op == "pulse_hold":
                 return self._validate_pulse_hold(action)
+            if op == "pulse_cycle":
+                return self._validate_pulse_cycle(action)
             if op == "clear":
                 return self._validate_clear(action)
             if op == "stop":
@@ -244,6 +249,29 @@ class SafetyManager:
             },
         )
 
+    def _validate_pulse_cycle(self, a: dict):
+        """单个原始波形周期：不按预设时长补帧或循环。"""
+        ch = self.norm_channel(a.get("channel"))
+        if (reason := self._check_enabled(ch)):
+            raise SafetyError(reason)
+        pattern = str(a.get("pattern", "")).strip()
+        meta = self._preset_meta(pattern)
+        frames = meta.get("frames")
+        if not isinstance(frames, list) or not frames:
+            raise SafetyError(f"波形 {pattern!r} 没有可播放帧")
+        return (
+            True,
+            f"{ch} 通道波形「{pattern}」({meta['waveform']})，单周期 {len(frames) * 100}ms",
+            {
+                "kind": "pulse_cycle",
+                "channel": ch,
+                "pattern": pattern,
+                "wave_key": meta["waveform"],
+                "frames": frames,
+                "duration_ms": len(frames) * 100,
+            },
+        )
+
     def _validate_clear(self, a: dict):
         ch = None
         if a.get("channel") is not None:
@@ -280,6 +308,8 @@ class SafetyManager:
         elif kind == "pulse_hold" and ch:
             # 持续波形：视为长期播放，直到清除
             self.pulse_until[ch] = time.monotonic() + 24 * 3600
+        elif kind == "pulse_cycle" and ch:
+            self.pulse_until[ch] = time.monotonic() + cmd["duration_ms"] / 1000.0
         elif kind == "zero" and ch:
             # 爆发结束自动归零
             self.current[ch] = 0

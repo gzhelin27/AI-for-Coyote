@@ -401,7 +401,7 @@ class ChannelCycleRunner:
                 if self._needs_activation:
                     try:
                         self._effective_strength = self._read_effective_strength(
-                            executed
+                            executed, actions[0]
                         )
                     except ValueError as exc:
                         self._resolve_startup(startup)
@@ -696,7 +696,9 @@ class ChannelCycleRunner:
         )
 
     @staticmethod
-    def _read_effective_strength(executed: object) -> int:
+    def _read_effective_strength(
+        executed: object, expected_action: Mapping[str, Any]
+    ) -> int:
         if isinstance(executed, Sequence) and not isinstance(executed, (str, bytes)):
             for item in executed:
                 if not isinstance(item, Mapping):
@@ -705,8 +707,10 @@ class ChannelCycleRunner:
                 effective = item.get("effective")
                 if (
                     isinstance(action, Mapping)
-                    and action.get("op") == "hold_strength"
+                    and dict(action) == dict(expected_action)
                     and isinstance(effective, Mapping)
+                    and effective.get("op") == expected_action.get("op")
+                    and effective.get("channel") == expected_action.get("channel")
                 ):
                     value = effective.get("effective_strength")
                     if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 200:

@@ -416,6 +416,36 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
             [18, 18],
         )
 
+    async def test_activation_selects_effective_strength_for_exact_action_and_channel(self):
+        harness = self.make_harness(
+            channel="A",
+            frames={"呼吸": ["f"]},
+            effective_strength=18,
+        )
+        execute = harness.executor.execute
+
+        async def execute_with_unrelated_hold(actions):
+            executed, dropped = await execute(actions)
+            executed.insert(
+                0,
+                {
+                    "action": {"op": "hold_strength", "channel": "B", "value": 99},
+                    "effective": {
+                        "op": "hold_strength",
+                        "channel": "B",
+                        "requested_strength": 99,
+                        "effective_strength": 99,
+                    },
+                },
+            )
+            return executed, dropped
+
+        harness.executor.execute = execute_with_unrelated_hold
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        await harness.complete_cycle()
+
+        self.assertEqual(harness.records[0].effective_strength, 18)
+
     async def test_missing_or_invalid_effective_strength_stops_runner(self):
         cases = (
             {"omit_effective_strength": True},

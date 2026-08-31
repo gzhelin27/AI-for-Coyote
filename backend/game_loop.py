@@ -460,6 +460,15 @@ class GameLoop:
         slot_id = self.relay.get_slot_id()
         ready = bool(client_id and slot_id)
         dry_run = self.safety.dry_run
+        explicit_wave_channels = set()
+        for candidate in actions:
+            if not isinstance(candidate, dict) or candidate.get("op") not in (
+                "pulse", "pulse_hold", "pulse_cycle",
+            ):
+                continue
+            wave_ok, _, wave_cmd = self.safety.validate(candidate)
+            if wave_ok and wave_cmd and wave_cmd.get("channel") in ("A", "B"):
+                explicit_wave_channels.add(wave_cmd["channel"])
 
         for action in actions:
             if not isinstance(action, dict):
@@ -478,13 +487,17 @@ class GameLoop:
             # 记录每通道最近一次强度/波形调整轮次（保底规则用）
             if cmd["kind"] in ("hold", "add", "temp") and cmd.get("channel") in ("A", "B"):
                 self.last_strength[cmd["channel"]] = self.turn_count
-            if cmd["kind"] in ("pulse", "pulse_hold") and cmd.get("channel") in ("A", "B"):
+            if cmd["kind"] in ("pulse", "pulse_hold", "pulse_cycle") and cmd.get("channel") in ("A", "B"):
                 self.last_wave[cmd["channel"]] = self.turn_count
 
             # 强度类动作必须有波形承载才有输出（DG-LAB 特性）：通道无波形时自动挂默认波形
             if cmd["kind"] in ("hold", "add", "temp") and cmd.get("channel") in ("A", "B"):
                 ch_name = cmd["channel"]
-                if ch_name not in self.loop_tasks and not self.safety.pulse_active().get(ch_name):
+                if (
+                    ch_name not in explicit_wave_channels
+                    and ch_name not in self.loop_tasks
+                    and not self.safety.pulse_active().get(ch_name)
+                ):
                     await self._ensure_default_wave(ch_name, client_id, slot_id, ready, dry_run)
 
             if cmd["kind"] == "pulse_hold":
@@ -499,7 +512,13 @@ class GameLoop:
                     self.patterns[cmd["channel"]] = cmd.get("pattern")
                 self.safety.record(cmd)
                 label = self._describe(cmd)
-                executed.append({"action": action, "reason": reason, "sent": sent, "label": label})
+                executed.append({
+                    "action": action,
+                    "effective": self._effective_result(action, cmd),
+                    "reason": reason,
+                    "sent": sent,
+                    "label": label,
+                })
                 logger.info("执行动作: %s（循环播放中）", label)
                 continue
 
@@ -511,7 +530,7 @@ class GameLoop:
                 elif cmd["channel"] in ("A", "B"):
                     self.patterns[cmd["channel"]] = None
 
-            if cmd["kind"] == "pulse" and cmd.get("channel") in ("A", "B"):
+            if cmd["kind"] in ("pulse", "pulse_cycle") and cmd.get("channel") in ("A", "B"):
                 self.patterns[cmd["channel"]] = cmd.get("pattern")
 
             frames = self._build_frames(cmd, client_id, slot_id)
@@ -520,7 +539,13 @@ class GameLoop:
                 sent = all(await self._send_all(frames))
             self.safety.record(cmd)
             label = self._describe(cmd)
-            executed.append({"action": action, "reason": reason, "sent": sent, "label": label})
+            executed.append({
+                "action": action,
+                "effective": self._effective_result(action, cmd),
+                "reason": reason,
+                "sent": sent,
+                "label": label,
+            })
             logger.info(
                 "%s执行动作: %s（%s）",
                 "DRY-RUN " if (dry_run or not ready) else "",
@@ -528,6 +553,38 @@ class GameLoop:
                 "已发送" if sent else "模拟",
             )
         return executed, dropped
+
+    async def clear_output(self, channel=None) -> tuple[list, list]:
+        """物理清除输出，不触发或改变急停状态。"""
+        action = (
+            {"op": "stop"}
+            if channel is None
+            else {"op": "clear", "channel": channel}
+        )
+        return await self.execute_actions([action])
+
+    def _effective_result(self, action: dict, cmd: dict) -> dict:
+        """返回适合时间线记账的生效值；设备原始帧不得泄漏到结果。"""
+        effective = {"op": action["op"]}
+        ch = cmd.get("channel")
+        if ch in ("A", "B"):
+            effective["channel"] = ch
+        if "pattern" in cmd:
+            effective["pattern"] = cmd["pattern"]
+        if cmd["kind"] in ("temp", "hold"):
+            effective["requested_strength"] = action.get("value")
+            effective["effective_strength"] = cmd["value"]
+        elif cmd["kind"] == "add":
+            effective["requested_delta"] = action.get("delta")
+            effective["effective_delta"] = cmd["delta"]
+            effective["effective_strength"] = cmd["value"]
+        elif cmd["kind"] in ("pulse", "pulse_hold", "pulse_cycle") and ch in ("A", "B"):
+            effective["effective_strength"] = self.safety.current[ch]
+        if cmd["kind"] == "pulse":
+            effective["duration_ms"] = int(cmd["duration_s"] * 1000)
+        elif cmd["kind"] == "pulse_cycle":
+            effective["duration_ms"] = cmd["duration_ms"]
+        return effective
 
     def _build_frames(self, cmd: dict, client_id: str | None, slot_id: str | None) -> list[dict]:
         """内部命令 -> V4 服务器帧列表。client_id/slot_id 可能为 None（dry-run 时）。"""
@@ -559,6 +616,13 @@ class GameLoop:
                 self.ops.pulse(
                     client_id, slot_id, ch, tiled,
                     int(cmd["duration_s"] * 1000), immediate=True,
+                )
+            )
+        elif kind == "pulse_cycle":
+            frames.append(
+                self.ops.pulse(
+                    client_id, slot_id, ch, cmd["frames"],
+                    cmd["duration_ms"], immediate=True,
                 )
             )
         elif kind == "clear":
@@ -703,6 +767,8 @@ class GameLoop:
             return f"{ch} 波形「{cmd['pattern']}」× {cmd['duration_s']:.1f}s"
         if kind == "pulse_hold":
             return f"{ch} 持续波形「{cmd['pattern']}」（循环）"
+        if kind == "pulse_cycle":
+            return f"{ch} 波形「{cmd['pattern']}」单周期 {cmd['duration_ms']}ms"
         if kind == "clear":
             return "清除全部" if ch is None else f"清除 {ch} 通道"
         return "急停清零"
