@@ -130,10 +130,30 @@ class BlockingCycleCallback:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+        self.records: list[CycleRecord] = []
 
     async def __call__(self, record: CycleRecord) -> None:
+        self.records.append(record)
         self.entered.set()
         await self.release.wait()
+
+
+class DurableCycleRecorder:
+    """Idempotent persistence fake that can fail before writing a record."""
+
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.attempts: list[tuple[str, int]] = []
+        self.records: dict[tuple[str, int], CycleRecord] = {}
+
+    async def __call__(self, record: CycleRecord) -> None:
+        key = (record.channel, record.cycle_index)
+        self.attempts.append(key)
+        if self.failure == "cancel":
+            raise asyncio.CancelledError
+        if self.failure == "raise":
+            raise RuntimeError("persistence unavailable")
+        self.records[key] = record
 
 
 class FakeCycleExecutor:
@@ -149,6 +169,7 @@ class FakeCycleExecutor:
         effective_strength: int | None = None,
         omit_effective_strength: bool = False,
         invalid_effective_strength: bool = False,
+        block_clear: bool = False,
     ) -> None:
         self.frames = {name: tuple(values) for name, values in frames.items()}
         self.fail_on_cycle = fail_on_cycle
@@ -157,6 +178,9 @@ class FakeCycleExecutor:
         self.effective_strength = effective_strength
         self.omit_effective_strength = omit_effective_strength
         self.invalid_effective_strength = invalid_effective_strength
+        self.block_clear = block_clear
+        self.clear_started = asyncio.Event()
+        self.release_clear = asyncio.Event()
         self.sent_cycles: list[tuple[str, str, int]] = []
         self.sent_patterns: list[str] = []
         self.strength_calls: list[tuple[str, int]] = []
@@ -194,6 +218,9 @@ class FakeCycleExecutor:
                 continue
             if op == "clear":
                 self.clear_calls.append(channel)
+                self.clear_started.set()
+                if self.block_clear:
+                    await self.release_clear.wait()
                 self._strengths[channel] = 0
                 executed.append({"action": action, "effective": dict(action)})
                 continue
@@ -246,6 +273,7 @@ class CycleHarness:
         effective_strength: int | None = None,
         omit_effective_strength: bool = False,
         invalid_effective_strength: bool = False,
+        block_clear: bool = False,
         on_cycle: Any = None,
     ) -> None:
         self.sleeper = ControlledSleeper()
@@ -258,12 +286,10 @@ class CycleHarness:
             effective_strength=effective_strength,
             omit_effective_strength=omit_effective_strength,
             invalid_effective_strength=invalid_effective_strength,
+            block_clear=block_clear,
         )
         self.records: list[CycleRecord] = []
-
-        def capture_record(record: CycleRecord) -> Any:
-            self.records.append(record)
-            return None if on_cycle is None else on_cycle(record)
+        record_callback = self.records.append if on_cycle is None else on_cycle
 
         self.runner = ChannelCycleRunner(
             channel=channel,
@@ -273,7 +299,7 @@ class CycleHarness:
             executor=self.executor,
             clock=lambda: self.sleeper.now_ms / 1000,
             sleeper=self.sleeper,
-            on_cycle=capture_record,
+            on_cycle=record_callback,
         )
 
     @property

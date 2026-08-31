@@ -8,6 +8,7 @@ from tests.timeline_fakes import (
     BlockingCycleCallback,
     CycleHarness,
     DeferredRunnerStart,
+    DurableCycleRecorder,
     SequenceGapRandom,
 )
 
@@ -92,6 +93,32 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
             callback.release.set()
             await asyncio.wait_for(stop_task, timeout=0.2)
 
+    async def test_cancelled_public_stop_still_finishes_clear_and_worker_teardown(self):
+        callback = BlockingCycleCallback()
+        harness = self.make_harness(
+            frames={"呼吸": ["f"] * 12},
+            on_cycle=callback,
+            block_clear=True,
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+
+        stop_task = asyncio.create_task(
+            harness.runner.stop(clear=True, reason="estop")
+        )
+        await asyncio.wait_for(harness.executor.clear_started.wait(), timeout=0.2)
+        await asyncio.wait_for(callback.entered.wait(), timeout=0.2)
+        stop_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await stop_task
+
+        harness.executor.release_clear.set()
+        callback.release.set()
+        state = await asyncio.wait_for(harness.runner.wait_stopped(), timeout=0.2)
+
+        self.assertEqual(state.phase, RunnerPhase.STOPPED)
+        self.assertFalse(state.worker_active)
+        self.assertEqual(harness.clear_calls, ["A"])
+
     async def test_cancelled_record_callback_stops_with_record_preserved(self):
         async def cancel_callback(record):
             raise asyncio.CancelledError
@@ -104,9 +131,9 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         await harness.flush()
 
         state = harness.runner.state()
-        self.assertEqual(len(harness.records), 1)
         self.assertEqual(state.phase, RunnerPhase.STOPPED)
         self.assertIn("callback", (state.failure or "").lower())
+        self.assertEqual(len(harness.runner.pending_records()), 1)
 
     async def test_record_callback_exception_surfaces_as_stopped_failure(self):
         async def fail_callback(record):
@@ -120,9 +147,40 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         await harness.flush()
 
         state = await asyncio.wait_for(harness.runner.wait_stopped(), timeout=0.2)
-        self.assertEqual(len(harness.records), 1)
         self.assertEqual(state.phase, RunnerPhase.STOPPED)
         self.assertIn("recorder failed", state.failure or "")
+        self.assertEqual(len(harness.runner.pending_records()), 1)
+
+    async def test_failed_record_delivery_is_durable_and_recoverable(self):
+        for failure in ("raise", "cancel"):
+            with self.subTest(failure=failure):
+                recorder = DurableCycleRecorder(failure)
+                harness = self.make_harness(
+                    frames={"呼吸": ["f"]},
+                    gap_tenths=[0],
+                    on_cycle=recorder,
+                )
+                await harness.runner.submit(
+                    CycleDirective("A", f"evt-{failure}", "呼吸", 20)
+                )
+                harness.sleeper.advance(100)
+                state = await asyncio.wait_for(
+                    harness.runner.wait_stopped(), timeout=0.2
+                )
+
+                self.assertEqual(recorder.records, {})
+                pending = harness.runner.pending_records()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].cycle_index, 1)
+                self.assertEqual(state.phase, RunnerPhase.STOPPED)
+
+                recorder.failure = "none"
+                await harness.runner.retry_pending_records()
+                self.assertEqual(recorder.records[("A", 1)], pending[0])
+                self.assertEqual(harness.runner.pending_records(), ())
+                self.assertEqual(harness.runner.state().phase, RunnerPhase.STOPPED)
+                await harness.runner.retry_pending_records()
+                self.assertEqual(len(recorder.records), 1)
 
     async def test_latest_pending_normal_change_wins(self):
         harness = self.make_harness(
@@ -264,6 +322,44 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.sent_cycles, [("A", "呼吸", 4), ("A", "呼吸", 4)])
         self.assertEqual(harness.executor.strength_calls, [("A", 20), ("A", 20)])
 
+    async def test_old_paused_worker_cannot_emit_or_clear_resumed_cycle_record(self):
+        callback = BlockingCycleCallback()
+        harness = self.make_harness(
+            frames={"呼吸": ["f"]}, gap_tenths=[0, 0], on_cycle=callback
+        )
+        await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
+        harness.sleeper.advance(100)
+        await asyncio.wait_for(callback.entered.wait(), timeout=0.2)
+
+        pause_task = asyncio.create_task(
+            harness.runner.pause(reason="operator_pause")
+        )
+        for _ in range(10):
+            if harness.runner.state().phase is RunnerPhase.PAUSED:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(harness.runner.state().phase, RunnerPhase.PAUSED)
+
+        await harness.runner.resume()
+        self.assertEqual(harness.sent_patterns, ["呼吸", "呼吸"])
+        callback.release.set()
+        await asyncio.wait_for(pause_task, timeout=0.2)
+        await harness.flush()
+
+        self.assertEqual(
+            [(record.cycle_index, record.completed) for record in callback.records],
+            [(1, True)],
+        )
+        self.assertEqual(harness.runner.pending_records(), ())
+        self.assertEqual(harness.runner.state().phase, RunnerPhase.CYCLE)
+
+        harness.sleeper.advance(100)
+        await harness.flush()
+        self.assertEqual(
+            [(record.cycle_index, record.completed) for record in callback.records],
+            [(1, True), (2, True)],
+        )
+
     async def test_zero_gap_does_not_call_sleeper_with_zero(self):
         harness = self.make_harness(frames={"呼吸": ["f"] * 2}, gap_tenths=[0])
         await harness.runner.submit(CycleDirective("A", "evt-1", "呼吸", 20))
@@ -311,10 +407,8 @@ class CycleRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 state = await harness.runner.wait_stopped()
                 self.assertIn("effective_strength", state.failure or "")
-                self.assertEqual(
-                    harness.records[-1].interruption_reason,
-                    "executor_invalid_result",
-                )
+                self.assertEqual(harness.records, [])
+                self.assertEqual(harness.runner.pending_records(), ())
 
     async def test_ab_gap_stream_is_independent_of_extra_a_cycle(self):
         session_seed = 0

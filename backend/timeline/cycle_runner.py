@@ -52,16 +52,21 @@ class RunnerState:
     generation: int
     failure: str | None
     disconnected: bool
+    worker_active: bool
 
 
 @dataclass
-class _CycleDraft:
+class _CycleAttempt:
     directive: CycleDirective
     cycle_index: int
     waveform_hash: str
     active_start_offset_ms: int
     raw_duration_ms: int
     effective_strength: int
+    raw_completed: bool = False
+    gap_tenths: int = 0
+    planned_gap_ms: int = 0
+    gap_started_ms: int | None = None
 
 
 class _CycleCallbackError(RuntimeError):
@@ -120,7 +125,11 @@ class ChannelCycleRunner:
         self._on_cycle = on_cycle
 
         self._lock = asyncio.Lock()
+        self._delivery_lock = asyncio.Lock()
+        self._pending_records: dict[tuple[str, int], CycleRecord] = {}
         self._worker: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[None] | None = None
+        self._cancel_reasons: dict[asyncio.Task[None], str] = {}
         self._gap_sleep: asyncio.Task[None] | None = None
         self._generation = 0
         self._phase = RunnerPhase.IDLE
@@ -130,15 +139,8 @@ class ChannelCycleRunner:
         self._failure: str | None = None
         self._disconnected = False
         self._stopped = asyncio.Event()
-        self._cancel_reason = "cancelled"
         self._needs_activation = True
         self._effective_strength: int | None = None
-
-        self._draft: _CycleDraft | None = None
-        self._raw_completed = False
-        self._gap_tenths = 0
-        self._planned_gap_ms = 0
-        self._gap_started_ms: int | None = None
 
     def state(self) -> RunnerState:
         return RunnerState(
@@ -149,7 +151,17 @@ class ChannelCycleRunner:
             generation=self._generation,
             failure=self._failure,
             disconnected=self._disconnected,
+            worker_active=self._worker is not None and not self._worker.done(),
         )
+
+    def pending_records(self) -> tuple[CycleRecord, ...]:
+        """Return records whose callback delivery has not succeeded."""
+        return tuple(self._pending_records.values())
+
+    async def retry_pending_records(self) -> None:
+        """Retry durable delivery without changing terminal runner state."""
+        for record in tuple(self._pending_records.values()):
+            await self._deliver_record(record)
 
     async def submit(self, directive: CycleDirective) -> None:
         if not isinstance(directive, CycleDirective):
@@ -203,9 +215,21 @@ class ChannelCycleRunner:
 
     async def stop(self, *, clear: bool = False, reason: str = "stop") -> None:
         self._require_reason(reason)
+        async with self._lock:
+            stop_task = self._stop_task
+            if stop_task is None or stop_task.done():
+                stop_task = asyncio.create_task(
+                    self._finish_stop(clear=clear, reason=reason),
+                    name=f"timeline-stop-{self.channel}",
+                )
+                self._stop_task = stop_task
+                stop_task.add_done_callback(self._stop_finished)
+        await asyncio.shield(stop_task)
+
+    async def _finish_stop(self, *, clear: bool, reason: str) -> None:
         worker = await self._invalidate_worker(RunnerPhase.STOPPED, reason)
-        if clear:
-            try:
+        try:
+            if clear:
                 executed, dropped = await self._executor.execute(
                     [{"op": "clear", "channel": self.channel}]
                 )
@@ -214,11 +238,14 @@ class ChannelCycleRunner:
                 ):
                     self._failure = self._format_rejection(dropped, "clear was not executed")
                     self._disconnected = self._is_disconnect(dropped)
-            except Exception as exc:  # the stopped phase remains authoritative
-                self._failure = str(exc) or type(exc).__name__
-                self._disconnected = isinstance(exc, ConnectionError) or self._is_disconnect(exc)
-        await self._wait_worker(worker)
-        self._stopped.set()
+        except Exception as exc:  # the stopped phase remains authoritative
+            self._failure = str(exc) or type(exc).__name__
+            self._disconnected = isinstance(exc, ConnectionError) or self._is_disconnect(exc)
+        finally:
+            try:
+                await self._wait_worker(worker)
+            finally:
+                self._stopped.set()
 
     async def wait_stopped(self) -> RunnerState:
         await self._stopped.wait()
@@ -235,6 +262,7 @@ class ChannelCycleRunner:
             self._run(generation, startup), name=f"timeline-cycle-{self.channel}"
         )
         self._worker = worker
+        self._cancel_reasons[worker] = "cancelled"
         worker.add_done_callback(
             lambda completed: self._worker_finished(completed, startup)
         )
@@ -249,10 +277,10 @@ class ChannelCycleRunner:
             self._generation += 1
             self._phase = target
             self._pending = None
-            self._cancel_reason = reason
             self._needs_activation = True
             worker = self._worker
             if worker is not None and not worker.done():
+                self._cancel_reasons[worker] = reason
                 worker.cancel()
             return worker
 
@@ -267,6 +295,7 @@ class ChannelCycleRunner:
     async def _run(
         self, generation: int, startup: asyncio.Future[None]
     ) -> None:
+        attempt: _CycleAttempt | None = None
         try:
             while True:
                 directive = await self._prepare_next_directive(generation)
@@ -277,7 +306,7 @@ class ChannelCycleRunner:
                 raw_duration_ms = self.policy.cycle_ms(len(frames))
                 self._cycle_index += 1
                 self._phase = RunnerPhase.CYCLE
-                self._draft = _CycleDraft(
+                attempt = _CycleAttempt(
                     directive=directive,
                     cycle_index=self._cycle_index,
                     waveform_hash=self._waveform_hash(frames),
@@ -289,10 +318,6 @@ class ChannelCycleRunner:
                         else self._effective_strength
                     ),
                 )
-                self._raw_completed = False
-                self._gap_tenths = 0
-                self._planned_gap_ms = 0
-                self._gap_started_ms = None
 
                 actions: list[dict[str, Any]] = []
                 if self._needs_activation:
@@ -316,19 +341,34 @@ class ChannelCycleRunner:
                     raise
                 except Exception as exc:
                     self._resolve_startup(startup)
+                    record = self._record_from_attempt(
+                        attempt,
+                        completed=False,
+                        interruption_reason="executor_failure",
+                    )
+                    attempt = None
                     await self._stop_for_failure(
-                        exc, interruption_reason="executor_failure"
+                        exc,
+                        record=record,
                     )
                     return
 
+                if not await self._generation_is_current(generation):
+                    return
                 if dropped or not all(
                     self._action_was_executed(executed, action) for action in actions
                 ) or not self._action_was_executed(executed, pulse):
                     self._resolve_startup(startup)
+                    record = self._record_from_attempt(
+                        attempt,
+                        completed=False,
+                        interruption_reason="executor_rejected",
+                    )
+                    attempt = None
                     await self._stop_for_failure(
                         self._format_rejection(dropped, "requested action was not executed"),
-                        interruption_reason="executor_rejected",
                         disconnected=self._is_disconnect(dropped),
+                        record=record,
                     )
                     return
 
@@ -339,58 +379,72 @@ class ChannelCycleRunner:
                         )
                     except ValueError as exc:
                         self._resolve_startup(startup)
+                        attempt = None
                         await self._stop_for_failure(
-                            exc, interruption_reason="executor_invalid_result"
+                            exc,
                         )
                         return
-                    self._draft.effective_strength = self._effective_strength
+                    attempt.effective_strength = self._effective_strength
                 self._needs_activation = False
                 self._resolve_startup(startup)
 
                 await self._sleeper.sleep(raw_duration_ms)
-                self._raw_completed = True
+                attempt.raw_completed = True
                 if not await self._generation_is_current(generation):
                     return
 
                 pending = await self._take_pending(generation)
                 if pending is not None:
-                    await self._emit_current(completed=True, interruption_reason=None)
+                    record = self._record_from_attempt(
+                        attempt, completed=True, interruption_reason=None
+                    )
+                    attempt = None
+                    await self._deliver_record(record)
                     self._directive = pending
                     self._needs_activation = True
                     continue
 
-                self._gap_tenths = self.policy.sample_tenths(self._rng)
-                self._planned_gap_ms = self.policy.gap_ms(
-                    len(frames), self._gap_tenths
+                attempt.gap_tenths = self.policy.sample_tenths(self._rng)
+                attempt.planned_gap_ms = self.policy.gap_ms(
+                    len(frames), attempt.gap_tenths
                 )
-                if self._planned_gap_ms == 0:
-                    await self._emit_current(completed=True, interruption_reason=None)
+                if attempt.planned_gap_ms == 0:
+                    record = self._record_from_attempt(
+                        attempt, completed=True, interruption_reason=None
+                    )
+                    attempt = None
+                    await self._deliver_record(record)
                     await asyncio.sleep(0)
                     continue
 
                 self._phase = RunnerPhase.GAP
-                self._gap_started_ms = self._now_ms()
-                self._gap_sleep = asyncio.create_task(
-                    self._sleeper.sleep(self._planned_gap_ms),
+                attempt.gap_started_ms = self._now_ms()
+                gap_sleep = asyncio.create_task(
+                    self._sleeper.sleep(attempt.planned_gap_ms),
                     name=f"timeline-gap-{self.channel}",
                 )
+                self._gap_sleep = gap_sleep
                 gap_interrupted = False
                 try:
-                    await self._gap_sleep
+                    await gap_sleep
                 except asyncio.CancelledError:
                     if asyncio.current_task().cancelling():
                         raise
                     gap_interrupted = True
                 finally:
-                    self._gap_sleep = None
+                    if self._gap_sleep is gap_sleep:
+                        self._gap_sleep = None
 
                 if not await self._generation_is_current(generation):
                     return
                 pending = await self._take_pending(generation)
-                await self._emit_current(
+                record = self._record_from_attempt(
+                    attempt,
                     completed=True,
                     interruption_reason="event_change" if gap_interrupted else None,
                 )
+                attempt = None
+                await self._deliver_record(record)
                 if pending is not None:
                     self._directive = pending
                     self._needs_activation = True
@@ -398,18 +452,27 @@ class ChannelCycleRunner:
                 await asyncio.sleep(0)
         except _CycleCallbackError as exc:
             await self._stop_for_failure(
-                exc, interruption_reason="callback_failure"
+                exc,
             )
         except asyncio.CancelledError:
             try:
-                if self._draft is not None:
-                    await self._emit_current(
-                        completed=self._raw_completed,
-                        interruption_reason=self._cancel_reason,
+                if attempt is not None:
+                    task = asyncio.current_task()
+                    reason = (
+                        self._cancel_reasons.get(task, "cancelled")
+                        if task is not None
+                        else "cancelled"
                     )
+                    record = self._record_from_attempt(
+                        attempt,
+                        completed=attempt.raw_completed,
+                        interruption_reason=reason,
+                    )
+                    attempt = None
+                    await self._deliver_record(record)
             except _CycleCallbackError as exc:
                 await self._stop_for_failure(
-                    exc, interruption_reason="callback_failure"
+                    exc,
                 )
         finally:
             self._resolve_startup(startup)
@@ -450,51 +513,76 @@ class ChannelCycleRunner:
         self,
         failure: object,
         *,
-        interruption_reason: str,
         disconnected: bool | None = None,
+        record: CycleRecord | None = None,
     ) -> None:
-        self._failure = str(failure) or type(failure).__name__
-        self._disconnected = (
-            self._is_disconnect(failure) if disconnected is None else disconnected
-        )
-        self._phase = RunnerPhase.STOPPED
-        self._generation += 1
-        try:
-            await self._emit_current(
-                completed=False, interruption_reason=interruption_reason
+        other_worker: asyncio.Task[None] | None = None
+        async with self._lock:
+            self._failure = str(failure) or type(failure).__name__
+            self._disconnected = (
+                self._is_disconnect(failure) if disconnected is None else disconnected
             )
+            self._phase = RunnerPhase.STOPPED
+            self._generation += 1
+            current = asyncio.current_task()
+            if (
+                self._worker is not None
+                and self._worker is not current
+                and not self._worker.done()
+            ):
+                other_worker = self._worker
+                self._cancel_reasons[other_worker] = "callback_failure"
+                other_worker.cancel()
+        try:
+            if record is not None:
+                await self._deliver_record(record)
         except _CycleCallbackError as exc:
             self._failure = str(exc)
         finally:
+            await self._wait_worker(other_worker)
             self._stopped.set()
 
-    async def _emit_current(
-        self, *, completed: bool, interruption_reason: str | None
-    ) -> None:
-        draft = self._draft
-        if draft is None:
-            return
+    def _record_from_attempt(
+        self,
+        attempt: _CycleAttempt,
+        *,
+        completed: bool,
+        interruption_reason: str | None,
+    ) -> CycleRecord:
         actual_gap_ms = 0
-        if self._gap_started_ms is not None:
-            actual_gap_ms = max(0, self._now_ms() - self._gap_started_ms)
-            actual_gap_ms = min(actual_gap_ms, self._planned_gap_ms)
-        record = CycleRecord(
+        if attempt.gap_started_ms is not None:
+            actual_gap_ms = max(0, self._now_ms() - attempt.gap_started_ms)
+            actual_gap_ms = min(actual_gap_ms, attempt.planned_gap_ms)
+        return CycleRecord(
             channel=self.channel,
-            cycle_index=draft.cycle_index,
-            plot_event_id=draft.directive.plot_event_id,
-            pattern=draft.directive.pattern,
-            waveform_hash=draft.waveform_hash,
-            requested_strength=draft.directive.requested_strength,
-            effective_strength=draft.effective_strength,
-            active_start_offset_ms=draft.active_start_offset_ms,
-            raw_duration_ms=draft.raw_duration_ms,
-            gap_tenths=self._gap_tenths,
-            planned_gap_ms=self._planned_gap_ms,
+            cycle_index=attempt.cycle_index,
+            plot_event_id=attempt.directive.plot_event_id,
+            pattern=attempt.directive.pattern,
+            waveform_hash=attempt.waveform_hash,
+            requested_strength=attempt.directive.requested_strength,
+            effective_strength=attempt.effective_strength,
+            active_start_offset_ms=attempt.active_start_offset_ms,
+            raw_duration_ms=attempt.raw_duration_ms,
+            gap_tenths=attempt.gap_tenths,
+            planned_gap_ms=attempt.planned_gap_ms,
             actual_gap_ms=actual_gap_ms,
             completed=completed,
             interruption_reason=interruption_reason,
         )
-        self._draft = None
+
+    async def _deliver_record(self, record: CycleRecord) -> None:
+        key = (record.channel, record.cycle_index)
+        self._pending_records.setdefault(key, record)
+        async with self._delivery_lock:
+            pending = self._pending_records.get(key)
+            if pending is None:
+                return
+            cancelled_after_delivery = await self._invoke_callback(pending)
+            self._pending_records.pop(key, None)
+            if cancelled_after_delivery:
+                raise asyncio.CancelledError
+
+    async def _invoke_callback(self, record: CycleRecord) -> bool:
         try:
             result = self._on_cycle(record)
         except asyncio.CancelledError as exc:
@@ -502,12 +590,14 @@ class ChannelCycleRunner:
         except Exception as exc:
             raise _CycleCallbackError(f"cycle callback failed: {exc}") from exc
         if inspect.isawaitable(result):
-            await self._await_callback(result)
+            return await self._await_callback(result)
+        return False
 
-    async def _await_callback(self, result: Any) -> None:
+    async def _await_callback(self, result: Any) -> bool:
         delivery = asyncio.ensure_future(result)
         try:
             await asyncio.shield(delivery)
+            return False
         except asyncio.CancelledError as exc:
             if asyncio.current_task().cancelling():
                 try:
@@ -518,7 +608,7 @@ class ChannelCycleRunner:
                     raise _CycleCallbackError(
                         f"cycle callback failed: {callback_exc}"
                     ) from callback_exc
-                raise
+                return True
             raise _CycleCallbackError("cycle callback cancelled") from exc
         except Exception as exc:
             raise _CycleCallbackError(f"cycle callback failed: {exc}") from exc
@@ -527,10 +617,17 @@ class ChannelCycleRunner:
         self, worker: asyncio.Task[None], startup: asyncio.Future[None]
     ) -> None:
         self._resolve_startup(startup)
+        self._cancel_reasons.pop(worker, None)
         if self._worker is worker:
             self._worker = None
         if not worker.cancelled():
             worker.exception()
+
+    def _stop_finished(self, stop_task: asyncio.Task[None]) -> None:
+        if self._stop_task is stop_task:
+            self._stop_task = None
+        if not stop_task.cancelled():
+            stop_task.exception()
 
     @staticmethod
     def _resolve_startup(startup: asyncio.Future[None]) -> None:
