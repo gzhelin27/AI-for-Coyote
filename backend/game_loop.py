@@ -13,7 +13,6 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from .config import reload_character
 from .device_ops import CHANNEL, DeviceOps
@@ -405,8 +404,7 @@ class GameLoop:
             return await self.timeline_session.start_live()
 
         previous_character = self.cfg["character"]
-        if Path(str(self.cfg.get("character_file") or "")).exists():
-            reload_character(self.cfg)
+        reload_character(self.cfg)
         character = deepcopy(self.cfg["character"])
         try:
             result = await self.timeline_session.start_live()

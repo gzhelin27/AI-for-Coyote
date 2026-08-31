@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 import warnings
 
 import backend.main as main_module
-from backend.config import DEFAULTS
+from backend.config import DEFAULTS, reload_character
 from backend.timeline.replay_store import ReplaySummary
 from backend.timeline.session import SessionController
 from tests.test_game_loop_timeline import FakeRelay
@@ -132,6 +132,8 @@ roles:
         )
 
     async def test_real_app_state_refreshes_seed_and_manifest_metadata_per_session(self):
+        self.cfg["character"].pop("dlc_version")
+        self._write_character("prompt one", "one")
         with (
             self._fake_external_dependencies(),
             patch.object(
@@ -146,9 +148,7 @@ roles:
             first = await state.loop.finish_timeline_session()
 
             self.cfg["llm"]["model"] = "model-two"
-            self.cfg["character"]["role"] = "role-two"
-            self.cfg["character"]["profile"] = "profile-two"
-            self.cfg["character"]["dlc_version"] = "dlc-two"
+            self._write_character("prompt two", "two")
             second_state = await state.loop.start_timeline_session()
             second = await state.loop.finish_timeline_session()
 
@@ -158,13 +158,14 @@ roles:
         self.assertNotEqual(first_state.session_id, second_state.session_id)
         self.assertNotEqual(first.seed, second.seed)
         self.assertEqual(
-            (first.model, first.dlc_role, first.dlc_profile, first.dlc_version),
-            ("model-one", "role-one", "profile-one", "dlc-one"),
+            (first.model, first.dlc_role, first.dlc_profile),
+            ("model-one", "role-one", "profile-one"),
         )
         self.assertEqual(
-            (second.model, second.dlc_role, second.dlc_profile, second.dlc_version),
-            ("model-two", "role-two", "profile-two", "dlc-two"),
+            (second.model, second.dlc_role, second.dlc_profile),
+            ("model-two", "role-one", "profile-one"),
         )
+        self.assertNotEqual(first.dlc_version, second.dlc_version)
 
     async def test_manifest_uses_nonempty_app_dlc_and_waveform_policy_provenance(self):
         self.cfg["character"].pop("dlc_version")
@@ -415,6 +416,31 @@ roles:
         self.assertEqual(
             self.llm.chat.await_args.args[0]["prompt"],
             "你是一个有趣的互动角色。",
+        )
+
+    async def test_new_session_after_character_deletion_uses_default_input_and_fingerprint(self):
+        self.cfg["character"].pop("dlc_version")
+        self._write_character("prompt A", "A")
+        with self._fake_external_dependencies():
+            state = main_module.AppState(self.cfg)
+            await state.loop.start_timeline_session()
+            await state.loop.stop_timeline_session()
+            Path(self.cfg["character_file"]).unlink()
+
+            expected_cfg = deepcopy(self.cfg)
+            reload_character(expected_cfg)
+            await state.loop.start_timeline_session()
+            await state.loop._autopilot_turn()
+            summary = await state.loop.finish_timeline_session()
+
+        manifest = state.replay_store.load(summary.replay_id).manifest
+        self.assertEqual(
+            self.llm.chat.await_args.args[0]["prompt"],
+            "你是一个有趣的互动角色。",
+        )
+        self.assertEqual(
+            manifest.dlc_fingerprint,
+            main_module._dlc_provenance(expected_cfg),
         )
     async def test_manifest_uses_controller_waveform_policy_after_config_drift(self):
         self.cfg["character"].pop("dlc_version")

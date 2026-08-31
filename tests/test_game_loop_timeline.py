@@ -132,6 +132,31 @@ def make_game_loop_for_test(
         "rage_baseline": 0,
         "player_nick": "tester",
     }
+    character_path = Path(cfg["character_file"])
+    character_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path = character_path.with_name("private-prompt.txt")
+    prompt_path.write_text("timeline test prompt", encoding="utf-8")
+    character_path.write_text(
+        f"""role: 触手
+profile: 纯爱
+roles:
+  触手:
+    name: 触手
+    title: 主人
+    profiles:
+      纯爱:
+        level: 中
+        prompt_file: {prompt_path.as_posix()}
+  装置:
+    name: 装置
+    title: 主人
+    profiles:
+      调教:
+        level: 中
+        prompt_file: {prompt_path.as_posix()}
+""",
+        encoding="utf-8",
+    )
     raw_frames = ["RAW_FRAME_SECRET_0"]
     cfg["presets"]["呼吸"] = {
         "waveform": "wave_test",
