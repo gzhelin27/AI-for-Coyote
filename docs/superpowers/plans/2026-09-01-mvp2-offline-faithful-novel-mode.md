@@ -133,11 +133,12 @@ Commit: `feat: import Codex story analysis offline`
 **Files:**
 - Create: `backend/story/planner.py`
 - Create: `tests/test_story_planner.py`
+- Modify: `backend/llm.py`
 - Modify only if a shared serializable event field is required: `backend/timeline/models.py`
 
 **Interfaces:**
-- Consumes: validated `StoryMap`, one selected `StoryChapter`, existing waveform registry, effective A/B caps, `CycleGapPolicy`, and MVP1 seeded resolver.
-- Produces: `ChapterPlanner.plan(story: ImportedStory, story_map: StoryMap, chapter_id: str, *, speed: Literal["slow", "standard", "fast"], seed: int) -> ValidatedChapterPlan` and `ChapterPlanError`.
+- Consumes: validated `StoryMap`, one selected `StoryChapter`, an injected structured chapter-plan client, existing waveform registry, effective A/B caps, `CycleGapPolicy`, and MVP1 seeded resolver.
+- Produces: `await ChapterPlanner.plan(story: ImportedStory, story_map: StoryMap, chapter_id: str, *, speed: Literal["slow", "standard", "fast"], seed: int) -> ValidatedChapterPlan` and `ChapterPlanError`.
 - `ValidatedChapterPlan` contains source/chapter identity, speed, seed, ordered resolved plot events, chapter duration, and a dry-validated timeline request; it owns no player or device.
 
 - [ ] **Step 1: Write failing faithful planning tests**
@@ -145,11 +146,11 @@ Commit: `feat: import Codex story analysis offline`
 Cover exact scene order, full selected-chapter coverage, deterministic same-seed output, different-seed permitted variation, only allowed waveforms, per-channel `keep|set|stop`, base strength within effective cap, scene pace timing, and all-or-nothing rejection.
 
 ```python
-def test_same_seed_and_speed_produce_same_plan(self):
-    first = self.planner.plan(self.story, self.story_map, self.chapter_id,
-                              speed="standard", seed=88)
-    second = self.planner.plan(self.story, self.story_map, self.chapter_id,
-                               speed="standard", seed=88)
+async def test_same_seed_and_speed_produce_same_plan(self):
+    first = await self.planner.plan(self.story, self.story_map, self.chapter_id,
+                                    speed="standard", seed=88)
+    second = await self.planner.plan(self.story, self.story_map, self.chapter_id,
+                                     speed="standard", seed=88)
     self.assertEqual(first, second)
 ```
 
@@ -161,7 +162,9 @@ Expected: FAIL because the planner module does not exist.
 
 - [ ] **Step 3: Implement pure planning and dry validation**
 
-Compute scene duration from normalized character count, configured CPM, and scene pace. Produce one ordered plot event per scene. Reuse the accepted MVP1 resolver for seeded waveform, strength jitter, and cycle-relative gaps; do not add a second random engine. Validate every event through the existing safety adapter without emitting frames. Return no partial plan on any failure.
+Send only the selected chapter text, its ordered scene offsets/summaries, allowed A/B capabilities, and faithful constraints through one injected structured request. Require exactly one response entry per scene and exactly A/B directives; `keep` and `stop` reject pattern/strength fields, while `set` requires allowed intent fields within effective caps. Do not send the whole novel, chat, camera, microphone, or retry by chunking.
+
+Compute scene duration from normalized character count, configured CPM, and scene pace. Produce one ordered plot event per scene. Reuse the accepted MVP1 resolver for seeded waveform, strength jitter, and cycle-relative gaps; do not add a second random engine. Validate every event through the existing safety adapter without emitting frames. Any model, schema, timing, or safety failure raises `ChapterPlanError` and returns no partial plan.
 
 - [ ] **Step 4: Verify and commit**
 
