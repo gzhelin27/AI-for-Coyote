@@ -1125,6 +1125,39 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(blocked.json()["dropped"])
         self.assertEqual(len(self.harness.relay.sent_frames), frame_count)
 
+    async def test_exceptional_helper_clear_fails_closed_and_blocks_later_output(self):
+        # Catches a helper-clear exception that escapes rollback before it
+        # publishes the finite conservative waveform and durable clear work.
+        self.harness.safety.dry_run = False
+        self.harness.relay.fail_next_strength_delta("A")
+        self.harness.relay.fail_next_clear("A", RuntimeError("clear exploded"))
+
+        response = await self.client.post(
+            "/api/manual",
+            json={"op": "hold_strength", "channel": "A", "value": 5},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["dropped"])
+        confirmed = self.harness.loop.output_coordinator.confirmed("A")
+        self.assertEqual(confirmed.strength, 0)
+        self.assertEqual(confirmed.waveform, "呼吸")
+        self.assertEqual(confirmed.waveform_mode, "finite")
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("A").clear_required
+        )
+        self.assertNotIn("A", self.harness.loop.loop_tasks)
+
+        frame_count = len(self.harness.relay.sent_frames)
+        blocked = await self.client.post(
+            "/api/manual",
+            json={"op": "pulse", "channel": "A", "pattern": "呼吸"},
+        )
+
+        self.assertEqual(blocked.status_code, 200)
+        self.assertTrue(blocked.json()["dropped"])
+        self.assertEqual(len(self.harness.relay.sent_frames), frame_count)
+
     async def test_missing_relay_ids_cannot_confirm_empty_helper_cleanup(self):
         self.harness.safety.dry_run = False
         self.harness.relay.fail_next_strength_delta("A")
