@@ -10,6 +10,7 @@ export default function ChatPanel() {
   const busy = useChat((st) => st.busy);
   const setBusy = useChat((st) => st.setBusy);
   const timeline = useApp((st) => st.state?.timeline);
+  const storySession = useApp((st) => st.state?.story.session);
   const relay = useApp((st) => st.state?.relay);
   const paired = relay?.status === "paired";
   const enabled = useApp((st) => st.state?.enabled_channels);
@@ -47,7 +48,13 @@ export default function ChatPanel() {
   }, [paired]);
 
   const sessionLabel =
-    timeline?.mode === "replay"
+    storySession?.status === "planning"
+      ? "小说章节规划中"
+      : storySession?.status === "running"
+        ? "小说忠实阅读中"
+        : storySession?.status === "paused"
+          ? "小说阅读已暂停"
+          : timeline?.mode === "replay"
       ? timeline.status === "paused"
         ? "重放已暂停"
         : "重放中"
@@ -95,6 +102,7 @@ export default function ChatPanel() {
         </div>
         <div className="ml-auto flex items-center gap-2">
           <span className="rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-muted">{sessionLabel}</span>
+          <span className="rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-warn">不改变原文剧情</span>
           <button
             onClick={() => {
               if (!window.confirm("清空对话历史？将清空聊天记录与 AI 的记忆上下文，设备强度不受影响。")) return;

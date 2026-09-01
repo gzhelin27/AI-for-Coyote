@@ -35,6 +35,13 @@ body {
   background: rgba(247, 217, 122, 0.3);
 }
 
+.reader-text {
+  max-height: 46vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ---------- 滑杆 ---------- */
 input[type="range"] {
   -webkit-appearance: none;

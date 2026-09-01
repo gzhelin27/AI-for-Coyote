@@ -7,6 +7,7 @@ import PresetPanel from "./components/PresetPanel";
 import BottomBar from "./components/BottomBar";
 import ChatPanel from "./components/ChatPanel";
 import ReplayPanel from "./components/ReplayPanel";
+import NovelReader from "./components/NovelReader";
 import { PairView, SettingsView } from "./components/views";
 import { api, mapFullState } from "./api";
 import type { BackendFullState } from "./types";
@@ -195,6 +196,7 @@ export default function App() {
               <ReplayPanel historyOnly={false} />
             </div>
           )}
+          {view === "novel" && <NovelReader />}
           {view === "history" && <ReplayPanel historyOnly />}
           {view === "pair" && <PairView />}
           {view === "settings" && <SettingsView />}

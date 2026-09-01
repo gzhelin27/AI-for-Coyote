@@ -15,3 +15,14 @@ export class StateRefreshGate {
     return requestGeneration === this.generation;
   }
 }
+
+/** Keeps out-of-order full-state WebSocket frames from rewinding public state. */
+export class StateRevisionGate {
+  private lastApplied = -1;
+
+  shouldApply(stateRevision: number): boolean {
+    if (!Number.isFinite(stateRevision) || stateRevision < this.lastApplied) return false;
+    this.lastApplied = stateRevision;
+    return true;
+  }
+}

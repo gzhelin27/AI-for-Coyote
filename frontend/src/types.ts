@@ -45,6 +45,7 @@ export interface RoleInfo {
   profiles: RoleProfile[];
 }
 export interface FullState {
+  state_revision: number;
   estop: boolean;
   caps: Record<"A" | "B", number>;
   user_caps: Record<"A" | "B", number>;
@@ -122,6 +123,64 @@ export interface FullState {
     version: string;
   };
   timeline: TimelineSessionState;
+  story: StoryState;
+}
+
+export type StoryAnalysisStatus = "ready" | "missing" | "invalid";
+
+export interface StorySourceSummary {
+  source_id: string;
+  filename: string;
+  extension: ".txt" | ".md" | ".docx";
+  encoding: "auto" | "utf-8" | "gb18030";
+  hash_prefix: string;
+  text_length: number;
+}
+
+export interface StoryAnalysisDetail {
+  status: StoryAnalysisStatus;
+  hash_prefix: string;
+  analysis_version: string;
+  dlc_version: string;
+}
+
+export interface StoryChapterSummary {
+  chapter_id: string;
+  index: number;
+  title: string;
+  summary: string;
+  start_offset: number;
+  end_offset: number;
+  scene_count: number;
+}
+
+export type NovelSessionStatus = "idle" | "planning" | "validated" | "running" | "paused" | "finishing";
+
+export interface NovelSessionState {
+  status: NovelSessionStatus;
+  hash_prefix: string | null;
+  filename: string | null;
+  chapter_id: string | null;
+  speed: "slow" | "standard" | "fast" | null;
+  cursor: number;
+  current_scene_id: string | null;
+  reader_start_offset: number | null;
+  reader_end_offset: number | null;
+  progress: number;
+}
+
+export interface StoryState {
+  selected_source: StorySourceSummary | null;
+  analysis: StoryAnalysisDetail | null;
+  chapters: StoryChapterSummary[];
+  session: NovelSessionState;
+}
+
+export interface ReaderTextSlice {
+  start: number;
+  end: number;
+  text_length: number;
+  text: string;
 }
 
 export interface ExecutedItem {

@@ -1,10 +1,11 @@
-import { Plus, Settings, ShieldAlert, SlidersHorizontal } from "lucide-react";
+import { BookOpen, Plus, Settings, ShieldAlert, SlidersHorizontal } from "lucide-react";
 import { doEstop } from "../commands";
 import { useApp } from "../store";
 import type { ViewName } from "./TopBar";
 import AccessoryConfig from "./AccessoryConfig";
 import CharacterConfig from "./CharacterConfig";
 import RoleCard from "./RoleCard";
+import NovelImport from "./NovelImport";
 
 interface Props {
   view: ViewName;
@@ -50,6 +51,7 @@ export default function Sidebar({ view, onView }: Props) {
 
       <div className="flex flex-col gap-1">
         <SideBtn icon={<SlidersHorizontal size={16} />} label="控制台" active={view === "control"} onClick={() => onView("control")} />
+        <SideBtn icon={<BookOpen size={16} />} label="小说阅读" active={view === "novel"} onClick={() => onView("novel")} />
         <SideBtn icon={<Plus size={16} />} label="添加 / 配对设备" active={view === "pair"} onClick={() => onView("pair")} />
         <SideBtn icon={<Settings size={16} />} label="设置" active={view === "settings"} onClick={() => onView("settings")} />
         <SideBtn icon={<ShieldAlert size={16} />} label="急停（长按空格）" danger onClick={doEstop} />
@@ -58,6 +60,8 @@ export default function Sidebar({ view, onView }: Props) {
       <AccessoryConfig />
 
       <CharacterConfig />
+
+      <NovelImport />
 
       <p className="mt-3 px-3 text-[11px] leading-relaxed text-faint">
         强度与波形均受安全上限钳制；

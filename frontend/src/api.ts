@@ -8,17 +8,45 @@ import type {
   FullState,
   ManualResult,
   NetworkInfo,
+  NovelSessionState,
+  ReaderTextSlice,
   ReplayHistoryItem,
+  StoryAnalysisDetail,
+  StoryChapterSummary,
+  StorySourceSummary,
   TimelineSessionState,
 } from "./types";
+
+export function mapStoryError(code: unknown): string {
+  switch (code) {
+    case "analysis_missing":
+      return "尚未导入匹配的离线分析";
+    case "analysis_invalid":
+      return "离线分析无效，请重新生成并导入";
+    case "reader_range_invalid":
+      return "无法读取当前正文片段";
+    case "story_not_found":
+    case "story_reader_missing":
+      return "当前小说不可用，请重新导入";
+    case "chapter_plan_failed":
+      return "章节规划未完成，无法启动阅读";
+    case "story_runtime_busy":
+    case "story_planning_active":
+      return "小说会话正在处理中";
+    default:
+      return "小说操作失败";
+  }
+}
 
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
     let msg = `${resp.status} ${resp.statusText}`;
     try {
-      const data = (await resp.json()) as { error?: string };
-      if (data?.error) msg = data.error;
+      const data = (await resp.json()) as { code?: unknown; error?: string };
+      if (typeof data?.code === "string" && (data.code.startsWith("story_") || data.code.startsWith("analysis_") || data.code === "reader_range_invalid" || data.code === "chapter_plan_failed")) {
+        msg = mapStoryError(data.code);
+      } else if (data?.error) msg = data.error;
     } catch {
       /* 无 JSON 错误体时用状态码提示 */
     }
@@ -156,6 +184,36 @@ export const api = {
       profile?: string | null;
     }>("/api/dlc/import", { method: "POST", body: fd });
   },
+  storyImport: (file: File, encoding: StorySourceSummary["encoding"]) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("encoding", encoding);
+    return j<{ source: StorySourceSummary; analysis: StoryAnalysisDetail }>("/api/story/import", {
+      method: "POST",
+      body: fd,
+    });
+  },
+  storyAnalysis: (sourceId: string) =>
+    j<StoryAnalysisDetail>(`/api/story/${encodeURIComponent(sourceId)}/analysis`),
+  storyChapters: (sourceId: string) =>
+    j<{ source: StorySourceSummary; analysis: StoryAnalysisDetail; chapters: StoryChapterSummary[] }>(
+      `/api/story/${encodeURIComponent(sourceId)}/chapters`,
+    ),
+  storyPlay: (sourceId: string, chapterId: string, speed: "slow" | "standard" | "fast") =>
+    j<NovelSessionState>(
+      `/api/story/${encodeURIComponent(sourceId)}/chapters/${encodeURIComponent(chapterId)}/play`,
+      json({ speed }),
+    ),
+  storyReader: () =>
+    j<{ source: StorySourceSummary; analysis: StoryAnalysisDetail; session: NovelSessionState }>(
+      "/api/story/reader",
+    ),
+  storyReaderText: (start: number, end: number) =>
+    j<ReaderTextSlice>(`/api/story/reader/text?start=${start}&end=${end}`),
+  storyPause: () => j<NovelSessionState>("/api/story/pause", json({})),
+  storyResume: (from: "current" | "chapter_start" | "beginning") =>
+    j<NovelSessionState>("/api/story/resume", json({ from })),
+  storyFinish: () => j<{ session: NovelSessionState }>("/api/story/finish", json({})),
   setAutopilot: (enabled: boolean) =>
     j<{ ok: boolean }>("/api/autopilot", json({ enabled })),
   timelineStart: () =>
