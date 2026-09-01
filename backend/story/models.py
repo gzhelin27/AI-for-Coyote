@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,22 @@ def _require_offset(value: object, name: str) -> int:
     return value
 
 
+def _require_positive_finite_number(value: object, name: str) -> float | int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
+
+
+def _source_namespace(source_hash: str) -> str:
+    _require_non_empty_text(source_hash, "source hash")
+    return hashlib.sha256(source_hash.encode("utf-8")).hexdigest()[:12]
+
+
 @dataclass(frozen=True, slots=True)
 class StoryScene:
     """A source-ordered scene whose identifier is independent of analysis text."""
@@ -43,6 +60,7 @@ class StoryScene:
     start_offset: int
     end_offset: int
     summary: str
+    pace: float
 
     def __post_init__(self) -> None:
         _require_non_empty_text(self.id, "scene id")
@@ -51,17 +69,17 @@ class StoryScene:
         end_offset = _require_offset(self.end_offset, "scene end offset")
         if start_offset >= end_offset:
             raise ValueError("scene offsets must be increasing")
-        if not isinstance(self.summary, str):
-            raise ValueError("scene summary must be a string")
+        _require_non_empty_text(self.summary, "scene summary")
+        _require_positive_finite_number(self.pace, "scene pace")
 
     @staticmethod
     def stable_id(source_hash: str, chapter_index: int, scene_index: int) -> str:
         """Return the source-indexed ID without consulting generated content."""
 
-        _require_non_empty_text(source_hash, "source hash")
         _require_index(chapter_index, "chapter index")
         _require_index(scene_index, "scene index")
-        return f"ch-{chapter_index + 1:04d}-sc-{scene_index + 1:04d}"
+        namespace = _source_namespace(source_hash)
+        return f"ch-{namespace}-{chapter_index + 1:04d}-sc-{scene_index + 1:04d}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,8 +103,7 @@ class StoryChapter:
             raise ValueError("chapter offsets must be increasing")
         if not isinstance(self.title, str):
             raise ValueError("chapter title must be a string")
-        if not isinstance(self.summary, str):
-            raise ValueError("chapter summary must be a string")
+        _require_non_empty_text(self.summary, "chapter summary")
         if not isinstance(self.scenes, tuple) or not self.scenes:
             raise ValueError("chapter scenes must be a non-empty tuple")
         if not all(isinstance(scene, StoryScene) for scene in self.scenes):
@@ -96,9 +113,8 @@ class StoryChapter:
     def stable_id(source_hash: str, chapter_index: int) -> str:
         """Return the source-indexed ID without consulting generated content."""
 
-        _require_non_empty_text(source_hash, "source hash")
         _require_index(chapter_index, "chapter index")
-        return f"ch-{chapter_index + 1:04d}"
+        return f"ch-{_source_namespace(source_hash)}-{chapter_index + 1:04d}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,10 +122,14 @@ class StoryMap:
     """The complete, ordered scene map for one imported source hash."""
 
     source_hash: str
+    text_length: int
     chapters: tuple[StoryChapter, ...]
 
     def __post_init__(self) -> None:
         source_hash = _require_non_empty_text(self.source_hash, "source hash")
+        text_length = _require_offset(self.text_length, "story text length")
+        if text_length == 0:
+            raise ValueError("story text length must be positive")
         if not isinstance(self.chapters, tuple) or not self.chapters:
             raise ValueError("story map chapters must be a non-empty tuple")
         if not all(isinstance(chapter, StoryChapter) for chapter in self.chapters):
@@ -121,8 +141,8 @@ class StoryMap:
                 raise ValueError("chapter indexes must be contiguous and zero-based")
             if chapter.id != StoryChapter.stable_id(source_hash, chapter_index):
                 raise ValueError("chapter id does not match its source index")
-            if chapter.start_offset < previous_chapter_end:
-                raise ValueError("chapter offsets must be source-ordered")
+            if chapter.start_offset != previous_chapter_end:
+                raise ValueError("chapters must exactly partition the story text")
             previous_scene_end = chapter.start_offset
             for scene_index, scene in enumerate(chapter.scenes):
                 if scene.index != scene_index:
@@ -136,10 +156,14 @@ class StoryMap:
                     and scene.end_offset <= chapter.end_offset
                 ):
                     raise ValueError("scene offsets must remain within their chapter")
-                if scene.start_offset < previous_scene_end:
-                    raise ValueError("scene offsets must be source-ordered")
+                if scene.start_offset != previous_scene_end:
+                    raise ValueError("scenes must exactly partition their chapter")
                 previous_scene_end = scene.end_offset
+            if previous_scene_end != chapter.end_offset:
+                raise ValueError("scenes must cover their entire chapter")
             previous_chapter_end = chapter.end_offset
+        if previous_chapter_end != text_length:
+            raise ValueError("chapters must cover the entire story text")
 
 
 @dataclass(frozen=True, slots=True)
