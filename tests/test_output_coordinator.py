@@ -47,6 +47,9 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             coordinator.helper_generation("A"), before_helper_generation
         )
+        self.assertIs(
+            coordinator._slot("A").minimum_priority, OutputIntentKind.MANUAL
+        )
         with self.assertRaises(FrozenInstanceError):
             result.reduction_required = True
 
@@ -74,6 +77,9 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             coordinator.helper_generation("A"), before_helper_generation
+        )
+        self.assertIs(
+            coordinator._slot("A").minimum_priority, OutputIntentKind.MANUAL
         )
 
     async def test_over_cap_report_atomically_blocks_normal_transport(self):
@@ -110,9 +116,36 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             coordinator.helper_generation("A"), before_helper_generation
         )
+        self.assertIs(
+            coordinator._slot("A").minimum_priority,
+            OutputIntentKind.SAFETY_REDUCE,
+        )
         self.assertFalse(normal.sent)
         self.assertEqual(normal.error, "blocked by higher-priority output intent")
         self.assertFalse(normal_transport_called)
+
+    async def test_over_cap_report_preserves_a_stricter_pending_target(self):
+        # Catches an over-cap report that weakens a previously established
+        # safety target instead of retaining the strictest reduction.
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=30, enabled=True)
+        coordinator.mark_reduction("A", 12)
+        before_generation = coordinator.generation("A")
+        before_normal_epoch = coordinator.normal_policy_epoch("A")
+
+        result = await coordinator.reconcile_reported_strength("A", 30, 20)
+
+        self.assertTrue(result.reduction_required)
+        self.assertEqual(result.confirmed.strength, 30)
+        self.assertEqual(coordinator.pending("A").target_strength, 12)
+        self.assertEqual(coordinator.generation("A"), before_generation + 1)
+        self.assertEqual(
+            coordinator.normal_policy_epoch("A"), before_normal_epoch + 1
+        )
+        self.assertIs(
+            coordinator._slot("A").minimum_priority,
+            OutputIntentKind.SAFETY_REDUCE,
+        )
 
     async def test_failed_transport_does_not_commit_confirmed_state(self):
         coordinator = DeviceOutputCoordinator()

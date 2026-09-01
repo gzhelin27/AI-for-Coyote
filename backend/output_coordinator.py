@@ -181,13 +181,11 @@ class DeviceOutputCoordinator:
         return await _await_cleanup(task)
 
     async def reconcile_reported_strength(
-        self, channel: str, reported_strength: int, cap: int
+        self, channel: str, reported_strength: int | None, cap: int
     ) -> ReportReconciliation:
-        """Atomically accept a device report and establish reduction ownership."""
+        """Atomically accept a report, or reconcile current output with a cap."""
         slot = self._slot(channel)
         strength = _strength(reported_strength)
-        if strength is None:
-            raise ValueError("reported strength cannot be None")
         effective_cap = _strength(cap)
         if effective_cap is None:
             raise ValueError("cap cannot be None")
@@ -257,10 +255,15 @@ class DeviceOutputCoordinator:
     @staticmethod
     async def _reconcile_reported_strength_locked(
         slot: _ChannelSlot,
-        strength: int,
+        reported_strength: int | None,
         effective_cap: int,
     ) -> ReportReconciliation:
         async with slot.lock:
+            strength = reported_strength
+            if strength is None:
+                strength = slot.confirmed.strength
+                if strength is None:
+                    return ReportReconciliation(slot.confirmed, False)
             if slot.confirmed.strength == strength and strength <= effective_cap:
                 return ReportReconciliation(slot.confirmed, False)
 

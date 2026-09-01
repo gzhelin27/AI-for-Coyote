@@ -874,6 +874,72 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
                 return_exceptions=True,
             )
 
+    async def test_policy_only_report_reconciles_the_strength_committed_while_waiting(self):
+        # Catches policy-only reconciliation that snapshots confirmed strength
+        # before the channel lock, overwrites a newer transport, and misses its
+        # required reduction under the newly lowered cap.
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.current["A"] = 10
+        loop.output_coordinator.seed_confirmed("A", strength=10, enabled=True)
+        controller = StalledSafetyController()
+        loop.timeline_session = controller
+        normal_started = asyncio.Event()
+        release_normal = asyncio.Event()
+        reconciliation_started = asyncio.Event()
+
+        async def normal_transport(_state):
+            normal_started.set()
+            await release_normal.wait()
+            relay.report_strength("A", 30)
+            return TransportOutcome(sent=True, effective={"strength": 30})
+
+        original_reconcile = loop.output_coordinator.reconcile_reported_strength
+
+        async def observed_reconcile(*args, **kwargs):
+            reconciliation_started.set()
+            return await original_reconcile(*args, **kwargs)
+
+        loop.output_coordinator.reconcile_reported_strength = observed_reconcile
+        normal = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, normal_transport
+            )
+        )
+        await asyncio.wait_for(normal_started.wait(), timeout=1)
+        policy_only = asyncio.create_task(
+            loop.update_device_state(
+                None,
+                {"channelA": {"comfortLimit": {"overheat": True}}},
+            )
+        )
+        try:
+            await asyncio.wait_for(reconciliation_started.wait(), timeout=1)
+            release_normal.set()
+            await normal
+            await wait_for_condition(
+                lambda: controller.suspend_started.is_set() or policy_only.done()
+            )
+
+            self.assertEqual(relay.physical_strength[0], 30)
+            self.assertEqual(loop.output_coordinator.confirmed("A").strength, 30)
+            self.assertEqual(
+                loop.output_coordinator.pending("A").target_strength, 20
+            )
+            self.assertGreater(loop.output_coordinator.generation("A"), 0)
+            self.assertGreater(loop.output_coordinator.normal_policy_epoch("A"), 0)
+
+            controller.release_suspend.set()
+            result = await policy_only
+
+            self.assertEqual(result["A"]["dropped"], [])
+            self.assertEqual(relay.physical_strength[0], 20)
+        finally:
+            release_normal.set()
+            controller.release_suspend.set()
+            await asyncio.gather(normal, policy_only, return_exceptions=True)
+
     async def test_cancelled_report_retains_pending_reduction_until_identical_retry(self):
         # Catches cancellation that reaches the caller before an accepted report
         # has atomically recorded its pending safety reduction.
@@ -1413,9 +1479,9 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
                 disabling, second_pulse, return_exceptions=True
             )
 
-    async def test_identical_report_keeps_floor_worker_as_its_live_owner(self):
-        # Catches an identical safe report that retires a continuous helper even
-        # though no physical output or safety policy changed.
+    async def test_safe_reports_keep_floor_worker_as_its_live_owner(self):
+        # Catches identical or changed-safe reports that retire a continuous
+        # helper even though no safety policy requires that ownership change.
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(relay=relay)
         self.addCleanup(loop._cancel_loops, None)
@@ -1435,19 +1501,25 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         worker = loop.loop_tasks["A"]
         helper_generation = loop.output_coordinator.helper_generation("A")
 
-        result = await loop.update_device_state({"intensityA": 5}, None)
-        await asyncio.wait_for(relay.second_pulse_sent.wait(), timeout=1)
+        for reported_strength in (5, 6):
+            loop.safety.pulse_until["A"] = 0.0
+            result = await loop.update_device_state(
+                {"intensityA": reported_strength}, None
+            )
 
-        self.assertEqual(result, {})
-        self.assertIs(loop.loop_tasks["A"], worker)
-        self.assertFalse(worker.done())
-        self.assertEqual(
-            loop.output_coordinator.helper_generation("A"), helper_generation
-        )
-        confirmed = loop.output_coordinator.confirmed("A")
-        self.assertEqual(confirmed.waveform, "呼吸")
-        self.assertEqual(confirmed.waveform_mode, "loop")
-        self.assertEqual(loop.patterns["A"], "呼吸")
+            self.assertEqual(result, {})
+            self.assertIs(loop.loop_tasks["A"], worker)
+            self.assertFalse(worker.done())
+            self.assertEqual(
+                loop.output_coordinator.helper_generation("A"), helper_generation
+            )
+            confirmed = loop.output_coordinator.confirmed("A")
+            self.assertEqual(confirmed.strength, reported_strength)
+            self.assertEqual(confirmed.waveform, "呼吸")
+            self.assertEqual(confirmed.waveform_mode, "loop")
+            self.assertEqual(loop.patterns["A"], "呼吸")
+
+        await asyncio.wait_for(relay.second_pulse_sent.wait(), timeout=1)
 
     async def test_cancelled_floor_worker_reaps_owner_and_marks_finite_batch(self):
         relay = GatedPhysicalRelay()

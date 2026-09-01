@@ -1123,10 +1123,6 @@ class GameLoop:
         self, props: dict | None, slot_state: dict | None
     ) -> dict[str, dict]:
         """Apply device feedback and retry every pending safety transition."""
-        revisions = {
-            channel: self.output_coordinator.revision(channel)
-            for channel in ("A", "B")
-        }
         policy_channels = {
             channel
             for channel, key in (("A", "channelA"), ("B", "channelB"))
@@ -1149,10 +1145,6 @@ class GameLoop:
             channel: int(self.safety.current[channel])
             for channel in confirmed_reports
         }
-        local_strengths = {
-            channel: int(self.safety.current[channel])
-            for channel in ("A", "B")
-        }
         affected = tuple(
             channel
             for channel in ("A", "B")
@@ -1165,8 +1157,6 @@ class GameLoop:
             self._reconcile_device_report_channel(
                 channel,
                 reported_strength=reported_strengths.get(channel),
-                local_strength=local_strengths[channel],
-                observed_revision=revisions[channel],
             )
             for channel in affected
         )
@@ -1181,18 +1171,11 @@ class GameLoop:
         channel: str,
         *,
         reported_strength: int | None,
-        local_strength: int,
-        observed_revision: int,
     ) -> dict | None:
         cap = self.safety.cap_for(channel)
-        strength = reported_strength
-        if strength is None:
-            strength = self.output_coordinator.confirmed(channel).strength
-        if strength is None:
-            strength = local_strength
         try:
             reconciliation = await self.output_coordinator.reconcile_reported_strength(
-                channel, strength, cap
+                channel, reported_strength, cap
             )
         finally:
             self._publish_coordinator_confirmed(channel)
