@@ -121,8 +121,6 @@ export default function App() {
       }
     };
 
-    // 初始状态
-    refreshState().then(schedulePoll).catch(() => {});
     // WebSocket 实时同步
     let ws: WebSocket;
     const connect = () => {
@@ -146,6 +144,8 @@ export default function App() {
       ws.onclose = () => {
         if (isCurrentRealtimeEpoch(epoch)) setTimeout(connect, 2000);
       };
+      // This fallback belongs to the epoch created immediately above, including reconnects.
+      void refreshState().then(schedulePoll).catch(() => {});
     };
     connect();
     document.addEventListener("visibilitychange", onVisibilityChange);

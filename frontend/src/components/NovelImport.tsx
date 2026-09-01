@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { api } from "../api";
+import { api, storyErrorMessage } from "../api";
 import { refreshAppState } from "../stateRefresh";
 import { useApp } from "../store";
 import { analysisStatusGuidance, buildMissingAnalysisCommand } from "../storyUi";
@@ -31,8 +31,8 @@ export default function NovelImport() {
       } catch {
         setNotice("原文已导入，正在等待状态刷新。");
       }
-    } catch {
-      setNotice("小说导入失败，请确认文件格式和编码后重试。");
+    } catch (cause) {
+      setNotice(storyErrorMessage(cause));
     } finally {
       setImporting(false);
     }

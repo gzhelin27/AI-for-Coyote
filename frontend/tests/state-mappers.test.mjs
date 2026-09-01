@@ -54,10 +54,25 @@ test("state synchronization rejects stale HTTP and WebSocket snapshots across re
   assert.equal(gate.shouldApplyRealtime(epoch, 11), false);
 });
 
+test("initial and reconnect fallback HTTP requests belong to their new realtime epoch", () => {
+  const gate = new StateSyncGate();
+  const initial = gate.beginRealtimeEpoch();
+  const initialHttp = gate.beginHttpRequest();
+  assert.equal(gate.shouldApplyHttp(initialHttp, 0), true);
+  const staleHttp = gate.beginHttpRequest();
+  const reconnect = gate.beginRealtimeEpoch();
+  const reconnectHttp = gate.beginHttpRequest();
+  assert.equal(gate.shouldApplyHttp(staleHttp, 1), false);
+  assert.equal(gate.shouldApplyHttp(reconnectHttp, 0), true);
+  assert.equal(gate.shouldApplyRealtime(initial, 2), false);
+  assert.equal(gate.shouldApplyRealtime(reconnect, 1), true);
+});
+
 test("story failures map backend codes to stable reader messages", () => {
   assert.equal(mapStoryError("analysis_missing"), "尚未导入匹配的离线分析");
   assert.equal(mapStoryError("analysis_invalid"), "离线分析无效，请重新生成并导入");
   assert.equal(mapStoryError("reader_range_invalid"), "无法读取当前正文片段");
+  assert.equal(mapStoryError("story_import_invalid"), "小说原文无效，请确认格式和编码");
   assert.equal(mapStoryError("unexpected_server_detail"), "小说操作失败");
 });
 
@@ -74,6 +89,18 @@ test("reader slice generation ignores an older success or error after the page c
   const second = gate.begin("scene-1:8192:16384");
   assert.equal(gate.isCurrent(first, "scene-1:0:8192"), false);
   assert.equal(gate.isCurrent(second, "scene-1:8192:16384"), true);
+});
+
+test("reader slice invalidation rejects late active-to-inactive results and resets only on scene identity changes", () => {
+  const gate = new ReaderSliceGate();
+  const lastPage = gate.begin("later:16384:20000");
+  const earlier = gate.begin("earlier:0:8192");
+  assert.equal(gate.isCurrent(lastPage, "later:16384:20000"), false);
+  assert.equal(gate.isCurrent(earlier, "earlier:0:8192"), true);
+  assert.equal(gate.resetPageStart("earlier", 0, 16384), 0);
+  assert.equal(gate.resetPageStart("earlier", 0, 8192), null);
+  gate.invalidate();
+  assert.equal(gate.isCurrent(earlier, "earlier:0:8192"), false);
 });
 
 test("offline-analysis guidance is actionable and start/resume controls stay bounded", () => {

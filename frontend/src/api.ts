@@ -34,6 +34,15 @@ export function mapStoryError(code: unknown): string {
     case "story_runtime_busy":
     case "story_planning_active":
       return "小说会话正在处理中";
+    case "story_import_invalid":
+      return "小说原文无效，请确认格式和编码";
+    case "story_import_failed":
+      return "小说导入未完成，请稍后重试";
+    case "story_output_failed":
+      return "设备输出未确认，小说会话未继续";
+    case "story_transition_invalid":
+    case "story_transition_failed":
+      return "小说会话当前无法切换";
     default:
       return "小说操作失败";
   }
@@ -44,6 +53,7 @@ export function storyErrorMessage(error: unknown): string {
   return Object.values({
     a: mapStoryError("analysis_missing"), b: mapStoryError("analysis_invalid"), c: mapStoryError("reader_range_invalid"),
     d: mapStoryError("story_not_found"), e: mapStoryError("chapter_plan_failed"), f: mapStoryError("story_runtime_busy"),
+    g: mapStoryError("story_import_invalid"), h: mapStoryError("story_import_failed"), i: mapStoryError("story_transition_invalid"),
   }).includes(text) ? text : mapStoryError(undefined);
 }
 

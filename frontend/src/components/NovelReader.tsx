@@ -3,6 +3,7 @@ import { api, storyErrorMessage } from "../api";
 import { ReaderSliceGate, readerPageRange } from "../readerPaging";
 import { refreshAppState } from "../stateRefresh";
 import { useApp } from "../store";
+import { isStoryReady, resumePayload } from "../storyUi";
 import type { ReaderTextSlice, StoryChapterSummary } from "../types";
 
 const speeds = [
@@ -22,6 +23,7 @@ export default function NovelReader() {
   const [pageStart, setPageStart] = useState<number | null>(null);
   const sliceGate = useRef(new ReaderSliceGate());
   const session = story?.session;
+  const analysis = story?.analysis;
 
   const page = session?.reader_start_offset !== null && session?.reader_start_offset !== undefined && session.reader_end_offset !== null && session.reader_end_offset !== undefined
     ? readerPageRange(session.reader_start_offset, session.reader_end_offset, pageStart) : null;
@@ -39,17 +41,23 @@ export default function NovelReader() {
       session.reader_start_offset === null ||
       session.reader_end_offset === null
     ) {
-      setSlice(null); setError(""); setPageStart(null);
+      sliceGate.current.invalidate(); setSlice(null); setError(""); setPageStart(null);
       return;
     }
     if (!page) return;
+    const sceneIdentity = `${session.current_scene_id ?? "scene"}:${session.reader_start_offset}:${session.reader_end_offset}`;
+    const reset = sliceGate.current.resetPageStart(sceneIdentity, session.reader_start_offset, pageStart);
+    if (reset !== null && reset !== pageStart) {
+      sliceGate.current.invalidate(); setSlice(null); setError(""); setPageStart(reset);
+      return;
+    }
     const key = `${session.current_scene_id ?? "scene"}:${page.start}:${page.end}`;
     const token = sliceGate.current.begin(key);
     setSlice(null); setError("");
     api.storyReaderText(page.start, page.end)
       .then((next) => { if (sliceGate.current.isCurrent(token, key)) { setSlice(next); setError(""); } })
       .catch((cause) => { if (sliceGate.current.isCurrent(token, key)) setError(storyErrorMessage(cause)); });
-  }, [session?.status, session?.reader_start_offset, session?.reader_end_offset, session?.current_scene_id, page?.start, page?.end]);
+  }, [session?.status, session?.reader_start_offset, session?.reader_end_offset, session?.current_scene_id, pageStart, page?.start, page?.end]);
 
   const run = async (action: () => Promise<unknown>) => {
     if (pending) return;
@@ -68,7 +76,7 @@ export default function NovelReader() {
   if (!story?.selected_source) {
     return <ReaderShell><p className="text-sm text-muted">请先在左侧导入本地小说原文。</p></ReaderShell>;
   }
-  if (story.analysis?.status !== "ready") {
+  if (!analysis || !isStoryReady(analysis.status)) {
     return <ReaderShell><p className="text-sm text-muted">离线分析就绪后才可选择章节并启动忠实阅读。</p></ReaderShell>;
   }
 
@@ -78,7 +86,7 @@ export default function NovelReader() {
       <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line pb-3">
         <div>
           <h1 className="text-base font-semibold text-text">{story.selected_source.filename}</h1>
-          <p className="mt-1 text-[11px] text-muted">分析版本 {story.analysis.analysis_version} · 原文标识 {story.analysis.hash_prefix}</p>
+          <p className="mt-1 text-[11px] text-muted">分析版本 {analysis.analysis_version} · 原文标识 {analysis.hash_prefix}</p>
         </div>
         <span className="rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-ok">离线分析已验证</span>
       </header>
@@ -95,9 +103,9 @@ export default function NovelReader() {
             {session.status === "running" && <ActionButton disabled={pending} onClick={() => void run(() => api.storyPause())}>暂停</ActionButton>}
             {session.status === "paused" && (
               <>
-                <ActionButton disabled={pending} onClick={() => void run(() => api.storyResume("current"))}>从当前位置继续</ActionButton>
-                <ActionButton disabled={pending} onClick={() => void run(() => api.storyResume("chapter_start"))}>从本章开头继续</ActionButton>
-                <ActionButton disabled={pending} onClick={() => void run(() => api.storyResume("beginning"))}>从全书开头继续</ActionButton>
+                <ActionButton disabled={pending} onClick={() => void run(() => api.storyResume(resumePayload("current").from))}>从当前位置继续</ActionButton>
+                <ActionButton disabled={pending} onClick={() => void run(() => api.storyResume(resumePayload("chapter_start").from))}>从本章开头继续</ActionButton>
+                <ActionButton disabled={pending} onClick={() => void run(() => api.storyResume(resumePayload("beginning").from))}>从全书开头继续</ActionButton>
               </>
             )}
             <ActionButton disabled={pending} danger onClick={() => void run(() => api.storyFinish())}>结束并保存</ActionButton>

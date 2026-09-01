@@ -19,6 +19,13 @@ export function readerPageRange(sceneStart: number, sceneEnd: number, pageStart:
 
 export class ReaderSliceGate {
   private generation = 0;
+  private sceneIdentity: string | null = null;
   begin(_key: string): number { this.generation += 1; return this.generation; }
   isCurrent(token: number, _key: string): boolean { return token === this.generation; }
+  invalidate(): void { this.generation += 1; this.sceneIdentity = null; }
+  resetPageStart(sceneIdentity: string, sceneStart: number, _currentPageStart: number | null): number | null {
+    if (this.sceneIdentity === sceneIdentity) return null;
+    this.sceneIdentity = sceneIdentity;
+    return sceneStart;
+  }
 }
