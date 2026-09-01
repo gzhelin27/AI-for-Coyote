@@ -1184,26 +1184,25 @@ class GameLoop:
         local_strength: int,
         observed_revision: int,
     ) -> dict | None:
+        cap = self.safety.cap_for(channel)
+        strength = reported_strength
+        if strength is None:
+            strength = self.output_coordinator.confirmed(channel).strength
+        if strength is None:
+            strength = local_strength
         try:
-            if reported_strength is not None:
-                await self.output_coordinator.confirm_reported_strength(
-                    channel, reported_strength
-                )
-            else:
-                await self.output_coordinator.confirm_reported_strength(
-                    channel,
-                    local_strength,
-                    expected_revision=observed_revision,
-                )
+            reconciliation = await self.output_coordinator.reconcile_reported_strength(
+                channel, strength, cap
+            )
         finally:
             self._publish_coordinator_confirmed(channel)
 
-        confirmed_strength = self.output_coordinator.confirmed(channel).strength
-        cap = self.safety.cap_for(channel)
-        if confirmed_strength is not None and confirmed_strength > cap:
-            self.output_coordinator.mark_reduction(channel, cap)
         pending = self.output_coordinator.pending(channel)
-        if not pending.clear_required and pending.target_strength is None:
+        if (
+            not reconciliation.reduction_required
+            and not pending.clear_required
+            and pending.target_strength is None
+        ):
             return None
 
         controller = self.timeline_session
@@ -1213,10 +1212,6 @@ class GameLoop:
                 channel, reason="overheat"
             )
 
-        confirmed_strength = self.output_coordinator.confirmed(channel).strength
-        cap = self.safety.cap_for(channel)
-        if confirmed_strength is not None and confirmed_strength > cap:
-            self.output_coordinator.mark_reduction(channel, cap)
         try:
             result = await self._reconcile_channel_safety_locked(channel)
         except DeviceOutputError as exc:

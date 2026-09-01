@@ -5,6 +5,7 @@ import unittest
 from backend.output_coordinator import (
     DeviceOutputCoordinator,
     OutputIntentKind,
+    ReportReconciliation,
     TransportOutcome,
 )
 
@@ -19,6 +20,100 @@ async def async_outcome(
 
 
 class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identical_safe_report_is_a_strict_ownership_noop(self):
+        # Catches a report path that mutates revisions, pending safety work, or
+        # any output owner counter even though the physical strength is unchanged.
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=10, enabled=True)
+        before_confirmed = coordinator.confirmed("A")
+        before_pending = coordinator.pending("A")
+        before_revision = coordinator.revision("A")
+        before_generation = coordinator.generation("A")
+        before_normal_epoch = coordinator.normal_policy_epoch("A")
+        before_helper_generation = coordinator.helper_generation("A")
+
+        result = await coordinator.reconcile_reported_strength("A", 10, 20)
+
+        self.assertIsInstance(result, ReportReconciliation)
+        self.assertEqual(result.confirmed, before_confirmed)
+        self.assertFalse(result.reduction_required)
+        self.assertEqual(coordinator.confirmed("A"), before_confirmed)
+        self.assertEqual(coordinator.pending("A"), before_pending)
+        self.assertEqual(coordinator.revision("A"), before_revision)
+        self.assertEqual(coordinator.generation("A"), before_generation)
+        self.assertEqual(
+            coordinator.normal_policy_epoch("A"), before_normal_epoch
+        )
+        self.assertEqual(
+            coordinator.helper_generation("A"), before_helper_generation
+        )
+        with self.assertRaises(FrozenInstanceError):
+            result.reduction_required = True
+
+    async def test_changed_safe_report_updates_only_confirmed_strength_and_revision(self):
+        # Catches a safe report path that invalidates normal/live/replay work or
+        # retires a continuous helper merely because reported strength changed.
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=10, enabled=True)
+        before_pending = coordinator.pending("A")
+        before_revision = coordinator.revision("A")
+        before_generation = coordinator.generation("A")
+        before_normal_epoch = coordinator.normal_policy_epoch("A")
+        before_helper_generation = coordinator.helper_generation("A")
+
+        result = await coordinator.reconcile_reported_strength("A", 15, 20)
+
+        self.assertEqual(result.confirmed.strength, 15)
+        self.assertFalse(result.reduction_required)
+        self.assertEqual(coordinator.confirmed("A").strength, 15)
+        self.assertEqual(coordinator.pending("A"), before_pending)
+        self.assertEqual(coordinator.revision("A"), before_revision + 1)
+        self.assertEqual(coordinator.generation("A"), before_generation)
+        self.assertEqual(
+            coordinator.normal_policy_epoch("A"), before_normal_epoch
+        )
+        self.assertEqual(
+            coordinator.helper_generation("A"), before_helper_generation
+        )
+
+    async def test_over_cap_report_atomically_blocks_normal_transport(self):
+        # Catches the report-to-reduction gap where queued normal transport can
+        # start before the pending safety target and priority are established.
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=10, enabled=True)
+        before_revision = coordinator.revision("A")
+        before_generation = coordinator.generation("A")
+        before_normal_epoch = coordinator.normal_policy_epoch("A")
+        before_helper_generation = coordinator.helper_generation("A")
+        normal_transport_called = False
+
+        result = await coordinator.reconcile_reported_strength("A", 30, 20)
+
+        async def normal_transport(_state):
+            nonlocal normal_transport_called
+            normal_transport_called = True
+            return await async_outcome(sent=True, effective={"strength": 35})
+
+        normal = await coordinator.run(
+            "A", OutputIntentKind.TIMELINE_OR_REPLAY, normal_transport
+        )
+
+        self.assertEqual(result.confirmed.strength, 30)
+        self.assertTrue(result.reduction_required)
+        self.assertEqual(coordinator.confirmed("A").strength, 30)
+        self.assertEqual(coordinator.pending("A").target_strength, 20)
+        self.assertEqual(coordinator.revision("A"), before_revision + 1)
+        self.assertEqual(coordinator.generation("A"), before_generation + 1)
+        self.assertEqual(
+            coordinator.normal_policy_epoch("A"), before_normal_epoch + 1
+        )
+        self.assertEqual(
+            coordinator.helper_generation("A"), before_helper_generation
+        )
+        self.assertFalse(normal.sent)
+        self.assertEqual(normal.error, "blocked by higher-priority output intent")
+        self.assertFalse(normal_transport_called)
+
     async def test_failed_transport_does_not_commit_confirmed_state(self):
         coordinator = DeviceOutputCoordinator()
         coordinator.seed_confirmed("A", strength=30, enabled=True)

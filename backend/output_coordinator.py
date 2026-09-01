@@ -19,6 +19,7 @@ __all__ = [
     "DeviceOutputCoordinator",
     "OutputIntentKind",
     "PendingSafetyWork",
+    "ReportReconciliation",
     "TransportOutcome",
 ]
 
@@ -83,6 +84,14 @@ class PendingSafetyWork:
 
     target_strength: int | None = None
     clear_required: bool = False
+
+
+@dataclass(frozen=True)
+class ReportReconciliation:
+    """Atomic device-report confirmation and safety ownership result."""
+
+    confirmed: ConfirmedChannelOutput
+    reduction_required: bool
 
 
 @dataclass
@@ -171,6 +180,22 @@ class DeviceOutputCoordinator:
         )
         return await _await_cleanup(task)
 
+    async def reconcile_reported_strength(
+        self, channel: str, reported_strength: int, cap: int
+    ) -> ReportReconciliation:
+        """Atomically accept a device report and establish reduction ownership."""
+        slot = self._slot(channel)
+        strength = _strength(reported_strength)
+        if strength is None:
+            raise ValueError("reported strength cannot be None")
+        effective_cap = _strength(cap)
+        if effective_cap is None:
+            raise ValueError("cap cannot be None")
+        task = asyncio.create_task(
+            self._reconcile_reported_strength_locked(slot, strength, effective_cap)
+        )
+        return await _await_cleanup(task)
+
     async def confirm_loop_stopped(
         self,
         channel: str,
@@ -223,14 +248,41 @@ class DeviceOutputCoordinator:
                 and slot.revision != expected_revision
             ):
                 return slot.confirmed
-            # A report supersedes legacy unbounded resend helpers without
-            # invalidating the live/replay owner generation for this channel.
-            slot.helper_generation += 1
             if slot.confirmed.strength == strength:
                 return slot.confirmed
             slot.confirmed = replace(slot.confirmed, strength=strength)
             slot.revision += 1
             return slot.confirmed
+
+    @staticmethod
+    async def _reconcile_reported_strength_locked(
+        slot: _ChannelSlot,
+        strength: int,
+        effective_cap: int,
+    ) -> ReportReconciliation:
+        async with slot.lock:
+            if slot.confirmed.strength == strength and strength <= effective_cap:
+                return ReportReconciliation(slot.confirmed, False)
+
+            if slot.confirmed.strength != strength:
+                slot.confirmed = replace(slot.confirmed, strength=strength)
+                slot.revision += 1
+
+            if strength > effective_cap:
+                strictest = (
+                    effective_cap
+                    if slot.pending.target_strength is None
+                    else min(slot.pending.target_strength, effective_cap)
+                )
+                slot.pending = replace(slot.pending, target_strength=strictest)
+                slot.normal_epoch += 1
+                slot.generation += 1
+                slot.minimum_priority = max(
+                    slot.minimum_priority, OutputIntentKind.SAFETY_REDUCE
+                )
+                return ReportReconciliation(slot.confirmed, True)
+
+            return ReportReconciliation(slot.confirmed, False)
 
     @staticmethod
     async def _confirm_loop_stopped_locked(

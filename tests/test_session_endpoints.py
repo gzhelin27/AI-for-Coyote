@@ -293,9 +293,14 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_live_slots_patch_identical_and_changed_strength_keep_owner_active(self):
+        # Catches a safe report that invalidates a live session or its helper
+        # ownership even though no safety reduction is required.
         await self._start_physical_live(20)
 
         for reported_strength in (20, 15):
+            helper_generation = self.harness.loop.output_coordinator.helper_generation(
+                "A"
+            )
             self.harness.safety.pulse_until["A"] = 0.0
             self.harness.relay.clients = {
                 "client-test": {
@@ -312,8 +317,14 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(
                 self.harness.controller.runners["A"].state().failure
             )
+            self.assertEqual(
+                self.harness.loop.output_coordinator.helper_generation("A"),
+                helper_generation,
+            )
 
     async def test_replay_slots_patch_identical_and_changed_strength_keep_owner_active(self):
+        # Catches a safe report that stops replay progression or changes helper
+        # ownership without an over-cap safety decision.
         bundle = make_replay_bundle([0, 0, 0], "completed")
         self.harness.store.save(bundle.manifest, bundle.timeline)
         playing = await self.client.post(
@@ -328,6 +339,9 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.controller.to_state().cursor, 1)
 
         for expected_cursor, reported_strength in ((2, 20), (3, 15)):
+            helper_generation = self.harness.loop.output_coordinator.helper_generation(
+                "A"
+            )
             self.harness.safety.pulse_until["A"] = 0.0
             self.harness.relay.clients = {
                 "client-test": {
@@ -349,6 +363,10 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 self.harness.controller.to_state().status,
                 SessionStatus.REPLAYING,
+            )
+            self.assertEqual(
+                self.harness.loop.output_coordinator.helper_generation("A"),
+                helper_generation,
             )
 
     async def test_cap_transport_exception_returns_safe_retryable_service_error(self):

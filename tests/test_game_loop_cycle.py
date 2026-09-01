@@ -167,6 +167,9 @@ class StalledSafetyController:
     async def resume_channel_after_safety(self, channel):
         return None
 
+    def to_state(self):
+        return SimpleNamespace(mode=None)
+
 
 def make_game_loop_for_test(*, pattern="呼吸", frames=None, relay=None):
     cfg = deepcopy(DEFAULTS)
@@ -781,7 +784,99 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             loop.output_coordinator.pending("A").target_strength
         )
 
+    async def test_over_cap_report_blocks_queued_pulse_before_reduction_transport(self):
+        # Catches split report confirmation/reduction handling that lets queued
+        # normal pulse transport run before safety ownership exists.
+        relay = GatedPhysicalRelay()
+        loop = make_game_loop_for_test(relay=relay)
+        self.addCleanup(loop._cancel_loops, None)
+        loop.safety.set_user_cap("A", 20)
+        loop.safety.current["A"] = 10
+        loop.output_coordinator.seed_confirmed("A", strength=10, enabled=True)
+        controller = StalledSafetyController()
+        loop.timeline_session = controller
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        reconciliation_started = asyncio.Event()
+        reconciliation_returned = asyncio.Event()
+        normal_queued = asyncio.Event()
+
+        async def block_channel(state):
+            blocker_started.set()
+            await release_blocker.wait()
+            return TransportOutcome(
+                sent=True,
+                simulated=True,
+                effective={"strength": int(state.strength or 0)},
+            )
+
+        original_reconcile = loop.output_coordinator.reconcile_reported_strength
+
+        async def observed_reconcile(*args, **kwargs):
+            reconciliation_started.set()
+            result = await original_reconcile(*args, **kwargs)
+            reconciliation_returned.set()
+            return result
+
+        original_run_locked = loop.output_coordinator._run_channel_locked
+
+        async def observed_run_locked(*args, **kwargs):
+            normal_queued.set()
+            return await original_run_locked(*args, **kwargs)
+
+        loop.output_coordinator.reconcile_reported_strength = observed_reconcile
+        loop.output_coordinator._run_channel_locked = observed_run_locked
+        blocker = asyncio.create_task(
+            loop.output_coordinator.run(
+                "A", OutputIntentKind.MANUAL, block_channel
+            )
+        )
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+        report = asyncio.create_task(
+            loop.update_device_state(relay.report_strength("A", 30), None)
+        )
+        normal = None
+        try:
+            await asyncio.wait_for(reconciliation_started.wait(), timeout=0.2)
+            normal = asyncio.create_task(
+                loop.execute_actions(
+                    [{"op": "pulse_cycle", "channel": "A", "pattern": "呼吸"}]
+                )
+            )
+            await asyncio.wait_for(normal_queued.wait(), timeout=1)
+            release_blocker.set()
+            await asyncio.wait_for(reconciliation_returned.wait(), timeout=1)
+            await asyncio.wait_for(controller.suspend_started.wait(), timeout=1)
+
+            self.assertEqual(loop.output_coordinator.confirmed("A").strength, 30)
+            self.assertEqual(
+                loop.output_coordinator.pending("A").target_strength, 20
+            )
+            self.assertGreater(loop.output_coordinator.generation("A"), 0)
+            self.assertGreater(loop.output_coordinator.normal_policy_epoch("A"), 0)
+            self.assertEqual(relay.pulse_send_count, 0)
+
+            controller.release_suspend.set()
+            report_result, normal_result = await asyncio.gather(report, normal)
+
+            self.assertEqual(report_result["A"]["dropped"], [])
+            self.assertEqual(normal_result[0], [])
+            self.assertEqual(len(normal_result[1]), 1)
+            self.assertEqual(relay.pulse_send_count, 0)
+            self.assertEqual(relay.physical_strength[0], 20)
+        finally:
+            release_blocker.set()
+            controller.release_suspend.set()
+            await asyncio.gather(
+                blocker,
+                report,
+                *(() if normal is None else (normal,)),
+                return_exceptions=True,
+            )
+
     async def test_cancelled_report_retains_pending_reduction_until_identical_retry(self):
+        # Catches cancellation that reaches the caller before an accepted report
+        # has atomically recorded its pending safety reduction.
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(relay=relay)
         self.addCleanup(loop._cancel_loops, None)
@@ -800,17 +895,17 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         initial_revision = loop.output_coordinator.revision("A")
-        confirmation_started = asyncio.Event()
-        confirm_reported_strength = (
-            loop.output_coordinator.confirm_reported_strength
+        reconciliation_started = asyncio.Event()
+        reconcile_reported_strength = (
+            loop.output_coordinator.reconcile_reported_strength
         )
 
-        async def observed_confirmation(*args, **kwargs):
-            confirmation_started.set()
-            return await confirm_reported_strength(*args, **kwargs)
+        async def observed_reconciliation(*args, **kwargs):
+            reconciliation_started.set()
+            return await reconcile_reported_strength(*args, **kwargs)
 
-        loop.output_coordinator.confirm_reported_strength = (
-            observed_confirmation
+        loop.output_coordinator.reconcile_reported_strength = (
+            observed_reconciliation
         )
         blocker = asyncio.create_task(
             loop.output_coordinator.run(
@@ -827,7 +922,7 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await wait_for_condition(lambda: loop.safety.overheat["A"])
-        await asyncio.wait_for(confirmation_started.wait(), timeout=1)
+        await asyncio.wait_for(reconciliation_started.wait(), timeout=1)
 
         report.cancel()
         release_blocker.set()
@@ -1318,7 +1413,9 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
                 disabling, second_pulse, return_exceptions=True
             )
 
-    async def test_identical_report_reaps_floor_worker_as_finite_batch(self):
+    async def test_identical_report_keeps_floor_worker_as_its_live_owner(self):
+        # Catches an identical safe report that retires a continuous helper even
+        # though no physical output or safety policy changed.
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(relay=relay)
         self.addCleanup(loop._cancel_loops, None)
@@ -1336,26 +1433,21 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
 
         await loop._apply_channel_floor()
         worker = loop.loop_tasks["A"]
+        helper_generation = loop.output_coordinator.helper_generation("A")
 
         result = await loop.update_device_state({"intensityA": 5}, None)
-        await asyncio.wait_for(asyncio.shield(worker), timeout=1)
+        await asyncio.wait_for(relay.second_pulse_sent.wait(), timeout=1)
 
         self.assertEqual(result, {})
-        self.assertNotIn("A", loop.loop_tasks)
-        self.assertNotIn("A", loop.loop_events)
+        self.assertIs(loop.loop_tasks["A"], worker)
+        self.assertFalse(worker.done())
+        self.assertEqual(
+            loop.output_coordinator.helper_generation("A"), helper_generation
+        )
         confirmed = loop.output_coordinator.confirmed("A")
         self.assertEqual(confirmed.waveform, "呼吸")
-        self.assertEqual(confirmed.waveform_mode, "finite")
+        self.assertEqual(confirmed.waveform_mode, "loop")
         self.assertEqual(loop.patterns["A"], "呼吸")
-        finite_until = loop.safety.pulse_until["A"]
-        remaining = finite_until - time.monotonic()
-        self.assertGreater(remaining, 0)
-        self.assertLessEqual(remaining, 0.25)
-        self.assertTrue(loop.safety.pulse_active()["A"])
-
-        await asyncio.sleep(max(0, finite_until - time.monotonic()) + 0.02)
-
-        self.assertFalse(loop.safety.pulse_active()["A"])
 
     async def test_cancelled_floor_worker_reaps_owner_and_marks_finite_batch(self):
         relay = GatedPhysicalRelay()
