@@ -28,17 +28,19 @@
 **Files:**
 - Create: `backend/story/offline_analysis.py`
 - Create: `backend/story/import_analysis.py`
+- Create: `backend/provenance.py`
 - Modify: `backend/story/__init__.py`
 - Modify: `backend/story/analysis_store.py`
+- Modify: `backend/main.py`
 - Delete after replacement tests pass: `backend/story/analyzer.py`
 - Delete after replacement tests pass: `tests/test_story_analyzer.py`
 - Create: `tests/test_story_offline_analysis.py`
 - Create: `tests/test_story_import_analysis_cli.py`
-- Modify: `config.example.yaml`
+- Modify: `config/config.example.yaml`
 
 **Interfaces:**
 - Consumes: `StorySourceLoader.load(path: Path, *, encoding: str = "auto") -> ImportedStory`, `AnalysisStore.load(key: AnalysisKey) -> StoryMap | None`, and `AnalysisStore.save(key: AnalysisKey, story_map: StoryMap) -> None`.
-- Produces: `OFFLINE_PRODUCER = "codex-offline"`, `OFFLINE_ANALYSIS_VERSION = "faithful-offline-v1"`, `offline_analysis_key(story: ImportedStory, dlc_version: str) -> AnalysisKey`, `OfflineAnalysisImporter.validate(source_path: Path, candidate_path: Path, *, encoding: str, dlc_version: str) -> ValidatedOfflineAnalysis`, `.import_candidate(...) -> ValidatedOfflineAnalysis`, and `AnalysisStore.inspect(key: AnalysisKey) -> AnalysisLookup`.
+- Produces: shared `dlc_provenance(cfg: Mapping[str, object], *, project_root: Path, waveform_policy: str | None = None) -> str`, `OFFLINE_PRODUCER = "codex-offline"`, `OFFLINE_ANALYSIS_VERSION = "faithful-offline-v1"`, `offline_analysis_key(story: ImportedStory, dlc_version: str) -> AnalysisKey`, `OfflineAnalysisImporter.validate(source_path: Path, candidate_path: Path, *, encoding: str, dlc_version: str) -> ValidatedOfflineAnalysis`, `.import_candidate(...) -> ValidatedOfflineAnalysis`, and `AnalysisStore.inspect(key: AnalysisKey) -> AnalysisLookup`.
 - `ValidatedOfflineAnalysis` contains only `key: AnalysisKey`, `story_map: StoryMap`, `chapter_count: int`, and `scene_count: int`.
 - `AnalysisLookup` contains `status: Literal["ready", "missing", "invalid"]` and `story_map: StoryMap | None`; `invalid` is returned for a matching entry quarantined during that inspection, while a later inspection after quarantine is `missing`.
 
@@ -103,11 +105,11 @@ Add `AnalysisStore.inspect()` without weakening `load()`: it reports `invalid` w
 Test `main(argv: Sequence[str] | None = None) -> int` directly with temporary paths and captured stdout/stderr. Cover `validate`, `import`, all three encodings, missing arguments, ambiguity, invalid DLC version, and redacted errors.
 
 ```text
-python -m backend.story.import_analysis validate --source FILE --map FILE --encoding auto --dlc-version dlc1-v1
-python -m backend.story.import_analysis import   --source FILE --map FILE --encoding auto --dlc-version dlc1-v1
+python -m backend.story.import_analysis validate --source FILE --map FILE --encoding auto
+python -m backend.story.import_analysis import   --source FILE --map FILE --encoding auto
 ```
 
-Success prints only source-hash prefix, identity versions, chapter count, scene count, and `validated` or `imported`. Errors print no source excerpt and return a nonzero status.
+The command loads the current local config and derives DLC provenance through the same shared pure helper used by `AppState`; it does not accept a caller-supplied DLC identity. Extract the existing `_dlc_provenance` logic from `backend/main.py` into `backend/provenance.py` without changing its digest. Success prints only source-hash prefix, identity versions, chapter count, scene count, and `validated` or `imported`. Errors print no source excerpt and return a nonzero status.
 
 - [ ] **Step 5: Remove the online whole-book path**
 
