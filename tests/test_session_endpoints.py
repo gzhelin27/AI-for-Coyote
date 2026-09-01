@@ -82,7 +82,10 @@ def make_endpoint_state(harness):
     state.story_source_generation = 0
     state.story_planning_task = None
     state.story_planning_context = None
-    state.story_runtime_change_active = False
+    state.story_runtime_owner = None
+    state.story_source_store_task = None
+    state.story_import_requests = set()
+    state.story_shutting_down = False
     state.chapter_planner = SimpleNamespace(cancel_pending=lambda: ())
     state.layout = {}
     state.sensor_switches = {"camera": False, "audio": False}

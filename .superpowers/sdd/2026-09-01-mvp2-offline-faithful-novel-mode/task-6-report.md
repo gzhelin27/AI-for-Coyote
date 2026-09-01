@@ -198,3 +198,47 @@ Ran 531 tests in 54.328s, OK (skipped=5)
 - Windows 安全存储使用 NT native handle-relative primitives；POSIX 分支依赖 `dir_fd + O_NOFOLLOW`，缺失这些能力的平台按裁决 fail closed。当前 CI 主机验证 Windows 分支；5 个全套平台 skip 为仓库既有/平台条件测试。
 - Pinned source handle 生命周期属于 AppState，并在 shutdown 关闭；直接构造 AppState 的测试/工具也必须显式走 shutdown 或关闭该 owner。
 - Task 7 必须以 `state_revision` 丢弃更低 revision；这不在 Task 6 前端范围。
+
+## Review fix round 2/5（2026-09-01）
+
+### RED → GREEN
+
+Owner token RED：受控挂起 DLC import 的末次 broadcast 后，并发 LLM save 仍返回 200，证明共享布尔 reservation 可被另一路径错误穿透/清除。将 reservation 改为 `eq=False` 的唯一 owner object，并规定所有 acquire/check/release 只在 `timeline_transition_lock` 下执行后，挂起 DLC 期间 LLM、cap、story import 均稳定 `409 story_runtime_busy`；它们的 `finally` 只能 identity-match 清除自己的 token，DLC 完成后下一次 import 正常成功。Planning 也持有同一类 owner，既有并发 play 仍保留 `story_planning_active` 的稳定优先级。
+
+No-replace RED：POSIX commit mock 证明旧 `os.replace` 会覆盖已存在 final；store 也没有 pinned delete API。改为 pinned dir-fd 上 `os.link(temp, final, follow_symlinks=False)` 原子创建 final、再相对 unlink temp，`FileExistsError` 直接触发 opaque ID retry；Windows 继续使用 `ReplaceIfExists=False`。重复 token 测试验证第一份 bytes 不变、第二份取得新 ID，delete 只接受 store 生成的 opaque identity 并只删除对应 final。
+
+异步 store RED：250ms stall 下旧同步 import 令 event loop/disconnect 延迟约 0.53s；取消仍会注册 source；shutdown safety 也延迟约 0.55s。实现锁内 owner/generation reservation、锁外 tracked `asyncio.to_thread(store)`、短锁内 identity/runtime revalidation 后，callback/disconnect 与 shutdown safety 均在 250ms 门内完成。取消或 shutdown race 等待不可中断的当前文件操作收敛，再用 pinned `delete()` 清除未注册 final；shutdown 在关闭 root handle 前 settle 所有 tracked import/store/delete。额外 RED 覆盖 cleanup 自身抛 unexpected exception 和 store unexpected exception，GREEN 后 owner/task/request set 总是清理，公开响应固定 generic 500 且不含内部路径。
+
+聚焦回归曾捕获 owner 检查顺序把第二个 play 从既有 `story_planning_active` 改成 generic `story_runtime_busy`；调整 planning-task 检查优先级后恢复既有 API contract。
+
+### API schema、并发与安全隔离增量
+
+- HTTP/WS schema 无新增或删除字段；本轮只强化既有 `409 story_runtime_busy|story_planning_active` 与 `500 story_import_failed` 的稳定语义。
+- `story_runtime_owner` 是 process-local、不可序列化的唯一 token；DLC、LLM、cap、profile、import 与 play reservation 不能互相偷清，active novel/autopilot/replay 和 shutdown 仍拒绝新 import/play。
+- Store worker 只接触 `PinnedStorySourceStore.store/delete` 和 immutable `ImportedStory/StoredStorySource`；它不读取或修改 AppState 异步状态。AppState registry、selection、generation 与 owner 只在 event-loop transition lock 内变更。
+- POSIX/Windows final commit 都是 no-replace；source ID collision 不覆盖 bytes。临时文件 exclusive/no-follow，write/flush/fsync、handle-relative commit、目录 fsync、异常 cleanup 和 root identity checks 保持 round 1 的安全边界。
+- 未注册 source 永不进入 registry/selection；取消、shutdown race、registration revalidation failure 都通过 pinned opaque identity 删除 final，不接受 caller path。
+
+### 最终验证证据
+
+```text
+python -X dev -W ignore::DeprecationWarning -W error::ResourceWarning \
+  -m unittest tests.test_story_endpoints tests.test_story_source_store \
+  tests.test_session_endpoints tests.test_app_state_timeline \
+  tests.test_game_loop_timeline tests.test_timeline_session -q
+Ran 190 tests in 22.778s, OK
+
+python -m unittest discover -s tests -q
+Ran 540 tests in 54.630s, OK (skipped=5)
+
+python -m compileall -q backend tests: exit 0
+git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
+```
+
+全程未运行 `tests/probe_llm.py`，未联网、未调用真实模型、未连接真实设备、未 push/tag。本轮提交信息为 `fix: serialize and offload story imports`；最终 hash 在提交完成后由交付消息报告。
+
+### 剩余边界
+
+- 当前开发主机直接执行 Windows no-replace/delete 分支；POSIX hard-link no-replace 分支由 capability/mock 单测覆盖。缺失安全 `dir_fd`/`follow_symlinks` 能力的平台继续 fail closed。
+- 文件系统操作不能被 Python 强制中断；取消和 shutdown 会先完成当前 bounded source store/delete，再释放 owner 并关闭 pinned handle。这是 ledger 明确接受的等待边界，安全 cleanup 与 event loop 不在该线程等待期间被 transition lock 阻塞。
+- 进程崩溃时可能留下同目录 dot-temp（final 仍不被覆盖）；MVP2 没有批准 startup scavenger。正常异常、取消与 shutdown 路径均清理 temp/final，并由测试验证。

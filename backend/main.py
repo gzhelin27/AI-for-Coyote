@@ -63,7 +63,11 @@ from .story import (
     offline_analysis_key,
 )
 from .story.planner import ChapterPlanError, ChapterPlanner
-from .story.source_store import PinnedStorySourceStore, StorySourceStorageError
+from .story.source_store import (
+    PinnedStorySourceStore,
+    StoredStorySource,
+    StorySourceStorageError,
+)
 from .timeline.models import CycleGapPolicy
 from .timeline.replay_store import ReplayStore, ReplayStoreError, ReplaySummary
 from .timeline.session import SessionController
@@ -98,6 +102,11 @@ class _StoryRuntimeSignature:
     caps: tuple[tuple[str, int], ...]
 
 
+@dataclass(eq=False, slots=True)
+class _StoryRuntimeOwner:
+    kind: str
+
+
 @dataclass(frozen=True, slots=True)
 class _StoryPlanningContext:
     generation: int
@@ -107,6 +116,7 @@ class _StoryPlanningContext:
     planner: ChapterPlanner
     story_map: StoryMap
     runtime_signature: _StoryRuntimeSignature
+    runtime_owner: _StoryRuntimeOwner
 
 
 class _StoryConflict(RuntimeError):
@@ -456,6 +466,7 @@ def _guard_story_runtime_change(state: "AppState"):
     def decorate(endpoint):
         @wraps(endpoint)
         async def guarded(*args, **kwargs):
+            owner: _StoryRuntimeOwner | None = None
             async with state.timeline_transition_lock:
                 planning = state.story_planning_task is not None
                 if state._story_runtime_is_busy():
@@ -470,12 +481,12 @@ def _guard_story_runtime_change(state: "AppState"):
                         )
                     )
                     return _story_transition_error(state, conflict)
-                state.story_runtime_change_active = True
+                owner = state._acquire_story_runtime_owner("dlc")
             try:
                 return await endpoint(*args, **kwargs)
             finally:
                 async with state.timeline_transition_lock:
-                    state.story_runtime_change_active = False
+                    state._release_story_runtime_owner(owner)
 
         return guarded
 
@@ -570,7 +581,10 @@ class AppState:
         self.story_source_generation = 0
         self.story_planning_task: asyncio.Task | None = None
         self.story_planning_context: _StoryPlanningContext | None = None
-        self.story_runtime_change_active = False
+        self.story_runtime_owner: _StoryRuntimeOwner | None = None
+        self.story_source_store_task: asyncio.Task | None = None
+        self.story_import_requests: set[asyncio.Task] = set()
+        self.story_shutting_down = False
         self.story_dlc_version = self._current_story_dlc_version()
         self.story_seed_factory = lambda: secrets.randbits(63)
         self.story_planner_signature = self._story_runtime_signature()
@@ -662,11 +676,31 @@ class AppState:
         planning = self.story_planning_task
         session = self.timeline_session.to_state()
         return (
-            self.story_runtime_change_active
+            self.story_shutting_down
+            or self.story_runtime_owner is not None
             or planning is not None
             or session.status.value != "idle"
             or bool(self.loop.autopilot)
         )
+
+    def _acquire_story_runtime_owner(self, kind: str) -> _StoryRuntimeOwner:
+        if not self.timeline_transition_lock.locked():
+            raise RuntimeError("story runtime owner requires the transition lock")
+        if self.story_runtime_owner is not None:
+            raise _StoryConflict(
+                "story_runtime_busy", "story runtime is already reserved"
+            )
+        owner = _StoryRuntimeOwner(kind=kind)
+        self.story_runtime_owner = owner
+        return owner
+
+    def _release_story_runtime_owner(
+        self, owner: _StoryRuntimeOwner | None
+    ) -> None:
+        if not self.timeline_transition_lock.locked():
+            raise RuntimeError("story runtime owner requires the transition lock")
+        if owner is not None and self.story_runtime_owner is owner:
+            self.story_runtime_owner = None
 
     def _reserve_story_planning(
         self,
@@ -675,13 +709,13 @@ class AppState:
         chapter_id: str,
         speed: object,
     ) -> tuple[asyncio.Task, _StoryPlanningContext]:
-        if self.story_runtime_change_active:
-            raise _StoryConflict(
-                "story_runtime_busy", "story runtime configuration is changing"
-            )
         if self.story_planning_task is not None:
             raise _StoryConflict(
                 "story_planning_active", "a story chapter is already being planned"
+            )
+        if self.story_runtime_owner is not None:
+            raise _StoryConflict(
+                "story_runtime_busy", "story runtime configuration is changing"
             )
         if self.timeline_session.to_state().status.value != "idle" or self.loop.autopilot:
             raise _StoryConflict(
@@ -693,6 +727,7 @@ class AppState:
             )
         runtime_signature = self._ensure_story_planner_current()
         planner = self.chapter_planner
+        runtime_owner = self._acquire_story_runtime_owner("planning")
         context = _StoryPlanningContext(
             generation=self.story_source_generation,
             source_id=record.source_id,
@@ -701,17 +736,22 @@ class AppState:
             planner=planner,
             story_map=story_map,
             runtime_signature=runtime_signature,
+            runtime_owner=runtime_owner,
         )
-        task = asyncio.create_task(
-            planner.plan(
-                record.story,
-                story_map,
-                chapter_id,
-                speed=speed,
-                seed=self.story_seed_factory(),
-            ),
-            name=f"story-plan-{record.source_id}",
-        )
+        try:
+            task = asyncio.create_task(
+                planner.plan(
+                    record.story,
+                    story_map,
+                    chapter_id,
+                    speed=speed,
+                    seed=self.story_seed_factory(),
+                ),
+                name=f"story-plan-{record.source_id}",
+            )
+        except BaseException:
+            self._release_story_runtime_owner(runtime_owner)
+            raise
         task.add_done_callback(
             lambda completed: (
                 None if completed.cancelled() else completed.exception()
@@ -723,8 +763,11 @@ class AppState:
 
     def _release_story_planning(self, task: asyncio.Task | None) -> None:
         if task is not None and self.story_planning_task is task:
+            context = self.story_planning_context
             self.story_planning_task = None
             self.story_planning_context = None
+            if context is not None:
+                self._release_story_runtime_owner(context.runtime_owner)
 
     def _cancel_story_planning_now(self) -> tuple[asyncio.Task, ...]:
         task = self.story_planning_task
@@ -742,14 +785,33 @@ class AppState:
             pending.extend(cancel_pending())
         if task is not None:
             self.story_source_generation += 1
+        context = self.story_planning_context
         self.story_planning_task = None
         self.story_planning_context = None
+        if context is not None:
+            self._release_story_runtime_owner(context.runtime_owner)
         return tuple(dict.fromkeys(pending))
 
     @staticmethod
     async def _settle_story_planning(tasks: tuple[asyncio.Task, ...]) -> None:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    async def _await_story_io_task(
+        task: asyncio.Task,
+    ) -> tuple[object, bool]:
+        """Await non-cancellable filesystem work and remember caller cancellation."""
+
+        caller_cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), caller_cancelled
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is None or not current.cancelling():
+                    raise
+                caller_cancelled = True
 
     def _timeline_manifest_metadata(self) -> dict[str, str]:
         """Snapshot provenance when a new live session actually begins."""
@@ -807,7 +869,8 @@ class AppState:
             self.auto_opened = True
             asyncio.create_task(self._auto_open_and_broadcast())
         if event == "client_disconnected":
-            planning = self._cancel_story_planning_now()
+            async with self.timeline_transition_lock:
+                planning = self._cancel_story_planning_now()
             await self._settle_story_planning(planning)
             async with self.timeline_transition_lock:
                 await self.loop.on_client_disconnected()
@@ -981,7 +1044,9 @@ class AppState:
         self.loop.stop_observe_loop()
         primary_error: BaseException | None = None
         try:
-            planning = self._cancel_story_planning_now()
+            async with self.timeline_transition_lock:
+                self.story_shutting_down = True
+                planning = self._cancel_story_planning_now()
             await self._settle_story_planning(planning)
             async with self.timeline_transition_lock:
                 # Process shutdown is always abnormal lifecycle termination: live
@@ -1007,6 +1072,16 @@ class AppState:
                             "shutdown estop fallback failed: %s", exc
                         )
         finally:
+            imports = tuple(
+                task
+                for task in self.story_import_requests
+                if task is not asyncio.current_task()
+            )
+            if imports:
+                await asyncio.gather(*imports, return_exceptions=True)
+            remaining_store = self.story_source_store_task
+            if remaining_store is not None and not remaining_store.done():
+                await asyncio.gather(remaining_store, return_exceptions=True)
             background = list(self.tasks)
             if self.sensor_watch_task is not None:
                 background.append(self.sensor_watch_task)
@@ -1082,6 +1157,21 @@ def make_app() -> FastAPI:
                 {"code": "story_import_invalid", "error": "story source is invalid"},
                 status_code=400,
             )
+        owner: _StoryRuntimeOwner | None = None
+        store_task: asyncio.Task | None = None
+        cleanup_task: asyncio.Task | None = None
+        stored: StoredStorySource | None = None
+        record: _StorySourceRecord | None = None
+        lookup: AnalysisLookup | None = None
+        response: JSONResponse | None = None
+        registered = False
+        caller_cancelled = False
+        request_task = asyncio.current_task()
+        if request_task is None:
+            return JSONResponse(
+                {"code": "story_import_failed", "error": "story import failed"},
+                status_code=500,
+            )
         async with state.timeline_transition_lock:
             if state._story_runtime_is_busy():
                 return _story_transition_error(
@@ -1090,27 +1180,107 @@ def make_app() -> FastAPI:
                         "story_runtime_busy", "story runtime is already active"
                     ),
                 )
+            owner = state._acquire_story_runtime_owner("import")
+            source_generation = state.story_source_generation
+            store_task = asyncio.create_task(
+                asyncio.to_thread(state.story_source_store.store, story),
+                name=f"story-source-store-{story.source_sha256[:12]}",
+            )
+            state.story_source_store_task = store_task
+            state.story_import_requests.add(request_task)
+        try:
             try:
-                stored = state.story_source_store.store(story)
-                record = _StorySourceRecord(
-                    source_id=stored.source_id,
-                    story=story,
-                    encoding=encoding,
-                    storage_path=stored.path,
+                stored_result, was_cancelled = await state._await_story_io_task(
+                    store_task
                 )
+                caller_cancelled = caller_cancelled or was_cancelled
+                if not isinstance(stored_result, StoredStorySource):
+                    raise StorySourceStorageError(
+                        "story source store returned an invalid result"
+                    )
+                stored = stored_result
             except StorySourceStorageError:
-                return JSONResponse(
+                response = JSONResponse(
                     {
                         "code": "story_import_failed",
                         "error": "story source could not be stored",
                     },
                     status_code=500,
                 )
-
-            state.story_sources[record.source_id] = record
-            state.active_story_source_id = record.source_id
-            state.story_source_generation += 1
-            lookup = _inspect_story_analysis(state, record)
+            except Exception:
+                state.logger.exception("unexpected story source store failure")
+                response = JSONResponse(
+                    {
+                        "code": "story_import_failed",
+                        "error": "story source could not be stored",
+                    },
+                    status_code=500,
+                )
+            if stored is not None and not caller_cancelled:
+                async with state.timeline_transition_lock:
+                    runtime_changed = (
+                        state.story_runtime_owner is not owner
+                        or state.story_shutting_down
+                        or state.story_source_generation != source_generation
+                        or state.story_planning_task is not None
+                        or state.timeline_session.to_state().status.value != "idle"
+                        or bool(state.loop.autopilot)
+                    )
+                    if runtime_changed:
+                        response = _story_transition_error(
+                            state,
+                            _StoryConflict(
+                                "story_runtime_busy",
+                                "story runtime changed during import",
+                            ),
+                        )
+                    else:
+                        record = _StorySourceRecord(
+                            source_id=stored.source_id,
+                            story=story,
+                            encoding=encoding,
+                            storage_path=stored.path,
+                        )
+                        state.story_sources[record.source_id] = record
+                        state.active_story_source_id = record.source_id
+                        state.story_source_generation += 1
+                        lookup = _inspect_story_analysis(state, record)
+                        registered = True
+        finally:
+            try:
+                if stored is not None and not registered:
+                    cleanup_task = asyncio.create_task(
+                        asyncio.to_thread(state.story_source_store.delete, stored),
+                        name=f"story-source-store-delete-{stored.source_id}",
+                    )
+                    async with state.timeline_transition_lock:
+                        if state.story_source_store_task is store_task:
+                            state.story_source_store_task = cleanup_task
+                    try:
+                        _, cleanup_cancelled = await state._await_story_io_task(
+                            cleanup_task
+                        )
+                        caller_cancelled = caller_cancelled or cleanup_cancelled
+                    except Exception:
+                        state.logger.exception(
+                            "failed to remove unregistered story source"
+                        )
+            finally:
+                async with state.timeline_transition_lock:
+                    if state.story_source_store_task in (store_task, cleanup_task):
+                        state.story_source_store_task = None
+                    state.story_import_requests.discard(request_task)
+                    state._release_story_runtime_owner(owner)
+        if caller_cancelled:
+            raise asyncio.CancelledError
+        if response is not None:
+            return response
+        if record is None or lookup is None:
+            state.logger.error("story import completed without a public result")
+            return JSONResponse(
+                {"code": "story_import_failed", "error": "story import failed"},
+                status_code=500,
+            )
         await state.broadcast()
         return JSONResponse(
             {
@@ -1184,6 +1354,8 @@ def make_app() -> FastAPI:
                 if (
                     state.story_planning_task is not planning_task
                     or state.story_planning_context is not planning_context
+                    or state.story_runtime_owner
+                    is not planning_context.runtime_owner
                     or state.story_source_generation != planning_context.generation
                     or state.active_story_source_id != planning_context.source_id
                     or state.chapter_planner is not planning_context.planner
@@ -1625,20 +1797,38 @@ def make_app() -> FastAPI:
         except (TypeError, ValueError):
             return JSONResponse({"error": "value 必须是整数"}, status_code=400)
         planning: tuple[asyncio.Task, ...] = ()
+        owner: _StoryRuntimeOwner | None = None
         try:
             async with state.timeline_transition_lock:
-                planning = state._cancel_story_planning_now()
-                result = await state.loop.set_runtime_cap(ch, value)
-        except DeviceOutputError as exc:
+                if (
+                    state.story_runtime_owner is not None
+                    and state.story_runtime_owner.kind != "planning"
+                ):
+                    raise _StoryConflict(
+                        "story_runtime_busy", "story runtime is already reserved"
+                    )
+                if state.story_planning_task is not None:
+                    planning = state._cancel_story_planning_now()
+                owner = state._acquire_story_runtime_owner("cap")
             await state._settle_story_planning(planning)
+            async with state.timeline_transition_lock:
+                if state.story_runtime_owner is not owner:
+                    raise _StoryConflict(
+                        "story_runtime_busy", "story runtime reservation changed"
+                    )
+                result = await state.loop.set_runtime_cap(ch, value)
+        except _StoryConflict as exc:
+            return _story_transition_error(state, exc)
+        except DeviceOutputError as exc:
             return JSONResponse(
                 {"error": "运行时上限物理降档失败"},
                 status_code=exc.status_code,
             )
         except (RuntimeError, TypeError, ValueError) as exc:
-            await state._settle_story_planning(planning)
             return _timeline_error_response(exc)
-        await state._settle_story_planning(planning)
+        finally:
+            async with state.timeline_transition_lock:
+                state._release_story_runtime_owner(owner)
         if result["dropped"]:
             return JSONResponse(
                 {"error": "运行时上限物理降档失败"},
@@ -1658,11 +1848,12 @@ def make_app() -> FastAPI:
         """切换角色/风格：{role: "触手", profile: "调教"}，保存并热加载；目标 DLC 未安装时拒绝。"""
         requested_role = str(body.get("role") or "").strip()
         requested_profile = str(body.get("profile") or "").strip()
+        owner: _StoryRuntimeOwner | None = None
         try:
             async with state.timeline_transition_lock:
                 active_session = state.timeline_session.to_state()
                 if (
-                    state.story_runtime_change_active
+                    state.story_runtime_owner is not None
                     or state.story_planning_task is not None
                     or (
                         active_session.mode in ("novel", "replay")
@@ -1675,6 +1866,7 @@ def make_app() -> FastAPI:
                             "story_runtime_busy", "story runtime is already active"
                         ),
                     )
+                owner = state._acquire_story_runtime_owner("profile")
                 candidate_cfg = deepcopy(cfg)
                 reload_character(candidate_cfg)
                 roles = {
@@ -1727,6 +1919,9 @@ def make_app() -> FastAPI:
                 }
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
+        finally:
+            async with state.timeline_transition_lock:
+                state._release_story_runtime_owner(owner)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -1958,6 +2153,8 @@ def make_app() -> FastAPI:
         model = str(body.get("model") or "").strip()
         if not base_url or not model:
             return JSONResponse({"error": "地址与模型名不能为空"}, status_code=400)
+        owner: _StoryRuntimeOwner | None = None
+        planning: tuple[asyncio.Task, ...] = ()
         async with state.timeline_transition_lock:
             if state.timeline_session.to_state().status.value != "idle":
                 return _story_transition_error(
@@ -1966,13 +2163,27 @@ def make_app() -> FastAPI:
                         "story_runtime_busy", "story runtime is already active"
                     ),
                 )
-            state.story_runtime_change_active = True
-            planning = state._cancel_story_planning_now()
-        await state._settle_story_planning(planning)
+            if (
+                state.story_runtime_owner is not None
+                and state.story_runtime_owner.kind != "planning"
+            ):
+                return _story_transition_error(
+                    state,
+                    _StoryConflict(
+                        "story_runtime_busy", "story runtime is already reserved"
+                    ),
+                )
+            if state.story_planning_task is not None:
+                planning = state._cancel_story_planning_now()
+            owner = state._acquire_story_runtime_owner("llm")
         old = None
         try:
+            await state._settle_story_planning(planning)
             async with state.timeline_transition_lock:
-                if state.timeline_session.to_state().status.value != "idle":
+                if (
+                    state.story_runtime_owner is not owner
+                    or state.timeline_session.to_state().status.value != "idle"
+                ):
                     raise _StoryConflict(
                         "story_runtime_busy", "story runtime is already active"
                     )
@@ -2004,13 +2215,11 @@ def make_app() -> FastAPI:
                 signature = state._story_runtime_signature()
                 state.chapter_planner = state._build_story_planner(signature)
                 state.story_planner_signature = signature
-                state.story_runtime_change_active = False
         except _StoryConflict as exc:
             return _story_transition_error(state, exc)
         finally:
-            if state.story_runtime_change_active:
-                async with state.timeline_transition_lock:
-                    state.story_runtime_change_active = False
+            async with state.timeline_transition_lock:
+                state._release_story_runtime_owner(owner)
         with contextlib.suppress(Exception):
             await old.client.aclose()
         await state.broadcast()

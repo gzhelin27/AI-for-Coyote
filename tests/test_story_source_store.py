@@ -36,6 +36,68 @@ class PinnedStorySourceStoreTests(unittest.TestCase):
         )
         self.assertFalse(any(path.name.endswith(".tmp") for path in self.directory.iterdir()))
 
+    def test_duplicate_opaque_id_never_overwrites_first_source(self):
+        first_id = "A" * 24
+        second_id = "B" * 24
+        other = StorySourceLoader(max_bytes=1024).load(
+            "other.txt", b"WXYZ", encoding="utf-8"
+        )
+
+        with patch(
+            "backend.story.source_store.secrets.token_urlsafe",
+            side_effect=(first_id, first_id, second_id),
+        ):
+            first = self.store.store(self.story)
+            second = self.store.store(other)
+
+        self.assertEqual(first.source_id, first_id)
+        self.assertEqual(second.source_id, second_id)
+        self.assertEqual(first.path.read_bytes(), b"ABCD")
+        self.assertEqual(second.path.read_bytes(), b"WXYZ")
+        self.assertEqual(
+            sorted(path.name for path in self.directory.iterdir()),
+            [f"{first_id}.txt", f"{second_id}.txt"],
+        )
+
+    def test_delete_removes_only_the_committed_opaque_source(self):
+        kept_story = StorySourceLoader(max_bytes=1024).load(
+            "kept.txt", b"WXYZ", encoding="utf-8"
+        )
+        removed = self.store.store(self.story)
+        kept = self.store.store(kept_story)
+        delete = getattr(self.store, "delete", None)
+        self.assertIsNotNone(delete, "pinned source deletion API is missing")
+
+        delete(removed)
+
+        self.assertFalse(removed.path.exists())
+        self.assertEqual(kept.path.read_bytes(), b"WXYZ")
+
+    def test_posix_commit_fails_on_existing_final_instead_of_replacing_it(self):
+        with (
+            patch("backend.story.source_store.os.name", "posix"),
+            patch(
+                "backend.story.source_store.os.link",
+                side_effect=FileExistsError("occupied"),
+            ),
+            patch(
+                "backend.story.source_store.os.replace",
+                return_value=None,
+            ),
+        ):
+            with (
+                patch(
+                    "backend.story.source_store.os.supports_dir_fd",
+                    {os.link, os.unlink, os.rename, os.replace},
+                ),
+                patch(
+                    "backend.story.source_store.os.supports_follow_symlinks",
+                    {os.link},
+                ),
+            ):
+                with self.assertRaises(FileExistsError):
+                    self.store._replace_relative(123, ".temporary", "opaque.txt")
+
     def test_root_replacement_cannot_redirect_a_write(self):
         moved = self.root / "moved-stories"
         outside = self.root / "outside"

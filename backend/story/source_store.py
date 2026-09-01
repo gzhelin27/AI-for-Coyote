@@ -91,6 +91,47 @@ class PinnedStorySourceStore:
             self._closed = True
             self._root.handle.close()
 
+    def delete(self, stored: StoredStorySource) -> None:
+        """Remove one committed source without resolving a caller-owned path."""
+
+        if not isinstance(stored, StoredStorySource):
+            raise TypeError("stored source must be a StoredStorySource")
+        suffix = stored.path.suffix.lower()
+        name = f"{stored.source_id}{suffix}"
+        expected = self._root.final_path / name
+        if (
+            not _OPAQUE_ID.fullmatch(stored.source_id)
+            or suffix not in _SOURCE_EXTENSIONS
+            or stored.path.name != name
+            or _path_key(stored.path) != _path_key(expected)
+        ):
+            raise StorySourceStorageError("stored story source identity is unsafe")
+        self._verify_root()
+        try:
+            if os.name == "nt":
+                descriptor = self._open_windows_existing(name)
+                try:
+                    self._verify_opened_child(descriptor)
+                    self._mark_windows_delete(descriptor)
+                finally:
+                    os.close(descriptor)
+            elif os.unlink in os.supports_dir_fd:
+                os.unlink(name, dir_fd=self._root.handle.fileno())
+            else:
+                raise StorySourceStorageError(
+                    "safe relative story source deletion is unavailable"
+                )
+        except FileNotFoundError:
+            return
+        except StorySourceStorageError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise StorySourceStorageError(
+                "story source could not be deleted"
+            ) from exc
+        self._verify_root()
+        self._fsync_directory()
+
     def store(self, story: ImportedStory) -> StoredStorySource:
         if not isinstance(story, ImportedStory):
             raise TypeError("story must be an ImportedStory")
@@ -190,12 +231,22 @@ class PinnedStorySourceStore:
         )
 
     def _open_windows_temporary(self, temporary_name: str) -> int:
+        return self._open_windows_relative(
+            temporary_name, create=True, writable=True
+        )
+
+    def _open_windows_existing(self, name: str) -> int:
+        return self._open_windows_relative(name, create=False, writable=False)
+
+    def _open_windows_relative(
+        self, name: str, *, create: bool, writable: bool
+    ) -> int:
         import ctypes
         import msvcrt
         from ctypes import wintypes
 
-        if Path(temporary_name).name != temporary_name:
-            raise StorySourceStorageError("story source temporary name is unsafe")
+        if Path(name).name != name:
+            raise StorySourceStorageError("story source child name is unsafe")
 
         class UnicodeString(ctypes.Structure):
             _fields_ = (
@@ -233,8 +284,8 @@ class PinnedStorySourceStore:
         file_synchronous_io_nonalert = 0x00000020
         object_case_insensitive = 0x00000040
 
-        name_buffer = ctypes.create_unicode_buffer(temporary_name)
-        encoded_name = temporary_name.encode("utf-16-le")
+        name_buffer = ctypes.create_unicode_buffer(name)
+        encoded_name = name.encode("utf-16-le")
         object_name = UnicodeString(
             Length=len(encoded_name),
             MaximumLength=len(encoded_name) + 2,
@@ -268,13 +319,16 @@ class PinnedStorySourceStore:
         create_file.restype = ctypes.c_long
         status = create_file(
             ctypes.byref(native_handle),
-            generic_write | delete_access | file_read_attributes | synchronize,
+            (generic_write if writable else 0)
+            | delete_access
+            | file_read_attributes
+            | synchronize,
             ctypes.byref(attributes),
             ctypes.byref(status_block),
             None,
             file_attribute_normal,
             file_share_read | file_share_write,
-            file_create,
+            file_create if create else 1,
             file_open_reparse_point
             | file_non_directory_file
             | file_synchronous_io_nonalert,
@@ -286,12 +340,16 @@ class PinnedStorySourceStore:
             to_dos_error.argtypes = (ctypes.c_long,)
             to_dos_error.restype = wintypes.ULONG
             error = int(to_dos_error(status))
-            if error in (80, 183):
-                raise FileExistsError(temporary_name)
+            if create and error in (80, 183):
+                raise FileExistsError(name)
+            if not create and error in (2, 3):
+                raise FileNotFoundError(name)
             raise OSError(error, "relative story source create failed")
         try:
             return msvcrt.open_osfhandle(
-                native_handle.value, os.O_WRONLY | getattr(os, "O_BINARY", 0)
+                native_handle.value,
+                (os.O_WRONLY if writable else os.O_RDONLY)
+                | getattr(os, "O_BINARY", 0),
             )
         except BaseException:
             ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(native_handle)
@@ -303,16 +361,32 @@ class PinnedStorySourceStore:
         if os.name == "nt":
             self._rename_windows_handle(descriptor, final_name)
             return
-        if os.replace not in os.supports_dir_fd and os.rename not in os.supports_dir_fd:
+        if (
+            os.link not in os.supports_dir_fd
+            or os.unlink not in os.supports_dir_fd
+            or os.link not in os.supports_follow_symlinks
+        ):
             raise StorySourceStorageError(
                 "safe relative story source replacement is unavailable"
             )
-        os.replace(
+        directory_descriptor = self._root.handle.fileno()
+        os.link(
             temporary_name,
             final_name,
-            src_dir_fd=self._root.handle.fileno(),
-            dst_dir_fd=self._root.handle.fileno(),
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
         )
+        try:
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
+        except OSError as exc:
+            try:
+                os.unlink(final_name, dir_fd=directory_descriptor)
+            except OSError as cleanup_exc:
+                raise StorySourceStorageError(
+                    "story source no-replace rollback failed"
+                ) from cleanup_exc
+            raise exc
 
     def _rename_windows_handle(self, descriptor: int, final_name: str) -> None:
         import ctypes

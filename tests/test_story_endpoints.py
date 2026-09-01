@@ -7,6 +7,8 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -148,6 +150,36 @@ class BlockingFirstWebSocket(CapturingWebSocket):
         self.messages.append(message)
 
 
+class StalledStorySourceStore:
+    def __init__(
+        self,
+        delegate,
+        *,
+        fallback_timeout: float = 0.5,
+        delete_error: Exception | None = None,
+    ) -> None:
+        self.delegate = delegate
+        self.fallback_timeout = fallback_timeout
+        self.delete_error = delete_error
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+
+    def store(self, story):
+        self.started.set()
+        self.release.wait(self.fallback_timeout)
+        return self.delegate.store(story)
+
+    def delete(self, stored) -> None:
+        self.delegate.delete(stored)
+        if self.delete_error is not None:
+            raise self.delete_error
+
+    def close(self) -> None:
+        self.closed.set()
+        self.delegate.close()
+
+
 def _docx_bytes(text: str) -> bytes:
     document = Document()
     document.add_paragraph(text)
@@ -212,7 +244,10 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.state.story_source_generation = 0
         self.state.story_planning_task = None
         self.state.story_planning_context = None
-        self.state.story_runtime_change_active = False
+        self.state.story_runtime_owner = None
+        self.state.story_source_store_task = None
+        self.state.story_import_requests = set()
+        self.state.story_shutting_down = False
         self.state.story_dlc_version = main_module.dlc_provenance(
             self.state.cfg,
             project_root=main_module.PROJECT_ROOT,
@@ -276,6 +311,18 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
             data={"encoding": encoding},
             files={"file": (filename, source_bytes, "application/octet-stream")},
         )
+
+    async def _wait_for_thread_event(self, event: threading.Event) -> None:
+        deadline = asyncio.get_running_loop().time() + 0.75
+        while not event.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail("background story store did not start")
+            await asyncio.sleep(0.001)
+
+    def _stall_story_store(self) -> StalledStorySourceStore:
+        stalled = StalledStorySourceStore(self.state.story_source_store)
+        self.state.story_source_store = stalled
+        return stalled
 
     def _load_story(self, filename: str, source_bytes: bytes, encoding: str):
         return self.state.story_source_loader.load(
@@ -342,6 +389,141 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
             sorted(path.name for path in self.state.story_import_directory.iterdir()),
             [f"{source_id}.txt"],
         )
+
+    async def test_stalled_store_keeps_loop_callback_and_disconnect_responsive(self):
+        stalled = self._stall_story_store()
+        callback_ran = asyncio.Event()
+
+        async def disconnect_after_store_starts():
+            await self._wait_for_thread_event(stalled.started)
+            await main_module.AppState.on_relay_event(
+                self.state, "client_disconnected", {}
+            )
+
+        started_at = time.perf_counter()
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+        disconnect = asyncio.create_task(disconnect_after_store_starts())
+        asyncio.get_running_loop().call_soon(callback_ran.set)
+        await asyncio.wait_for(disconnect, timeout=0.75)
+        elapsed = time.perf_counter() - started_at
+        callback_completed = callback_ran.is_set()
+        import_was_pending = not importing.done()
+        stalled.release.set()
+        imported = await asyncio.wait_for(importing, timeout=0.75)
+
+        self.assertLess(elapsed, 0.25)
+        self.assertTrue(callback_completed)
+        self.assertTrue(import_was_pending)
+        self.assertEqual(imported.status_code, 200, imported.text)
+
+    async def test_cancelled_stalled_import_deletes_committed_orphan_and_clears_tasks(self):
+        stalled = self._stall_story_store()
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+        await self._wait_for_thread_event(stalled.started)
+
+        importing.cancel()
+        stalled.release.set()
+        was_cancelled = False
+        try:
+            await asyncio.wait_for(importing, timeout=0.75)
+        except asyncio.CancelledError:
+            was_cancelled = True
+
+        self.assertTrue(was_cancelled)
+        self.assertEqual(self.state.story_sources, {})
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertIsNone(self.state.story_runtime_owner)
+        self.assertIsNone(getattr(self.state, "story_source_store_task", None))
+        self.assertFalse(
+            [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and not task.done()
+                and task.get_name().startswith("story-source-store-")
+            ]
+        )
+
+    async def test_cleanup_exception_cannot_steal_import_owner_or_leak_task(self):
+        stalled = StalledStorySourceStore(
+            self.state.story_source_store,
+            delete_error=RuntimeError("private cleanup detail"),
+        )
+        self.state.story_source_store = stalled
+        self.state.logger.exception = MagicMock()
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+        await self._wait_for_thread_event(stalled.started)
+
+        importing.cancel()
+        stalled.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(importing, timeout=0.75)
+
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertIsNone(self.state.story_runtime_owner)
+        self.assertIsNone(self.state.story_source_store_task)
+        self.assertEqual(self.state.story_import_requests, set())
+        self.state.logger.exception.assert_called_once_with(
+            "failed to remove unregistered story source"
+        )
+
+    async def test_unexpected_store_exception_is_generic_500_and_clears_owner(self):
+        self.state.story_source_store.store = MagicMock(
+            side_effect=RuntimeError("C:\\private\\source-secret.txt")
+        )
+        self.state.logger.exception = MagicMock()
+
+        response = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["code"], "story_import_failed")
+        self.assertNotIn("private", response.text.lower())
+        self.assertNotIn("secret", response.text.lower())
+        self.assertIsNone(self.state.story_runtime_owner)
+        self.assertIsNone(self.state.story_source_store_task)
+        self.assertEqual(self.state.story_import_requests, set())
+        self.state.logger.exception.assert_called_once_with(
+            "unexpected story source store failure"
+        )
+
+    async def test_shutdown_runs_safety_before_settling_stalled_store_then_cleans_orphan(self):
+        stalled = self._stall_story_store()
+        safety_progress = asyncio.Event()
+
+        async def stop_sensors(_enabled: bool) -> None:
+            safety_progress.set()
+
+        self.state.set_sensors = AsyncMock(side_effect=stop_sensors)
+        self.state.shutdown = main_module.AppState.shutdown.__get__(
+            self.state, main_module.AppState
+        )
+        self.state._shutdown_cleanup = main_module.AppState._shutdown_cleanup.__get__(
+            self.state, main_module.AppState
+        )
+
+        async def shutdown_after_store_starts():
+            await self._wait_for_thread_event(stalled.started)
+            await self.state.shutdown()
+
+        started_at = time.perf_counter()
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+        shutdown = asyncio.create_task(shutdown_after_store_starts())
+
+        await asyncio.wait_for(safety_progress.wait(), timeout=0.75)
+        elapsed = time.perf_counter() - started_at
+        shutdown_was_pending = not shutdown.done()
+        stalled.release.set()
+        imported = await asyncio.wait_for(importing, timeout=0.75)
+        await asyncio.wait_for(shutdown, timeout=0.75)
+
+        self.assertLess(elapsed, 0.25)
+        self.assertTrue(shutdown_was_pending)
+        self.assertEqual(imported.status_code, 409, imported.text)
+        self.assertEqual(imported.json()["code"], "story_runtime_busy")
+        self.assertEqual(self.state.story_sources, {})
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertTrue(stalled.closed.is_set())
+        self.assertIsNone(self.state.story_runtime_owner)
 
     async def test_import_rejects_unsupported_and_oversize_without_storing_a_source(self):
         unsupported = await self._import("secret.pdf", b"not a novel", "auto")
@@ -989,6 +1171,73 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         client.release.set()
         completed = await asyncio.wait_for(play, timeout=0.2)
         self.assertEqual(completed.status_code, 200, completed.text)
+
+    async def test_pending_dlc_owner_rejects_llm_cap_and_story_import_without_being_cleared(self):
+        first_broadcast_started = asyncio.Event()
+        release_first_broadcast = asyncio.Event()
+        broadcast_count = 0
+
+        async def controlled_broadcast():
+            nonlocal broadcast_count
+            broadcast_count += 1
+            if broadcast_count == 1:
+                first_broadcast_started.set()
+                await release_first_broadcast.wait()
+
+        self.state.broadcast = controlled_broadcast
+        runtime_root = self.root / "runtime-owner"
+        config_dir = runtime_root / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.example.yaml").write_text(
+            "llm:\n"
+            '  api_key: ""\n'
+            "  base_url: https://old.invalid/v1\n"
+            "  model: model-one\n",
+            encoding="utf-8",
+        )
+        replacement = CloseAwareStructuredClient()
+        original_llm = self.state.llm
+
+        with (
+            patch.object(main_module, "PROJECT_ROOT", runtime_root),
+            patch.object(main_module, "LLM", return_value=replacement),
+        ):
+            dlc = asyncio.create_task(
+                self.client.post(
+                    "/api/dlc/import",
+                    files={"file": ("theme.md", b"# DLC", "text/markdown")},
+                )
+            )
+            await asyncio.wait_for(first_broadcast_started.wait(), timeout=0.2)
+
+            llm = await self.client.post(
+                "/api/settings/llm",
+                json={
+                    "api_key": "replacement-key",
+                    "base_url": "https://new.invalid/v1",
+                    "model": "model-two",
+                },
+            )
+            cap = await self.client.post(
+                "/api/device/channels/cap", json={"channel": "A", "value": 30}
+            )
+            imported = await self._import("story.txt", b"ABCD", "utf-8")
+
+            for response in (llm, cap, imported):
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(response.json()["code"], "story_runtime_busy")
+            self.assertIs(self.state.llm, original_llm)
+            self.assertFalse((config_dir / "config.yaml").exists())
+            self.assertEqual(self.state.story_sources, {})
+            self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+
+            release_first_broadcast.set()
+            completed_dlc = await asyncio.wait_for(dlc, timeout=0.2)
+            self.assertEqual(completed_dlc.status_code, 200, completed_dlc.text)
+            accepted = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertIsNone(self.state.story_runtime_owner)
 
     async def test_llm_replace_cancels_old_plan_before_closing_and_uses_new_client(self):
         old = CloseAwareStructuredClient(blocked=True)
