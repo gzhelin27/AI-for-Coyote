@@ -1,10 +1,16 @@
 """Local story-source import and analysis domain helpers."""
 
-from .models import ImportedStory
+from .analysis_store import AnalysisStore
+from .models import AnalysisKey, ImportedStory, StoryChapter, StoryMap, StoryScene
 from .source import StorySourceEncoding, StorySourceError, StorySourceLoader
 
 __all__ = (
+    "AnalysisKey",
+    "AnalysisStore",
     "ImportedStory",
+    "StoryChapter",
+    "StoryMap",
+    "StoryScene",
     "StorySourceEncoding",
     "StorySourceError",
     "StorySourceLoader",
