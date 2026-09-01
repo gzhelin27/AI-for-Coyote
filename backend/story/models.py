@@ -18,7 +18,7 @@ class ImportedStory:
 
 
 def _require_non_empty_text(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value
 
@@ -47,8 +47,7 @@ def _require_positive_finite_number(value: object, name: str) -> float | int:
 
 
 def _source_namespace(source_hash: str) -> str:
-    _require_non_empty_text(source_hash, "source hash")
-    return hashlib.sha256(source_hash.encode("utf-8")).hexdigest()[:12]
+    return _require_non_empty_text(source_hash, "source hash")
 
 
 @dataclass(frozen=True, slots=True)

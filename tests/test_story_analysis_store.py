@@ -1,7 +1,9 @@
 import json
 import math
+import os
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -69,10 +71,13 @@ class AnalysisStoreTests(unittest.TestCase):
     def test_analysis_models_include_pace_text_length_and_source_namespace(self):
         self.assertIn("pace", StoryScene.__dataclass_fields__)
         self.assertIn("text_length", StoryMap.__dataclass_fields__)
-        self.assertEqual(StoryChapter.stable_id("source-hash", 0), "ch-badb34c8bf5a-0001")
+        self.assertEqual(
+            StoryChapter.stable_id("source-hash", 0),
+            "ch-source-hash-0001",
+        )
         self.assertEqual(
             StoryScene.stable_id("source-hash", 0, 1),
-            "ch-badb34c8bf5a-0001-sc-0002",
+            "ch-source-hash-0001-sc-0002",
         )
         self.assertNotEqual(
             StoryChapter.stable_id("source-hash", 0),
@@ -93,10 +98,13 @@ class AnalysisStoreTests(unittest.TestCase):
         store.save(self.key, self.scene_map)
 
         self.assertEqual(store.load(self.key), self.scene_map)
-        self.assertEqual(self.scene_map.chapters[0].id, "ch-badb34c8bf5a-0001")
+        self.assertEqual(
+            self.scene_map.chapters[0].id,
+            "ch-source-hash-0001",
+        )
         self.assertEqual(
             self.scene_map.chapters[0].scenes[1].id,
-            "ch-badb34c8bf5a-0001-sc-0002",
+            "ch-source-hash-0001-sc-0002",
         )
 
     def test_models_are_immutable_and_ids_do_not_depend_on_summaries(self):
@@ -193,7 +201,11 @@ class AnalysisStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(scene, summary="")
         with self.assertRaises(ValueError):
+            replace(scene, summary=" \t\n")
+        with self.assertRaises(ValueError):
             replace(chapter, summary="")
+        with self.assertRaises(ValueError):
+            replace(chapter, summary=" \t\n")
         with self.assertRaises(ValueError):
             replace(chapter, scenes=())
         with self.assertRaises(ValueError):
@@ -301,6 +313,24 @@ class AnalysisStoreTests(unittest.TestCase):
         store.save(self.key, self.scene_map)
         self.assertEqual(store.load(self.key), self.scene_map)
 
+    def test_load_and_save_reclaim_only_this_key_stale_temporary_files(self):
+        self.cache_directory.mkdir()
+        store = AnalysisStore(self.cache_directory)
+        cache_path = store.cache_path(self.key)
+        stale = cache_path.with_name(f".{cache_path.name}.crashed.tmp")
+        unrelated = self.cache_directory / ".other-cache.crashed.tmp"
+        stale.write_text("stale", encoding="utf-8")
+        unrelated.write_text("preserve", encoding="utf-8")
+
+        self.assertIsNone(store.load(self.key))
+        self.assertFalse(stale.exists())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserve")
+
+        stale.write_text("stale again", encoding="utf-8")
+        store.save(self.key, self.scene_map)
+        self.assertFalse(stale.exists())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserve")
+
     def test_quarantine_name_collision_preserves_existing_file(self):
         store = AnalysisStore(self.cache_directory)
         store.save(self.key, self.scene_map)
@@ -327,6 +357,19 @@ class AnalysisStoreTests(unittest.TestCase):
                         store.save(self.key, self.scene_map)
                 self.assertEqual(list(directory.glob("*.tmp")), [])
                 self.assertIsNone(store.load(self.key))
+
+    def test_opened_temp_fstat_failure_closes_descriptor_and_removes_temp(self):
+        store = AnalysisStore(self.cache_directory)
+        real_close = analysis_store_module.os.close
+
+        with patch.object(analysis_store_module.os, "fstat", side_effect=OSError("simulated")), patch.object(
+            analysis_store_module.os, "close", wraps=real_close
+        ) as close:
+            with self.assertRaises(AnalysisStoreError):
+                store.save(self.key, self.scene_map)
+
+        self.assertGreaterEqual(close.call_count, 1)
+        self.assertEqual(list(self.cache_directory.glob("*.tmp")), [])
 
     def test_symlinked_cache_and_analysis_directory_are_not_followed(self):
         outside = Path(self.temporary_directory.name) / "outside"
@@ -357,6 +400,28 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual(external_file.read_text(encoding="utf-8"), "outside")
         with self.assertRaises(AnalysisStoreError):
             store.save(self.key, self.scene_map)
+
+    def test_windows_junction_analysis_directory_is_not_followed(self):
+        if os.name != "nt":
+            self.skipTest("junctions are a Windows-only filesystem feature")
+        outside = Path(self.temporary_directory.name) / "junction-outside"
+        outside.mkdir()
+        junction = Path(self.temporary_directory.name) / "junction-analysis"
+        command = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if command.returncode != 0:
+            self.skipTest(f"mklink /J is unavailable: {command.stderr or command.stdout}")
+        self.addCleanup(lambda: junction.rmdir() if junction.exists() else None)
+        store = AnalysisStore(junction)
+
+        self.assertIsNone(store.load(self.key))
+        with self.assertRaises(AnalysisStoreError):
+            store.save(self.key, self.scene_map)
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_concurrent_writers_leave_one_complete_readable_cache(self):
         store_one = AnalysisStore(self.cache_directory)

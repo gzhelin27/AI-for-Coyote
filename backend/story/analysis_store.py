@@ -81,7 +81,8 @@ class AnalysisStore:
         if self._resolved_directory() is None:
             return None
         with _cache_path_lock(cache_path):
-            if self._resolved_directory() is None or cache_path.is_symlink():
+            self._reclaim_stale_temporaries(cache_path)
+            if self._resolved_directory() is None or _is_redirect(cache_path):
                 return None
             identity = _regular_file_identity(cache_path)
             if identity is None:
@@ -109,15 +110,35 @@ class AnalysisStore:
         target = directory / f"{key.digest()}.json"
         document = self._encode_document(key, story_map)
         with _cache_path_lock(target):
+            self._reclaim_stale_temporaries(target)
             if self._resolved_directory() != directory:
                 raise AnalysisStoreError("analysis directory changed or is unsafe")
-            if target.is_symlink():
-                raise AnalysisStoreError("analysis cache target is a symlink")
+            if _is_redirect(target):
+                raise AnalysisStoreError("analysis cache target is a filesystem redirect")
             self._write_atomically(directory, target, document)
 
+    @staticmethod
+    def _reclaim_stale_temporaries(cache_path: Path) -> None:
+        """Remove only regular abandoned temp files for this generated cache key."""
+
+        prefix = f".{cache_path.name}."
+        try:
+            candidates = tuple(cache_path.parent.iterdir())
+        except OSError:
+            return
+        for candidate in candidates:
+            if not (
+                candidate.name.startswith(prefix)
+                and candidate.name.endswith(".tmp")
+            ):
+                continue
+            identity = _regular_file_identity(candidate)
+            if identity is not None:
+                _unlink_if_identity_matches(candidate, identity)
+
     def _prepare_directory(self) -> Path:
-        if self._directory_has_symlink():
-            raise AnalysisStoreError("analysis directory contains a symlink")
+        if self._directory_has_redirect():
+            raise AnalysisStoreError("analysis directory contains a filesystem redirect")
         try:
             self._directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -128,18 +149,18 @@ class AnalysisStore:
         return directory
 
     def _resolved_directory(self) -> Path | None:
-        if self._directory_has_symlink():
+        if self._directory_has_redirect():
             return None
         try:
             return self._directory.resolve(strict=False)
         except OSError:
             return None
 
-    def _directory_has_symlink(self) -> bool:
+    def _directory_has_redirect(self) -> bool:
         path = self._directory.absolute()
         for candidate in (path, *path.parents):
             try:
-                if candidate.is_symlink():
+                if _is_redirect(candidate):
                     return True
             except OSError:
                 return True
@@ -148,12 +169,16 @@ class AnalysisStore:
     def _write_atomically(self, directory: Path, target: Path, document: dict[str, object]) -> None:
         temporary_path: Path | None = None
         temporary_identity: tuple[int, int] | None = None
+        descriptor: int | None = None
         try:
             temporary_path, descriptor = self._open_temporary_file(directory, target.name)
-            temporary_identity = _regular_file_identity(temporary_path)
-            if temporary_identity is None:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode):
                 raise AnalysisStoreError("could not verify analysis cache temporary file")
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            temporary_identity = details.st_dev, details.st_ino
+            handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+            descriptor = None
+            with handle:
                 json.dump(document, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -164,8 +189,15 @@ class AnalysisStore:
                 raise
             raise AnalysisStoreError("could not save analysis cache") from exc
         finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             if temporary_path is not None and temporary_identity is not None:
                 _unlink_if_identity_matches(temporary_path, temporary_identity)
+            elif temporary_path is not None:
+                _unlink_generated_regular_temp(temporary_path)
 
     @staticmethod
     def _open_temporary_file(directory: Path, target_name: str) -> tuple[Path, int]:
@@ -201,14 +233,14 @@ class AnalysisStore:
             os.close(descriptor)
 
     def _quarantine(self, cache_path: Path, expected_identity: tuple[int, int]) -> None:
-        if self._resolved_directory() is None or cache_path.is_symlink():
+        if self._resolved_directory() is None or _is_redirect(cache_path):
             return
         if _regular_file_identity(cache_path) != expected_identity:
             return
         for _ in range(32):
             invalid_path = cache_path.with_name(f"{cache_path.name}.{secrets.token_hex(16)}.invalid")
             try:
-                if invalid_path.exists() or invalid_path.is_symlink():
+                if invalid_path.exists() or _is_redirect(invalid_path):
                     continue
                 cache_path.rename(invalid_path)
                 return
@@ -280,6 +312,8 @@ def _reject_duplicate_object(pairs: list[tuple[str, object]]) -> dict[str, objec
 
 
 def _regular_file_identity(path: Path) -> tuple[int, int] | None:
+    if _is_redirect(path):
+        return None
     try:
         details = os.lstat(path)
     except (FileNotFoundError, OSError):
@@ -289,8 +323,39 @@ def _regular_file_identity(path: Path) -> tuple[int, int] | None:
     return details.st_dev, details.st_ino
 
 
+def _is_redirect(path: Path) -> bool:
+    """Recognize symlinks, Windows junctions, and detectable reparse points."""
+
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        details = os.lstat(path)
+    except (FileNotFoundError, OSError):
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    return bool(getattr(details, "st_file_attributes", 0) & reparse_point)
+
+
 def _unlink_if_identity_matches(path: Path, expected_identity: tuple[int, int]) -> None:
     if _regular_file_identity(path) != expected_identity:
+        return
+    try:
+        path.unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _unlink_generated_regular_temp(path: Path) -> None:
+    """Clean a just-created temp after fstat failed without following links."""
+
+    try:
+        details = os.lstat(path)
+    except (FileNotFoundError, OSError):
+        return
+    if not stat.S_ISREG(details.st_mode):
         return
     try:
         path.unlink()
