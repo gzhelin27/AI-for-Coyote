@@ -149,18 +149,13 @@ def _decode_plain_text(original_bytes: bytes) -> str:
 def _resolve_ambiguous_chinese_text(utf8: str, gb18030: str) -> str:
     normalized_utf8 = _normalize_text(utf8)
     normalized_gb18030 = _normalize_text(gb18030)
-    utf8_suspicious = _has_suspicious_text_content(normalized_utf8)
-    gb18030_suspicious = _has_suspicious_text_content(normalized_gb18030)
-    if utf8_suspicious != gb18030_suspicious:
-        return gb18030 if utf8_suspicious else utf8
-    if utf8_suspicious:
-        raise StorySourceError("story text encoding is ambiguous")
-
-    utf8_score = _cjk_plausibility(normalized_utf8)
-    gb18030_score = _cjk_plausibility(normalized_gb18030)
-    if utf8_score >= gb18030_score + 0.2:
+    if _has_coherent_utf8_text(normalized_utf8):
         return utf8
-    if gb18030_score >= utf8_score + 0.2:
+    if (
+        (_has_suspicious_text_content(normalized_utf8) or _is_isolated_non_cjk(normalized_utf8))
+        and not _has_suspicious_text_content(normalized_gb18030)
+        and _is_coherent_chinese_text(normalized_gb18030)
+    ):
         return gb18030
     raise StorySourceError("story text encoding is ambiguous")
 
@@ -173,17 +168,44 @@ def _has_suspicious_text_content(text: str) -> bool:
     )
 
 
-def _cjk_plausibility(text: str) -> float:
+def _has_coherent_utf8_text(text: str) -> bool:
     visible = [character for character in text if not character.isspace()]
-    if not visible:
-        return 0.0
-    cjk_count = sum(
+    if any(_is_cjk(character) or unicodedata.category(character) == "So" for character in visible):
+        return True
+    latin_letters = [character for character in visible if _is_latin_letter(character)]
+    if len(latin_letters) >= 2:
+        return True
+    letters = [character for character in visible if character.isalpha()]
+    return len(letters) >= 2 and all(_is_cyrillic_letter(character) for character in letters)
+
+
+def _is_isolated_non_cjk(text: str) -> bool:
+    visible = [character for character in text if not character.isspace()]
+    return len(visible) == 1 and not _is_cjk(visible[0])
+
+
+def _is_coherent_chinese_text(text: str) -> bool:
+    visible = [character for character in text if not character.isspace()]
+    return bool(visible) and any(_is_cjk(character) for character in visible) and all(
+        _is_cjk(character) or unicodedata.category(character).startswith("P")
+        for character in visible
+    )
+
+
+def _is_cjk(character: str) -> bool:
+    return (
         0x3400 <= ord(character) <= 0x4DBF
         or 0x4E00 <= ord(character) <= 0x9FFF
         or 0xF900 <= ord(character) <= 0xFAFF
-        for character in visible
     )
-    return cjk_count / len(visible)
+
+
+def _is_latin_letter(character: str) -> bool:
+    return character.isalpha() and unicodedata.name(character, "").startswith("LATIN ")
+
+
+def _is_cyrillic_letter(character: str) -> bool:
+    return character.isalpha() and unicodedata.name(character, "").startswith("CYRILLIC ")
 
 
 def _unsafe_docx_member_name(name: str) -> bool:

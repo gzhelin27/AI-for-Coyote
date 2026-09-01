@@ -52,8 +52,23 @@ class StorySourceTests(unittest.TestCase):
 
         self.assertEqual(imported.text, "中文")
 
+    def test_preserves_utf8_emoji_when_gb18030_also_decodes(self):
+        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "😊".encode("utf-8"))
+
+        self.assertEqual(imported.text, "😊")
+
+    def test_preserves_multi_character_utf8_cyrillic_when_gb18030_also_decodes(self):
+        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "Привет".encode("utf-8"))
+
+        self.assertEqual(imported.text, "Привет")
+
+    def test_preserves_utf8_latin_accents_when_gb18030_also_decodes(self):
+        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "café".encode("utf-8"))
+
+        self.assertEqual(imported.text, "café")
+
     def test_rejects_equally_plausible_conflicting_text_decodings(self):
-        ambiguous = bytes.fromhex("e5bcb2e99b9b")
+        ambiguous = bytes.fromhex("d2bbceb1")
 
         with self.assertRaises(StorySourceError):
             StorySourceLoader(max_bytes=1024).load("chapter.txt", ambiguous)
@@ -198,8 +213,8 @@ class StoryConfigurationTests(unittest.TestCase):
         config = self._load_config(
             {
                 "story": {
-                    "import_dir": "stories\\imports",
-                    "analysis_dir": "analysis/cache",
+                    "import_dir": "data\\stories\\imports",
+                    "analysis_dir": "data/analysis/cache",
                     "max_source_mb": 2.5,
                     "analysis_prompt_version": " faithful-v2 ",
                     "reading_speed_cpm": {"slow": 250.0, "standard": 401.5, "fast": 600.0},
@@ -207,8 +222,8 @@ class StoryConfigurationTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(config["story"]["import_dir"], "stories/imports")
-        self.assertEqual(config["story"]["analysis_dir"], "analysis/cache")
+        self.assertEqual(config["story"]["import_dir"], "data/stories/imports")
+        self.assertEqual(config["story"]["analysis_dir"], "data/analysis/cache")
         self.assertEqual(config["story"]["max_source_mb"], 2.5)
         self.assertEqual(config["story"]["analysis_prompt_version"], "faithful-v2")
         self.assertEqual(
@@ -230,8 +245,13 @@ class StoryConfigurationTests(unittest.TestCase):
             {"reading_speed_cpm": {"slow": 250, "standard": float("inf"), "fast": 600}},
             {"import_dir": "../stories"},
             {"analysis_dir": "C:\\story-analysis"},
+            {"import_dir": "stories/imports"},
+            {"analysis_dir": "data"},
             {"import_dir": ""},
             {"analysis_prompt_version": "   "},
+            {"unknown": "value"},
+            {"reading_speed_cpm": {"slow": 400, "standard": 250, "fast": 600}},
+            {"reading_speed_cpm": {"slow": 250, "standard": 600, "fast": 600}},
         )
 
         for story in invalid_stories:

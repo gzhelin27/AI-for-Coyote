@@ -225,6 +225,11 @@ def _validate_story_config(cfg: Config) -> None:
     story = cfg.get("story")
     if not isinstance(story, dict):
         raise ValueError("story must be an object")
+    expected_keys = {
+        "import_dir", "analysis_dir", "max_source_mb", "analysis_prompt_version", "reading_speed_cpm",
+    }
+    if set(story) != expected_keys:
+        raise ValueError("story contains unknown or missing configuration keys")
     story["import_dir"] = _safe_local_story_path(story.get("import_dir"), "story import_dir")
     story["analysis_dir"] = _safe_local_story_path(story.get("analysis_dir"), "story analysis_dir")
     story["max_source_mb"] = _positive_story_number(story.get("max_source_mb"), "story max_source_mb")
@@ -235,10 +240,13 @@ def _validate_story_config(cfg: Config) -> None:
 
     speeds = story.get("reading_speed_cpm")
     _validate_story_speed_mapping(speeds)
-    story["reading_speed_cpm"] = {
+    normalized_speeds = {
         name: _positive_story_number(speeds[name], f"story reading_speed_cpm {name}")
         for name in ("slow", "standard", "fast")
     }
+    if not normalized_speeds["slow"] < normalized_speeds["standard"] < normalized_speeds["fast"]:
+        raise ValueError("story reading_speed_cpm must increase from slow to fast")
+    story["reading_speed_cpm"] = normalized_speeds
 
 
 def _validate_story_override_shape(raw: object) -> None:
@@ -263,8 +271,10 @@ def _safe_local_story_path(value: object, name: str) -> str:
         normalized.startswith("/")
         or re.match(r"^[A-Za-z]:", normalized)
         or any(part in ("", ".", "..") for part in normalized.split("/"))
+        or normalized == "data"
+        or not normalized.startswith("data/")
     ):
-        raise ValueError(f"{name} must be a safe local path")
+        raise ValueError(f"{name} must be a safe local data path")
     return normalized
 
 
