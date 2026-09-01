@@ -75,6 +75,13 @@ DEFAULTS = {
         },
         "replay_dir": "data/replays",
     },
+    "story": {
+        "import_dir": "data/stories",
+        "analysis_dir": "data/story_analysis",
+        "max_source_mb": 20,
+        "analysis_prompt_version": "faithful-v1",
+        "reading_speed_cpm": {"slow": 250, "standard": 400, "fast": 600},
+    },
     "ui": {
         "quick_strengths": [20, 40, 60, 80],
         "baseline_strength": {"A": 15, "B": 5},

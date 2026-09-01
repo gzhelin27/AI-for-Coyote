@@ -39,6 +39,17 @@ timeline:
     frame_ms: 100
   replay_dir: data/replays
 
+# ============ 小说模式（仅本地导入与分析缓存） ============
+story:
+  import_dir: data/stories
+  analysis_dir: data/story_analysis
+  max_source_mb: 20
+  analysis_prompt_version: faithful-v1
+  reading_speed_cpm:
+    slow: 250
+    standard: 400
+    fast: 600
+
 # ============ 安全（任何来源的命令都经过这里钳制） ============
 safety:
   channels:
