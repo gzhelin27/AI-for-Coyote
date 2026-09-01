@@ -152,18 +152,22 @@ def _normalize_text(text: str) -> str:
 
 
 def _decode_plain_text(original_bytes: bytes, encoding: StorySourceEncoding) -> str:
+    if original_bytes.startswith(b"\xef\xbb\xbf"):
+        if encoding == "gb18030":
+            raise StorySourceError(
+                "story UTF-8 BOM conflicts with explicit gb18030 encoding"
+            )
+        try:
+            return original_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise StorySourceError("story UTF-8 BOM text is not valid utf-8") from exc
+
     if encoding != "auto":
         codec = "utf-8-sig" if encoding == "utf-8" else encoding
         try:
             return original_bytes.decode(codec)
         except UnicodeDecodeError as exc:
             raise StorySourceError(f"story text is not valid {encoding}") from exc
-
-    if original_bytes.startswith(b"\xef\xbb\xbf"):
-        try:
-            return original_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise StorySourceError("story UTF-8 BOM text is not valid utf-8") from exc
 
     candidates: dict[str, str] = {}
     for candidate_encoding in ("utf-8", "gb18030"):

@@ -97,14 +97,22 @@ class StorySourceTests(unittest.TestCase):
 
         self.assertEqual(imported.text, "\u0800")
 
-    def test_utf8_bom_is_definitive_in_auto_and_explicit_utf8(self):
-        original = b"\xef\xbb\xbf" + "开篇😊".encode("utf-8")
+    def test_utf8_bom_is_definitive_and_stripped_in_auto_and_explicit_utf8(self):
+        for expected in ("ASCII chapter", "中", "开篇😊"):
+            original = b"\xef\xbb\xbf" + expected.encode("utf-8")
+            for encoding in ("auto", "utf-8"):
+                with self.subTest(expected=expected, encoding=encoding):
+                    imported = self._load_with_encoding("chapter.txt", original, encoding)
 
-        for encoding in ("auto", "utf-8"):
-            with self.subTest(encoding=encoding):
-                imported = self._load_with_encoding("chapter.txt", original, encoding)
+                    self.assertEqual(imported.text, expected)
 
-                self.assertEqual(imported.text, "开篇😊")
+    def test_utf8_bom_rejects_conflicting_explicit_gb18030(self):
+        for text in ("ASCII chapter", "中"):
+            original = b"\xef\xbb\xbf" + text.encode("utf-8")
+            with self.subTest(text=text), self.assertRaisesRegex(
+                StorySourceError, "UTF-8 BOM.*conflicts.*gb18030"
+            ):
+                self._load_with_encoding("chapter.txt", original, "gb18030")
 
     def test_rejects_invalid_encoding_name(self):
         with self.assertRaisesRegex(StorySourceError, "encoding must be one of"):
