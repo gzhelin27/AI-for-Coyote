@@ -31,43 +31,83 @@ _CONTEXT_ERROR_CODES = frozenset(
     }
 )
 _CONTEXT_HTTP_STATUSES = frozenset((400, 413, 422))
-_NON_CONTEXT_POLICY_MARKERS = (
+_NON_CONTEXT_ERROR_IDENTITY_MARKERS = (
+    "auth",
+    "unauthorized",
+    "permission",
+    "access_denied",
+    "privacy",
+    "data_policy",
+    "zero_data_retention",
+    "zdr",
+    "rate_limit",
+    "too_many_requests",
+    "quota",
+    "billing",
+    "payment",
+    "credit",
+    "capacity",
+    "overloaded",
+)
+_NON_CONTEXT_ERROR_MESSAGE_MARKERS = (
+    "api key",
+    "not authorized",
+    "unauthorized",
+    "permission denied",
+    "access denied",
     "privacy",
     "data policy",
     "data-policy",
-    "capacity description",
+    "zero data retention",
+    "zero-data-retention",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "quota",
+    "billing",
+    "payment required",
+    "insufficient credit",
+    "credit balance",
+    "capacity",
+    "overloaded",
 )
-_CONTEXT_OVERAGE_MARKERS = (
-    "maximum context length was exceeded",
-    "max context length was exceeded",
-    "context length exceeded",
-    "context window exceeded",
-    "exceeds the context window",
-    "exceeded the context window",
-    "exceeds the maximum context length",
-    "exceeded the maximum context length",
-    "prompt is too long",
-    "input is too long",
-    "too many tokens",
-)
+
+
+def _normalized_error_identity(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _non_context_error_identity(value: str) -> bool:
+    normalized = _normalized_error_identity(value)
+    return any(marker in normalized for marker in _NON_CONTEXT_ERROR_IDENTITY_MARKERS)
+
+
+def _non_context_error_message(text: str) -> bool:
+    return any(marker in text for marker in _NON_CONTEXT_ERROR_MESSAGE_MARKERS)
 
 
 def _explicit_context_overage(text: str) -> bool:
-    if any(marker in text for marker in _NON_CONTEXT_POLICY_MARKERS):
+    if _non_context_error_message(text):
         return False
-    if any(marker in text for marker in _CONTEXT_OVERAGE_MARKERS):
-        return True
-    has_subject = any(
-        subject in text for subject in ("request", "requested", "prompt", "input")
+    has_subject = re.search(r"\b(?:request|input|prompt)\b", text) is not None
+    has_actual_measure = any(
+        marker in text
+        for marker in ("token", "size", "byte", "character", "too long", "too large")
     )
-    has_overage = any(word in text for word in ("exceed", "too long", "over limit"))
-    has_context_measure = "context" in text or "token" in text
-    if has_subject and has_overage and has_context_measure:
+    has_context_limit = "context" in text and any(
+        marker in text for marker in ("limit", "window", "maximum", "max")
+    )
+    has_overage = any(
+        marker in text
+        for marker in ("exceed", "too long", "too large", "over the limit")
+    )
+    if has_subject and has_actual_measure and has_context_limit and has_overage:
         return True
     return (
-        "requested" in text
-        and "maximum context length" in text
+        "you requested" in text
         and "token" in text
+        and has_context_limit
+        and "reduce" in text
     )
 
 
@@ -79,7 +119,7 @@ def _bounded_response_json(response: httpx.Response) -> dict | None:
         return None
     try:
         document = json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return document if isinstance(document, dict) else None
 
@@ -103,14 +143,20 @@ def _verified_context_error(
         if isinstance(message, str) and len(message) <= _MAX_ERROR_FIELD_CHARS
         else ""
     )
-    if any(marker in bounded_message for marker in _NON_CONTEXT_POLICY_MARKERS):
-        return False
+    bounded_identities: list[str] = []
     for field in ("code", "type"):
         value = error.get(field)
         if isinstance(value, str) and len(value) <= _MAX_ERROR_FIELD_CHARS:
-            normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
-            if normalized in _CONTEXT_ERROR_CODES:
-                return True
+            bounded_identities.append(value)
+    if _non_context_error_message(bounded_message) or any(
+        _non_context_error_identity(value) for value in bounded_identities
+    ):
+        return False
+    if any(
+        _normalized_error_identity(value) in _CONTEXT_ERROR_CODES
+        for value in bounded_identities
+    ):
+        return True
     if _explicit_context_overage(bounded_message):
         return True
 
@@ -121,7 +167,7 @@ def _verified_context_error(
         return False
     try:
         provider_document = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         provider_document = None
     if isinstance(provider_document, dict) and _verified_context_error(
         status_code,
@@ -590,7 +636,7 @@ class LLM:
             )
         try:
             document = response.json()
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise StoryAnalysisError("structured model returned invalid JSON") from exc
         if not isinstance(document, dict):
             raise StoryAnalysisError("structured model returned invalid JSON")
@@ -612,7 +658,7 @@ class LLM:
             content = str(message.get("reasoning") or "").strip()
         try:
             parsed = json.loads(content)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             raise StoryAnalysisError("structured model returned invalid JSON") from exc
         if not isinstance(parsed, dict):
             raise StoryAnalysisError("structured model response must be a JSON object")

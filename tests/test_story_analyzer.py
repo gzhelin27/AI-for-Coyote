@@ -951,12 +951,166 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
                     await llm.complete_json("system", "private novel", "story_map")
                 self.assertNotIsInstance(raised.exception, ContextLimitError)
 
-    async def test_explicit_request_overage_and_too_many_tokens_are_context_limit(self):
+    async def test_http_400_policy_and_account_errors_override_context_wording(self):
+        # Catches policy/account failures causing a second paid request through fallback.
+        explicit_overage = (
+            "This request contains 140000 tokens, exceeding the model context "
+            "limit of 128000 tokens."
+        )
+        cases = (
+            (
+                "model-description",
+                {
+                    "message": "The requested model has a maximum context length of 128000 tokens.",
+                    "code": 400,
+                },
+            ),
+            (
+                "api-key-tier",
+                {
+                    "message": (
+                        "Your API key is not authorized to submit requests exceeding "
+                        "the model context token tier."
+                    ),
+                    "code": 400,
+                },
+            ),
+            (
+                "zero-data-retention",
+                {
+                    "message": (
+                        "Zero data retention is unavailable for prompts exceeding "
+                        "32000 tokens."
+                    ),
+                    "code": 400,
+                },
+            ),
+            (
+                "auth-type",
+                {
+                    "message": explicit_overage,
+                    "type": "authentication_error",
+                    "code": "context_length_exceeded",
+                },
+            ),
+            (
+                "permission-code",
+                {
+                    "message": explicit_overage,
+                    "type": "invalid_request_error",
+                    "code": "permission_denied",
+                },
+            ),
+            (
+                "rate-limit-code",
+                {
+                    "message": explicit_overage,
+                    "type": "invalid_request_error",
+                    "code": "rate_limit_exceeded",
+                },
+            ),
+            (
+                "quota-code",
+                {
+                    "message": explicit_overage,
+                    "type": "invalid_request_error",
+                    "code": "insufficient_quota",
+                },
+            ),
+            (
+                "billing-type",
+                {
+                    "message": explicit_overage,
+                    "type": "billing_error",
+                    "code": "context_length_exceeded",
+                },
+            ),
+            (
+                "capacity-type",
+                {
+                    "message": explicit_overage,
+                    "type": "capacity_error",
+                    "code": "context_length_exceeded",
+                },
+            ),
+            (
+                "ambiguous-too-many-tokens",
+                {
+                    "message": "Too many tokens in the request for this model.",
+                    "code": 400,
+                },
+            ),
+            (
+                "generic-context-overage",
+                {
+                    "message": "This request exceeds the maximum context length.",
+                    "code": 400,
+                },
+            ),
+            (
+                "rate-limit-message",
+                {
+                    "message": (
+                        "Rate limit reached while submitting a request whose input "
+                        "tokens exceed the model context limit."
+                    ),
+                    "code": 400,
+                },
+            ),
+            (
+                "quota-message",
+                {
+                    "message": (
+                        "You exceeded your current quota while submitting a prompt "
+                        "whose token count exceeds the context window."
+                    ),
+                    "code": 400,
+                },
+            ),
+            (
+                "billing-message",
+                {
+                    "message": (
+                        "Billing is inactive for requests whose input token count "
+                        "exceeds the model context limit."
+                    ),
+                    "code": 400,
+                },
+            ),
+            (
+                "capacity-message",
+                {
+                    "message": (
+                        "Provider capacity is unavailable for prompts whose token "
+                        "count exceeds the context window."
+                    ),
+                    "code": 400,
+                },
+            ),
+        )
+        for name, error in cases:
+            with self.subTest(name=name):
+                llm = self.llm_with_response(400, {"error": error})
+                with self.assertRaises(StoryAnalysisError) as raised:
+                    await llm.complete_json("system", "private novel", "story_map")
+                self.assertNotIsInstance(raised.exception, ContextLimitError)
+                self.assertEqual(llm.request_count, 1)
+
+    async def test_explicit_current_request_overage_is_context_limit(self):
         # Catches losing legitimate message-only context failures from compatible providers.
         messages = (
-            "This request exceeds the maximum context length.",
-            "Too many tokens in the request for this model.",
-            "Input tokens exceed this model's context limit.",
+            (
+                "This request contains 140000 tokens, exceeding the model context "
+                "limit of 128000 tokens."
+            ),
+            (
+                "Input size is 140000 tokens and exceeds this model's context "
+                "window limit of 128000 tokens."
+            ),
+            (
+                "Prompt token count of 140000 exceeds the model maximum context "
+                "length of 128000 tokens."
+            ),
             (
                 "Maximum context length is 128000 tokens, but you requested "
                 "140000 tokens; please reduce the input."
@@ -993,6 +1147,41 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
             await llm.complete_json("system", "private novel", "story_map")
 
         self.assertNotIsInstance(raised.exception, ContextLimitError)
+
+    async def test_deeply_nested_json_is_always_a_typed_non_context_error(self):
+        # Catches recursion/depth failures escaping any structured JSON parse boundary.
+        nested = "[" * 5_000 + "0" + "]" * 5_000
+        provider_nested = "[" * 1_500 + "0" + "]" * 1_500
+        clients = (
+            ("http-error-body", self.llm_with_raw_response(400, nested.encode("ascii"))),
+            ("success-body", self.llm_with_raw_response(200, nested.encode("ascii"))),
+            (
+                "message-content",
+                self.llm_with_response(
+                    200,
+                    {"choices": [{"message": {"content": nested}}]},
+                ),
+            ),
+            (
+                "provider-error",
+                self.llm_with_response(
+                    400,
+                    {
+                        "error": {
+                            "message": "Provider returned error",
+                            "code": 400,
+                            "metadata": {"raw": provider_nested},
+                        }
+                    },
+                ),
+            ),
+        )
+        for boundary, llm in clients:
+            with self.subTest(boundary=boundary):
+                with self.assertRaises(StoryAnalysisError) as raised:
+                    await llm.complete_json("system", "private novel", "story_map")
+                self.assertNotIsInstance(raised.exception, ContextLimitError)
+                self.assertEqual(llm.request_count, 1)
 
     async def test_closed_client_runtime_error_is_typed_and_non_context(self):
         # Catches a closed/injected transport RuntimeError escaping the LLM error contract.
