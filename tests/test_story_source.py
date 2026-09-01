@@ -47,6 +47,13 @@ class StorySourceTests(unittest.TestCase):
 
         self.assertEqual(imported.text, "一")
 
+    def test_rejects_repeated_ambiguous_gb18030_bytes(self):
+        loader = StorySourceLoader(max_bytes=1024)
+
+        for repeats in (2, 3, 8):
+            with self.subTest(repeats=repeats), self.assertRaises(StorySourceError):
+                loader.load("chapter.txt", bytes.fromhex("d2bb") * repeats)
+
     def test_preserves_real_utf8_chinese_when_gb18030_also_decodes(self):
         imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "中文".encode("utf-8"))
 

@@ -176,7 +176,11 @@ def _has_coherent_utf8_text(text: str) -> bool:
     if len(latin_letters) >= 2:
         return True
     letters = [character for character in visible if character.isalpha()]
-    return len(letters) >= 2 and all(_is_cyrillic_letter(character) for character in letters)
+    return (
+        len(letters) >= 2
+        and len(set(letters)) >= 2
+        and all(_is_cyrillic_letter(character) for character in letters)
+    )
 
 
 def _is_isolated_non_cjk(text: str) -> bool:
