@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +40,36 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.clear_calls, [None])
         self.assertEqual(controller.store.list(), [])
         self.assertEqual(controller.to_state().status, SessionStatus.PAUSED)
+
+    async def test_disconnect_invalidates_a_replay_prepared_while_idle(self):
+        controller = SessionHarness.create(seed=901)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        prepared = await controller.prepare_replay(bundle.manifest.replay_id)
+        generation = controller.routing_generation
+
+        await controller.on_disconnect()
+
+        self.assertGreater(controller.routing_generation, generation)
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            await controller.start_prepared_replay(prepared)
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+
+    async def test_idle_stop_invalidates_an_already_prepared_replay(self):
+        controller = SessionHarness.create(seed=902)
+        self.addAsyncCleanup(controller.close)
+        bundle = make_replay_bundle([0], "completed")
+        controller.store.save(bundle.manifest, bundle.timeline)
+        prepared = await controller.prepare_replay(bundle.manifest.replay_id)
+        generation = controller.routing_generation
+
+        await controller.stop()
+
+        self.assertGreater(controller.routing_generation, generation)
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            await controller.start_prepared_replay(prepared)
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
 
     async def test_pause_clear_failure_blocks_output_until_pause_retries(self):
         controller = SessionHarness.create(seed=22)
@@ -256,6 +287,37 @@ class SessionControllerTests(unittest.IsolatedAsyncioTestCase):
         saved = controller.store.load(summary.replay_id)
         self.assertEqual(summary.cycle_count, len(saved.timeline.cycles))
         self.assertEqual(summary.title, "回放 " + summary.replay_id[:8])
+
+    async def test_cancelled_finish_waits_for_stalled_save_then_finalizes(self):
+        controller = SessionHarness.create(seed=232)
+        self.addAsyncCleanup(controller.close)
+        await controller.start_live()
+        original_save = controller.store.save
+        save_started = threading.Event()
+        save_release = threading.Event()
+
+        def stalled_save(*args, **kwargs):
+            save_started.set()
+            save_release.wait(0.5)
+            return original_save(*args, **kwargs)
+
+        with patch.object(controller.store, "save", side_effect=stalled_save):
+            finishing = asyncio.create_task(controller.finish())
+            self.assertTrue(await asyncio.to_thread(save_started.wait, 0.2))
+            finishing.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(finishing.done())
+            self.assertEqual(
+                controller.to_state().status, SessionStatus.FINISHING
+            )
+            save_release.set()
+            result = await asyncio.gather(finishing, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(controller.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(len(controller.store.list()), 1)
+        self.assertFalse(controller._store_io_tasks)
 
     async def test_stop_retries_clear_after_failed_finish_before_idle(self):
         controller = SessionHarness.create(seed=24)

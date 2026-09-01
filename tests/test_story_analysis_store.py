@@ -160,6 +160,41 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual(first.status, "invalid")
         self.assertEqual(second.status, "missing")
 
+    def test_inspect_quarantines_otherwise_valid_cache_above_formal_byte_limit(self):
+        formal_limit = 1024 * 1024
+        store = AnalysisStore(self.cache_directory)
+        store.save(self.key, self.scene_map)
+        cache_path = store.cache_path(self.key)
+        payload = cache_path.read_bytes()
+        cache_path.write_bytes(
+            payload
+            + b" " * (formal_limit + 1 - len(payload))
+        )
+
+        first = store.inspect(self.key)
+        second = store.inspect(self.key)
+
+        self.assertEqual(first.status, "invalid")
+        self.assertEqual(second.status, "missing")
+
+    def test_save_rejects_story_map_above_formal_byte_limit_without_partial_cache(self):
+        formal_limit = 1024 * 1024
+        store = AnalysisStore(self.cache_directory)
+        scene = replace(
+            self.scene_map.chapters[0].scenes[0],
+            summary="x" * formal_limit,
+        )
+        chapter = replace(
+            self.scene_map.chapters[0],
+            scenes=(scene, self.scene_map.chapters[0].scenes[1]),
+        )
+
+        with self.assertRaises(AnalysisStoreError):
+            store.save(self.key, replace(self.scene_map, chapters=(chapter,)))
+
+        self.assertFalse(store.cache_path(self.key).exists())
+        self.assertEqual(list(self.cache_directory.glob("*.tmp")), [])
+
     def test_load_rejects_unknown_fields_future_schema_without_using_them(self):
         store = AnalysisStore(self.cache_directory)
         store.save(self.key, self.scene_map)
@@ -367,6 +402,34 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserve")
 
+    @unittest.skipUnless(os.name == "nt", "Windows pinned handle enumeration")
+    def test_windows_stale_cleanup_never_reopens_the_analysis_root_path(self):
+        self.cache_directory.mkdir()
+        store = AnalysisStore(self.cache_directory)
+        cache_path = store.cache_path(self.key)
+        stale = cache_path.with_name(f".{cache_path.name}.crashed.tmp")
+        stale.write_text("stale", encoding="utf-8")
+
+        with patch.object(
+            analysis_store_module.os,
+            "listdir",
+            side_effect=AssertionError("analysis root pathname was reopened"),
+        ):
+            self.assertIsNone(store.load(self.key))
+
+        self.assertFalse(stale.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory durability")
+    def test_windows_save_flushes_the_pinned_directory_handle(self):
+        store = AnalysisStore(self.cache_directory)
+
+        with patch.object(
+            analysis_store_module, "_flush_windows_directory"
+        ) as flush_directory:
+            store.save(self.key, self.scene_map)
+
+        flush_directory.assert_called_once_with(store._root.handle)
+
     def test_quarantine_name_collision_preserves_existing_file(self):
         store = AnalysisStore(self.cache_directory)
         store.save(self.key, self.scene_map)
@@ -382,12 +445,16 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertTrue(cache_path.with_name(f"{cache_path.name}.fresh.invalid").exists())
 
     def test_failed_dump_fsync_or_replace_removes_only_its_temporary_file(self):
-        for failure_target in ("json.dump", "os.fsync", "Path.replace"):
+        for failure_target in ("json.dump", "os.fsync", "AnalysisStore._replace_relative"):
             with self.subTest(failure_target=failure_target):
                 directory = Path(self.temporary_directory.name) / failure_target.replace(".", "-")
                 store = AnalysisStore(directory)
                 module_name, attribute = failure_target.split(".")
-                target = getattr(analysis_store_module, module_name)
+                target = (
+                    AnalysisStore
+                    if module_name == "AnalysisStore"
+                    else getattr(analysis_store_module, module_name)
+                )
                 with patch.object(target, attribute, side_effect=OSError("simulated")):
                     with self.assertRaises(AnalysisStoreError):
                         store.save(self.key, self.scene_map)
@@ -398,7 +465,7 @@ class AnalysisStoreTests(unittest.TestCase):
         store = AnalysisStore(self.cache_directory)
         real_close = analysis_store_module.os.close
 
-        with patch.object(analysis_store_module.os, "fstat", side_effect=OSError("simulated")), patch.object(
+        with patch.object(store, "_verify_opened_child", side_effect=OSError("simulated")), patch.object(
             analysis_store_module.os, "close", wraps=real_close
         ) as close:
             with self.assertRaises(AnalysisStoreError):
@@ -458,6 +525,39 @@ class AnalysisStoreTests(unittest.TestCase):
         with self.assertRaises(AnalysisStoreError):
             store.save(self.key, self.scene_map)
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_pinned_analysis_root_rejects_same_name_swap_during_read(self):
+        store = AnalysisStore(self.cache_directory)
+        store.save(self.key, self.scene_map)
+        cache_name = store.cache_path(self.key).name
+        payload = store.cache_path(self.key).read_bytes()
+        displaced = self.cache_directory.with_name("analysis-displaced")
+        try:
+            self.cache_directory.replace(displaced)
+        except OSError as exc:
+            self.skipTest(f"directory replacement is prevented by this platform: {exc}")
+        self.cache_directory.mkdir()
+        (self.cache_directory / cache_name).write_bytes(payload)
+
+        lookup = store.inspect(self.key)
+
+        self.assertEqual(lookup.status, "missing")
+        self.assertTrue((self.cache_directory / cache_name).exists())
+
+    def test_pinned_analysis_root_rejects_same_name_swap_during_save(self):
+        store = AnalysisStore(self.cache_directory)
+        store.save(self.key, self.scene_map)
+        displaced = self.cache_directory.with_name("analysis-displaced-save")
+        try:
+            self.cache_directory.replace(displaced)
+        except OSError as exc:
+            self.skipTest(f"directory replacement is prevented by this platform: {exc}")
+        self.cache_directory.mkdir()
+
+        with self.assertRaises(AnalysisStoreError):
+            store.save(self.key, self.scene_map)
+
+        self.assertEqual(list(self.cache_directory.iterdir()), [])
 
     def test_concurrent_writers_leave_one_complete_readable_cache(self):
         store_one = AnalysisStore(self.cache_directory)

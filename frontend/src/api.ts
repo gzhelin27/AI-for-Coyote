@@ -18,57 +18,65 @@ import type {
   TimelineSessionState,
 } from "./types";
 
+const STORY_ERROR_MESSAGES = {
+  analysis_missing: "尚未导入匹配的离线分析",
+  analysis_invalid: "离线分析无效，请重新生成并导入",
+  reader_range_invalid: "无法读取当前正文片段",
+  story_not_found: "当前小说不可用，请重新导入",
+  story_reader_missing: "当前小说不可用，请重新导入",
+  chapter_plan_failed: "章节规划未完成，无法启动阅读",
+  story_runtime_busy: "小说会话正在处理中",
+  story_planning_active: "小说会话正在处理中",
+  story_state_changed: "小说状态已变化，请重新选择章节",
+  story_planning_cancelled: "章节规划已取消，请重试",
+  story_import_invalid: "小说原文无效，请确认格式和编码",
+  story_import_failed: "小说导入未完成，请稍后重试",
+  story_output_failed: "设备输出未确认，小说会话未继续",
+  story_transition_invalid: "小说会话当前无法切换",
+  story_transition_failed: "小说会话当前无法切换",
+} as const;
+
+type StoryErrorCode = keyof typeof STORY_ERROR_MESSAGES;
+const UNKNOWN_STORY_ERROR = "小说操作失败";
+
+function isStoryErrorCode(code: unknown): code is StoryErrorCode {
+  return typeof code === "string"
+    && Object.prototype.hasOwnProperty.call(STORY_ERROR_MESSAGES, code);
+}
+
 export function mapStoryError(code: unknown): string {
-  switch (code) {
-    case "analysis_missing":
-      return "尚未导入匹配的离线分析";
-    case "analysis_invalid":
-      return "离线分析无效，请重新生成并导入";
-    case "reader_range_invalid":
-      return "无法读取当前正文片段";
-    case "story_not_found":
-    case "story_reader_missing":
-      return "当前小说不可用，请重新导入";
-    case "chapter_plan_failed":
-      return "章节规划未完成，无法启动阅读";
-    case "story_runtime_busy":
-    case "story_planning_active":
-      return "小说会话正在处理中";
-    case "story_import_invalid":
-      return "小说原文无效，请确认格式和编码";
-    case "story_import_failed":
-      return "小说导入未完成，请稍后重试";
-    case "story_output_failed":
-      return "设备输出未确认，小说会话未继续";
-    case "story_transition_invalid":
-    case "story_transition_failed":
-      return "小说会话当前无法切换";
-    default:
-      return "小说操作失败";
+  return isStoryErrorCode(code) ? STORY_ERROR_MESSAGES[code] : UNKNOWN_STORY_ERROR;
+}
+
+class StoryApiError extends Error {
+  readonly code: StoryErrorCode | null;
+
+  constructor(code: unknown) {
+    const safeCode = isStoryErrorCode(code) ? code : null;
+    super(mapStoryError(safeCode));
+    this.name = "StoryApiError";
+    this.code = safeCode;
   }
 }
 
 export function storyErrorMessage(error: unknown): string {
-  const text = error instanceof Error ? error.message : "";
-  return Object.values({
-    a: mapStoryError("analysis_missing"), b: mapStoryError("analysis_invalid"), c: mapStoryError("reader_range_invalid"),
-    d: mapStoryError("story_not_found"), e: mapStoryError("chapter_plan_failed"), f: mapStoryError("story_runtime_busy"),
-    g: mapStoryError("story_import_invalid"), h: mapStoryError("story_import_failed"), i: mapStoryError("story_transition_invalid"),
-  }).includes(text) ? text : mapStoryError(undefined);
+  return error instanceof StoryApiError ? error.message : UNKNOWN_STORY_ERROR;
 }
 
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
     let msg = `${resp.status} ${resp.statusText}`;
+    const storyPath = path.startsWith("/api/story/") || path === "/api/story/import";
+    let storyCode: unknown;
     try {
       const data = (await resp.json()) as { code?: unknown; error?: string };
-      if (path.startsWith("/api/story/") || path === "/api/story/import") {
-        msg = mapStoryError(data.code);
-      } else if (data?.error) msg = data.error;
+      if (storyPath) storyCode = data.code;
+      else if (data?.error) msg = data.error;
     } catch {
       /* 无 JSON 错误体时用状态码提示 */
     }
+    if (storyPath) throw new StoryApiError(storyCode);
     throw new Error(msg);
   }
   return (await resp.json()) as T;

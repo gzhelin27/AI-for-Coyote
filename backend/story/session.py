@@ -9,7 +9,11 @@ from typing import Literal
 
 from backend.timeline.models import SCHEMA_VERSION, SessionStatus
 from backend.timeline.replay_store import ReplaySummary
-from backend.timeline.session import PlannedSessionArchive, SessionController
+from backend.timeline.session import (
+    PlannedSessionArchive,
+    PreparedSessionFinish,
+    SessionController,
+)
 
 from .models import ImportedStory, StoryChapter, StoryMap
 from .planner import ValidatedChapterPlan
@@ -205,7 +209,7 @@ class NovelSessionController:
                 self._reconcile_with_session()
             return self.to_state()
 
-    async def finish(self) -> ReplaySummary:
+    async def prepare_finish(self) -> PreparedSessionFinish:
         async with self._lock:
             try:
                 self._reconcile_with_session()
@@ -216,10 +220,38 @@ class NovelSessionController:
                 ):
                     raise NovelSessionError("no novel session to finish")
                 self._phase = NovelSessionStatus.FINISHING
-                summary = await self._session.finish()
+                prepared = await self._session.prepare_finish()
             finally:
                 self._reconcile_with_session()
-            return summary
+            return prepared
+
+    async def persist_finish(
+        self, prepared: PreparedSessionFinish
+    ) -> ReplaySummary:
+        try:
+            return await self._session.persist_finish(prepared)
+        finally:
+            self._reconcile_with_session()
+
+    async def finalize_finish(
+        self, prepared: PreparedSessionFinish
+    ) -> ReplaySummary:
+        async with self._lock:
+            try:
+                return await self._session.finalize_finish(prepared)
+            finally:
+                self._reconcile_with_session()
+
+    async def finish(self) -> ReplaySummary:
+        prepared = await self.prepare_finish()
+
+        async def persist_and_finalize() -> ReplaySummary:
+            await self.persist_finish(prepared)
+            return await self.finalize_finish(prepared)
+
+        return await self._session._await_lifecycle_completion(
+            persist_and_finalize(), name="novel-finish-lifecycle"
+        )
 
     async def abort(self) -> NovelSessionState:
         async with self._lock:

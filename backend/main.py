@@ -51,6 +51,7 @@ from .relay_client import RelayClient
 from .safety import DeviceOutputError, SafetyManager
 from .story import (
     OFFLINE_ANALYSIS_VERSION,
+    AnalysisKey,
     AnalysisLookup,
     AnalysisStore,
     ImportedStory,
@@ -110,6 +111,15 @@ class _StoryRuntimeOwner:
 @dataclass(frozen=True, slots=True)
 class _StoryImportInspection:
     dlc_version: str
+    key: AnalysisKey
+    lookup: AnalysisLookup
+
+
+@dataclass(frozen=True, slots=True)
+class _StoryAnalysisInspection:
+    key: AnalysisKey
+    dlc_version: str
+    source_generation: int
     lookup: AnalysisLookup
 
 
@@ -320,7 +330,7 @@ def _story_analysis_payload(
         "dlc_version": (
             dlc_version
             if dlc_version is not None
-            else state._current_story_dlc_version()
+            else getattr(state, "story_dlc_version", "")
         ),
     }
 
@@ -385,13 +395,6 @@ def _active_story_record(state: "AppState") -> _StorySourceRecord | None:
     return _story_record(state, source_id) if isinstance(source_id, str) else None
 
 
-def _inspect_story_analysis(
-    state: "AppState", record: _StorySourceRecord
-) -> AnalysisLookup:
-    key = offline_analysis_key(record.story, state._current_story_dlc_version())
-    return state.story_analysis_store.inspect(key)
-
-
 def _inspect_import_story_analysis(
     cfg_snapshot: dict[str, object],
     *,
@@ -408,6 +411,7 @@ def _inspect_import_story_analysis(
     key = offline_analysis_key(story, dlc_version)
     return _StoryImportInspection(
         dlc_version=dlc_version,
+        key=key,
         lookup=analysis_store.inspect(key),
     )
 
@@ -442,7 +446,7 @@ def _story_full_state(state: "AppState") -> dict[str, object]:
             "chapters": [],
             "session": session_payload,
         }
-    lookup = _inspect_story_analysis(state, record)
+    lookup = state._cached_story_analysis(record)
     chapters = (
         _story_chapters_payload(lookup.story_map)
         if lookup.status == "ready" and lookup.story_map is not None
@@ -623,6 +627,9 @@ class AppState:
         self.story_source_loader = StorySourceLoader(max_bytes=max_source_bytes)
         self.story_source_max_bytes = max_source_bytes
         self.story_analysis_store = AnalysisStore(story_analysis_directory)
+        self.story_analysis_lookups: dict[
+            tuple[str, str], AnalysisLookup
+        ] = {}
         self.story_sources: dict[str, _StorySourceRecord] = {}
         self.active_story_source_id: str | None = None
         self.story_source_generation = 0
@@ -668,14 +675,104 @@ class AppState:
         self.story_dlc_version = current
         return current
 
-    def _story_runtime_signature(self) -> _StoryRuntimeSignature:
+    @staticmethod
+    def _story_analysis_cache_identity(
+        record: _StorySourceRecord, key: AnalysisKey
+    ) -> tuple[str, str]:
+        return record.source_id, key.digest()
+
+    def _cached_story_analysis(
+        self, record: _StorySourceRecord
+    ) -> AnalysisLookup:
+        try:
+            key = offline_analysis_key(
+                record.story, getattr(self, "story_dlc_version", "")
+            )
+        except (TypeError, ValueError):
+            return AnalysisLookup("missing", None)
+        lookups = getattr(self, "story_analysis_lookups", None)
+        if not isinstance(lookups, dict):
+            return AnalysisLookup("missing", None)
+        lookup = lookups.get(self._story_analysis_cache_identity(record, key))
+        return (
+            lookup
+            if isinstance(lookup, AnalysisLookup)
+            else AnalysisLookup("missing", None)
+        )
+
+    def _publish_story_analysis(
+        self,
+        record: _StorySourceRecord,
+        key: AnalysisKey,
+        lookup: AnalysisLookup,
+    ) -> None:
+        lookups = getattr(self, "story_analysis_lookups", None)
+        if not isinstance(lookups, dict):
+            lookups = {}
+            self.story_analysis_lookups = lookups
+        # ``invalid`` belongs only to the caller that performed quarantine.
+        published = (
+            lookup
+            if lookup.status in ("ready", "missing")
+            else AnalysisLookup("missing", None)
+        )
+        lookups[self._story_analysis_cache_identity(record, key)] = published
+
+    async def _inspect_story_analysis_offloop(
+        self, record: _StorySourceRecord
+    ) -> _StoryAnalysisInspection:
+        cfg_snapshot = deepcopy(self.cfg)
+        project_root = PROJECT_ROOT
+        waveform_policy = self.timeline_session.waveform_policy
+        generation = self.story_source_generation
+        task = self._track_story_io(
+            asyncio.to_thread(
+                _inspect_import_story_analysis,
+                cfg_snapshot,
+                project_root=project_root,
+                waveform_policy=waveform_policy,
+                analysis_store=self.story_analysis_store,
+                story=record.story,
+            ),
+            name=f"story-analysis-inspect-{record.source_id}",
+        )
+        inspected = await asyncio.shield(task)
+        if not isinstance(inspected, _StoryImportInspection):
+            raise RuntimeError("story analysis inspection returned an invalid result")
+        self.story_dlc_version = inspected.dlc_version
+        self._publish_story_analysis(record, inspected.key, inspected.lookup)
+        return _StoryAnalysisInspection(
+            key=inspected.key,
+            dlc_version=inspected.dlc_version,
+            source_generation=generation,
+            lookup=inspected.lookup,
+        )
+
+    async def _refresh_active_story_analysis(self) -> None:
+        record = _active_story_record(self)
+        if record is None:
+            return
+        try:
+            await self._inspect_story_analysis_offloop(record)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("unexpected story analysis refresh failure")
+
+    def _story_runtime_signature(
+        self, *, dlc_version: str | None = None
+    ) -> _StoryRuntimeSignature:
         model = str(getattr(self.llm, "model", "") or "").strip()
         transport = getattr(self.llm, "client", self.llm)
         return _StoryRuntimeSignature(
             client_identity=(id(self.llm), id(transport)),
             model=model,
             prompt_version=OFFLINE_ANALYSIS_VERSION,
-            dlc_version=self._current_story_dlc_version(),
+            dlc_version=(
+                self._current_story_dlc_version()
+                if dlc_version is None
+                else dlc_version
+            ),
             waveforms=tuple(sorted(self.safety.presets)),
             caps=tuple(
                 (channel, self.safety.cap_for(channel))
@@ -701,8 +798,10 @@ class AppState:
             strength_jitter=int(self.cfg["timeline"]["strength_jitter"]),
         )
 
-    def _ensure_story_planner_current(self) -> _StoryRuntimeSignature:
-        signature = self._story_runtime_signature()
+    def _ensure_story_planner_current(
+        self, signature: _StoryRuntimeSignature | None = None
+    ) -> _StoryRuntimeSignature:
+        signature = signature or self._story_runtime_signature()
         if getattr(self, "story_planner_signature", None) != signature:
             if self.story_planning_task is not None:
                 raise _StoryConflict(
@@ -880,6 +979,7 @@ class AppState:
         story_map: StoryMap,
         chapter_id: str,
         speed: object,
+        runtime_signature: _StoryRuntimeSignature,
     ) -> tuple[asyncio.Task, _StoryPlanningContext]:
         if self.story_planning_task is not None:
             raise _StoryConflict(
@@ -897,7 +997,7 @@ class AppState:
             raise _StoryConflict(
                 "story_state_changed", "the selected story source changed"
             )
-        runtime_signature = self._ensure_story_planner_current()
+        runtime_signature = self._ensure_story_planner_current(runtime_signature)
         planner = self.chapter_planner
         runtime_owner = self._acquire_story_runtime_owner("planning")
         context = _StoryPlanningContext(
@@ -1065,22 +1165,27 @@ class AppState:
         await self.broadcast()
 
     # ---------- 广播 ----------
-    async def broadcast(self) -> None:
+    async def snapshot_state(self, *, refresh_analysis: bool = False) -> dict:
+        if refresh_analysis:
+            await self._refresh_active_story_analysis()
         async with self.broadcast_lock:
             self.state_revision += 1
-            state = self.build_state()
-            dead = []
-            for ws in list(self.ws_clients):
-                try:
-                    await ws.send_json({"type": "state", "data": state})
-                except Exception:  # noqa: BLE001
-                    dead.append(ws)
-            for ws in dead:
-                self.ws_clients.discard(ws)
+            return self.build_state()
+
+    async def broadcast(self) -> None:
+        state = await self.snapshot_state()
+        dead = []
+        for ws in list(self.ws_clients):
+            try:
+                await ws.send_json({"type": "state", "data": state})
+            except Exception:  # noqa: BLE001
+                dead.append(ws)
+        for ws in dead:
+            self.ws_clients.discard(ws)
 
     async def send_state(self, ws: WebSocket) -> None:
-        async with self.broadcast_lock:
-            await ws.send_json({"type": "state", "data": self.build_state()})
+        state = await self.snapshot_state(refresh_analysis=True)
+        await ws.send_json({"type": "state", "data": state})
 
     async def broadcast_chat(self, result: dict) -> None:
         """把 AI 主动生成的台词推送到页面聊天区。"""
@@ -1244,6 +1349,11 @@ class AppState:
                             "shutdown estop fallback failed: %s", exc
                         )
         finally:
+            settle_replay_io = getattr(
+                self.timeline_session, "settle_store_io", None
+            )
+            if callable(settle_replay_io):
+                await settle_replay_io()
             imports = tuple(
                 task
                 for task in self.story_import_requests
@@ -1279,6 +1389,11 @@ class AppState:
             if unique_tasks:
                 await asyncio.gather(*unique_tasks, return_exceptions=True)
             self.tasks.clear()
+            close_analysis_store = getattr(
+                self.story_analysis_store, "close", None
+            )
+            if callable(close_analysis_store):
+                close_analysis_store()
             self.story_source_store.close()
 
         if primary_error is not None:
@@ -1324,7 +1439,7 @@ def make_app() -> FastAPI:
 
     @app.get("/api/state")
     async def api_state() -> JSONResponse:
-        return JSONResponse(state.build_state())
+        return JSONResponse(await state.snapshot_state(refresh_analysis=True))
 
     # ---------- 离线小说来源 / 阅读器 / 会话 ----------
     @app.post("/api/story/import")
@@ -1344,6 +1459,7 @@ def make_app() -> FastAPI:
         transaction: _StoryImportTransaction | None = None
         record: _StorySourceRecord | None = None
         lookup: AnalysisLookup | None = None
+        analysis_key: AnalysisKey | None = None
         analysis_dlc_version: str | None = None
         response: JSONResponse | None = None
         caller_cancelled = False
@@ -1454,6 +1570,7 @@ def make_app() -> FastAPI:
                             "story analysis inspection returned an invalid result"
                         )
                     analysis_dlc_version = inspected_result.dlc_version
+                    analysis_key = inspected_result.key
                     lookup = inspected_result.lookup
                 except Exception:
                     state.logger.exception(
@@ -1469,6 +1586,7 @@ def make_app() -> FastAPI:
             if (
                 record is not None
                 and lookup is not None
+                and analysis_key is not None
                 and analysis_dlc_version is not None
                 and response is None
                 and not caller_cancelled
@@ -1496,6 +1614,9 @@ def make_app() -> FastAPI:
                             state.active_story_source_id = record.source_id
                             state.story_source_generation = source_generation + 1
                             state.story_dlc_version = analysis_dlc_version
+                            state._publish_story_analysis(
+                                record, analysis_key, lookup
+                            )
                             transaction.committed = True
                         except Exception:
                             state.logger.exception(
@@ -1553,7 +1674,8 @@ def make_app() -> FastAPI:
         record = _story_record(state, source_id)
         if record is None:
             return _story_not_found_response()
-        lookup = _inspect_story_analysis(state, record)
+        inspection = await state._inspect_story_analysis_offloop(record)
+        lookup = inspection.lookup
         if lookup.status != "ready":
             return _analysis_error_response(state, record, lookup)
         return JSONResponse(_story_analysis_payload(state, record, "ready"))
@@ -1563,7 +1685,8 @@ def make_app() -> FastAPI:
         record = _story_record(state, source_id)
         if record is None:
             return _story_not_found_response()
-        lookup = _inspect_story_analysis(state, record)
+        inspection = await state._inspect_story_analysis_offloop(record)
+        lookup = inspection.lookup
         if lookup.status != "ready" or lookup.story_map is None:
             return _analysis_error_response(state, record, lookup)
         return JSONResponse(
@@ -1585,17 +1708,34 @@ def make_app() -> FastAPI:
         planning_task: asyncio.Task | None = None
         planning_cleanup_task: asyncio.Task | None = None
         try:
+            inspection = await state._inspect_story_analysis_offloop(record)
+            lookup = inspection.lookup
+            if lookup.status != "ready" or lookup.story_map is None:
+                return _analysis_error_response(state, record, lookup)
             async with state.timeline_transition_lock:
                 current_record = _story_record(state, source_id)
-                if current_record is not record:
+                current_key = offline_analysis_key(
+                    record.story, state.story_dlc_version
+                )
+                runtime_signature = state._story_runtime_signature(
+                    dlc_version=inspection.dlc_version
+                )
+                if (
+                    current_record is not record
+                    or state.active_story_source_id != record.source_id
+                    or state.story_source_generation
+                    != inspection.source_generation
+                    or current_key != inspection.key
+                ):
                     raise _StoryConflict(
                         "story_state_changed", "the selected story source changed"
                     )
-                lookup = _inspect_story_analysis(state, record)
-                if lookup.status != "ready" or lookup.story_map is None:
-                    return _analysis_error_response(state, record, lookup)
                 planning_task, planning_context = state._reserve_story_planning(
-                    record, lookup.story_map, chapter_id, speed
+                    record,
+                    lookup.story_map,
+                    chapter_id,
+                    speed,
+                    runtime_signature,
                 )
             await state.broadcast()
             try:
@@ -1611,6 +1751,9 @@ def make_app() -> FastAPI:
                 raise _StoryConflict(
                     "story_planning_cancelled", "chapter planning was cancelled"
                 )
+            final_inspection = await state._inspect_story_analysis_offloop(
+                record
+            )
             async with state.timeline_transition_lock:
                 if (
                     state.story_planning_task is not planning_task
@@ -1625,18 +1768,24 @@ def make_app() -> FastAPI:
                         "story_state_changed", "story state changed during planning"
                     )
                 current_record = _story_record(state, source_id)
-                current_lookup = (
-                    _inspect_story_analysis(state, current_record)
-                    if current_record is record
-                    else None
+                current_lookup = final_inspection.lookup
+                current_key = offline_analysis_key(
+                    record.story, state.story_dlc_version
+                )
+                current_runtime_signature = state._story_runtime_signature(
+                    dlc_version=state.story_dlc_version
                 )
                 if (
-                    current_lookup is None
+                    current_record is not record
+                    or state.active_story_source_id != record.source_id
+                    or final_inspection.source_generation
+                    != planning_context.generation
+                    or current_key != final_inspection.key
+                    or state.story_dlc_version != final_inspection.dlc_version
                     or current_lookup.status != "ready"
                     or current_lookup.story_map is None
                     or current_lookup.story_map != planning_context.story_map
-                    or state._story_runtime_signature()
-                    != planning_context.runtime_signature
+                    or current_runtime_signature != planning_context.runtime_signature
                     or state.story_planner_signature
                     != planning_context.runtime_signature
                     or state.timeline_session.to_state().status.value != "idle"
@@ -1684,7 +1833,8 @@ def make_app() -> FastAPI:
                 {"code": "story_reader_missing", "error": "no story is selected"},
                 status_code=409,
             )
-        lookup = _inspect_story_analysis(state, record)
+        inspection = await state._inspect_story_analysis_offloop(record)
+        lookup = inspection.lookup
         if lookup.status != "ready" or lookup.story_map is None:
             return _analysis_error_response(state, record, lookup)
         return JSONResponse(
@@ -1703,7 +1853,8 @@ def make_app() -> FastAPI:
                 {"code": "story_reader_missing", "error": "no story is selected"},
                 status_code=409,
             )
-        lookup = _inspect_story_analysis(state, record)
+        inspection = await state._inspect_story_analysis_offloop(record)
+        lookup = inspection.lookup
         if lookup.status != "ready" or lookup.story_map is None:
             return _analysis_error_response(state, record, lookup)
         text = record.story.text
@@ -1751,12 +1902,22 @@ def make_app() -> FastAPI:
     @app.post("/api/story/finish")
     async def api_story_finish() -> JSONResponse:
         try:
-            async with state.timeline_transition_lock:
-                summary = await state.novel_session.finish()
-                payload = {
-                    "replay": _replay_summary_payload(summary),
-                    "session": _novel_session_payload(state.novel_session.to_state()),
-                }
+            async def finish_transition() -> dict[str, object]:
+                async with state.timeline_transition_lock:
+                    prepared = await state.novel_session.prepare_finish()
+                await state.novel_session.persist_finish(prepared)
+                async with state.timeline_transition_lock:
+                    summary = await state.novel_session.finalize_finish(prepared)
+                    return {
+                        "replay": _replay_summary_payload(summary),
+                        "session": _novel_session_payload(
+                            state.novel_session.to_state()
+                        ),
+                    }
+
+            payload = await state.loop._await_timeline_lifecycle(
+                finish_transition
+            )
         except Exception as exc:
             return _story_transition_error(state, exc)
         await state.broadcast()
@@ -1766,10 +1927,19 @@ def make_app() -> FastAPI:
     @app.post("/api/session/start")
     async def api_session_start() -> JSONResponse:
         try:
-            async with state.timeline_transition_lock:
-                await state.loop.start_timeline_session()
-                await state.set_sensors(True)
-                payload = _session_payload(state.timeline_session)
+            while True:
+                wait_for_finish = False
+                async with state.timeline_transition_lock:
+                    wait_for_finish = (
+                        state.timeline_session.archive_persistence_pending
+                    )
+                    if not wait_for_finish:
+                        await state.loop.start_timeline_session()
+                        await state.set_sensors(True)
+                        payload = _session_payload(state.timeline_session)
+                if not wait_for_finish:
+                    break
+                await state.timeline_session.wait_for_archive_persistence()
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         await state.broadcast()
@@ -1805,10 +1975,18 @@ def make_app() -> FastAPI:
     @app.post("/api/session/finish")
     async def api_session_finish() -> JSONResponse:
         try:
-            async with state.timeline_transition_lock:
-                summary = await state.loop.finish_timeline_session()
-                await state.set_sensors(False)
-                payload = _replay_summary_payload(summary)
+            async def finish_transition() -> dict[str, object]:
+                async with state.timeline_transition_lock:
+                    prepared = await state.loop.prepare_timeline_finish()
+                    await state.set_sensors(False)
+                await state.loop.persist_timeline_finish(prepared)
+                async with state.timeline_transition_lock:
+                    summary = await state.loop.finalize_timeline_finish(prepared)
+                    return _replay_summary_payload(summary)
+
+            payload = await state.loop._await_timeline_lifecycle(
+                finish_transition
+            )
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         await state.broadcast()
@@ -1817,7 +1995,9 @@ def make_app() -> FastAPI:
     @app.get("/api/replays")
     async def api_replays() -> JSONResponse:
         try:
-            summaries = state.replay_store.list()
+            summaries = await state.timeline_session.run_store_io(
+                state.replay_store.list, name="replay-list"
+            )
         except ReplayStoreError as exc:
             return _timeline_error_response(exc)
         return JSONResponse([_replay_summary_payload(item) for item in summaries])
@@ -1860,9 +2040,14 @@ def make_app() -> FastAPI:
     @app.post("/api/replays/{replay_id}/play")
     async def api_replay_play(replay_id: str, body: dict) -> JSONResponse:
         try:
+            prepared = await state.timeline_session.prepare_replay(
+                replay_id, cursor=body.get("cursor", 0)
+            )
             async with state.timeline_transition_lock:
-                session_state = await state.loop.start_replay_session(
-                    replay_id, body.get("cursor", 0)
+                if state.story_shutting_down:
+                    raise RuntimeError("application is shutting down")
+                session_state = await state.loop.start_prepared_replay_session(
+                    prepared
                 )
                 payload = session_state.to_dict()
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
@@ -1873,8 +2058,11 @@ def make_app() -> FastAPI:
     @app.get("/api/replays/{replay_id}/download")
     async def api_replay_download(replay_id: str) -> Response:
         try:
-            archive_bytes = _validated_replay_archive(
-                state.replay_store, replay_id
+            archive_bytes = await state.timeline_session.run_store_io(
+                _validated_replay_archive,
+                state.replay_store,
+                replay_id,
+                name=f"replay-download-{replay_id}",
             )
         except (_ReplayNotFoundError, ReplayStoreError) as exc:
             return _timeline_error_response(exc)
@@ -2033,15 +2221,25 @@ def make_app() -> FastAPI:
     async def api_history_clear(body: dict) -> JSONResponse:
         """清空对话历史（模型上下文 + 页面记录由前端同步清）。"""
         try:
-            async with state.timeline_transition_lock:
-                session_state = state.timeline_session.to_state()
-                if (
-                    session_state.mode == "autopilot"
-                    and session_state.status.value != "idle"
-                ):
-                    await state.loop.finish_timeline_session()
-                    await state.set_sensors(False)
-                state.loop.clear_history()
+            async def clear_transition() -> None:
+                prepared = None
+                async with state.timeline_transition_lock:
+                    session_state = state.timeline_session.to_state()
+                    if (
+                        session_state.mode == "autopilot"
+                        and session_state.status.value != "idle"
+                    ):
+                        prepared = await state.loop.prepare_timeline_finish()
+                        await state.set_sensors(False)
+                    else:
+                        state.loop.clear_history()
+                        return
+                await state.loop.persist_timeline_finish(prepared)
+                async with state.timeline_transition_lock:
+                    await state.loop.finalize_timeline_finish(prepared)
+                    state.loop.clear_history()
+
+            await state.loop._await_timeline_lifecycle(clear_transition)
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         await state.broadcast()
@@ -2125,73 +2323,96 @@ def make_app() -> FastAPI:
         requested_profile = str(body.get("profile") or "").strip()
         owner: _StoryRuntimeOwner | None = None
         try:
-            async with state.timeline_transition_lock:
-                active_session = state.timeline_session.to_state()
-                if (
-                    state.story_runtime_owner is not None
-                    or state.story_planning_task is not None
-                    or (
-                        active_session.mode in ("novel", "replay")
-                        and active_session.status.value != "idle"
-                    )
-                ):
-                    return _story_transition_error(
-                        state,
-                        _StoryConflict(
-                            "story_runtime_busy", "story runtime is already active"
-                        ),
-                    )
-                owner = state._acquire_story_runtime_owner("profile")
-                candidate_cfg = deepcopy(cfg)
-                reload_character(candidate_cfg)
-                roles = {
-                    item["name"]: item
-                    for item in (
-                        candidate_cfg["character"].get("roles") or []
-                    )
-                }
-                role = requested_role or str(
-                    candidate_cfg["character"].get("role") or ""
-                )
-                if role not in roles:
-                    return JSONResponse(
-                        {"error": f"未知角色，可用：{list(roles)}"},
-                        status_code=400,
-                    )
-                profiles = {
-                    item["name"]: item["available"]
-                    for item in roles[role]["profiles"]
-                }
-                profile = requested_profile or next(iter(profiles), "")
-                if profile not in profiles:
-                    return JSONResponse(
-                        {"error": f"未知风格版本，可用：{list(profiles)}"},
-                        status_code=400,
-                    )
-                if not profiles.get(profile, True):
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"「{roles[role]['label']}·{profile}」的 DLC 未安装："
-                                "请先在「角色设置」导入对应 DLC 包。"
+            async def profile_transition() -> dict[str, object] | JSONResponse:
+                nonlocal owner
+                prepared = None
+                async with state.timeline_transition_lock:
+                    active_session = state.timeline_session.to_state()
+                    if (
+                        state.story_runtime_owner is not None
+                        or state.story_planning_task is not None
+                        or (
+                            active_session.mode in ("novel", "replay")
+                            and active_session.status.value != "idle"
+                        )
+                    ):
+                        return _story_transition_error(
+                            state,
+                            _StoryConflict(
+                                "story_runtime_busy",
+                                "story runtime is already active",
                             ),
-                            "detail": "dlc_missing",
-                        },
-                        status_code=400,
+                        )
+                    owner = state._acquire_story_runtime_owner("profile")
+                    candidate_cfg = deepcopy(cfg)
+                    reload_character(candidate_cfg)
+                    roles = {
+                        item["name"]: item
+                        for item in (
+                            candidate_cfg["character"].get("roles") or []
+                        )
+                    }
+                    role = requested_role or str(
+                        candidate_cfg["character"].get("role") or ""
                     )
-                session_state = state.timeline_session.to_state()
-                if (
-                    session_state.mode == "autopilot"
-                    and session_state.status.value != "idle"
-                ):
-                    await state.loop.finish_timeline_session()
-                    await state.set_sensors(False)
-                save_character_runtime(cfg, role=role, profile=profile)
-                payload = {
-                    "ok": True,
-                    "role": cfg["character"]["role"],
-                    "profile": cfg["character"]["profile"],
-                }
+                    if role not in roles:
+                        return JSONResponse(
+                            {"error": f"未知角色，可用：{list(roles)}"},
+                            status_code=400,
+                        )
+                    profiles = {
+                        item["name"]: item["available"]
+                        for item in roles[role]["profiles"]
+                    }
+                    profile = requested_profile or next(iter(profiles), "")
+                    if profile not in profiles:
+                        return JSONResponse(
+                            {"error": f"未知风格版本，可用：{list(profiles)}"},
+                            status_code=400,
+                        )
+                    if not profiles.get(profile, True):
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"「{roles[role]['label']}·{profile}」的 DLC 未安装："
+                                    "请先在「角色设置」导入对应 DLC 包。"
+                                ),
+                                "detail": "dlc_missing",
+                            },
+                            status_code=400,
+                        )
+                    session_state = state.timeline_session.to_state()
+                    if (
+                        session_state.mode == "autopilot"
+                        and session_state.status.value != "idle"
+                    ):
+                        prepared = await state.loop.prepare_timeline_finish()
+                        await state.set_sensors(False)
+                    else:
+                        save_character_runtime(cfg, role=role, profile=profile)
+                        return {
+                            "ok": True,
+                            "role": cfg["character"]["role"],
+                            "profile": cfg["character"]["profile"],
+                        }
+                await state.loop.persist_timeline_finish(prepared)
+                async with state.timeline_transition_lock:
+                    if state.story_runtime_owner is not owner:
+                        raise RuntimeError("profile transition ownership changed")
+                    await state.loop.finalize_timeline_finish(prepared)
+                    save_character_runtime(cfg, role=role, profile=profile)
+                    return {
+                        "ok": True,
+                        "role": cfg["character"]["role"],
+                        "profile": cfg["character"]["profile"],
+                    }
+
+            result = await state.loop._await_timeline_lifecycle(
+                profile_transition
+            )
+            if isinstance(result, JSONResponse):
+                return result
+            payload = result
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         finally:

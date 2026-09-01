@@ -71,9 +71,11 @@ def rewrite_member_metadata(
 
 
 class ReplayStoreTests(unittest.TestCase):
+    NOVEL_SOURCE = b"0123456789"
+
     @staticmethod
     def novel_scenes() -> dict[str, object]:
-        source_hash = "a" * 64
+        source_hash = hashlib.sha256(ReplayStoreTests.NOVEL_SOURCE).hexdigest()
         chapter_id = f"ch-{source_hash}-0001"
         return {
             "schema_version": 1,
@@ -103,7 +105,7 @@ class ReplayStoreTests(unittest.TestCase):
 
     @staticmethod
     def novel_metadata() -> dict[str, str]:
-        source_hash = "a" * 64
+        source_hash = hashlib.sha256(ReplayStoreTests.NOVEL_SOURCE).hexdigest()
         return {
             "analysis_version": "faithful-offline-v1",
             "chapter_id": f"ch-{source_hash}-0001",
@@ -397,7 +399,7 @@ class ReplayStoreTests(unittest.TestCase):
             for missing in ("source", "scenes"):
                 kwargs = {
                     "scenes": scenes,
-                    "source": b"original",
+                    "source": self.NOVEL_SOURCE,
                     "source_extension": "txt",
                 }
                 if missing == "source":
@@ -413,7 +415,7 @@ class ReplayStoreTests(unittest.TestCase):
                 manifest,
                 bundle.timeline,
                 scenes=scenes,
-                source=b"original",
+                source=self.NOVEL_SOURCE,
                 source_extension="txt",
             )
             loaded = store.load(manifest.replay_id)
@@ -424,6 +426,83 @@ class ReplayStoreTests(unittest.TestCase):
                 set(loaded.manifest.checksums or {}),
                 {"timeline.json", "scenes.json", "source.txt"},
             )
+
+    def test_novel_save_reimports_source_and_requires_semantic_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "source"):
+                store.save(
+                    manifest,
+                    bundle.timeline,
+                    scenes=self.novel_scenes(),
+                    source=b"abcdefghij",
+                    source_extension="txt",
+                )
+
+    def test_novel_save_enforces_docx_auto_encoding_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "source"):
+                store.save(
+                    manifest,
+                    bundle.timeline,
+                    scenes=self.novel_scenes(),
+                    source=self.NOVEL_SOURCE,
+                    source_extension="docx",
+                )
+
+    def test_load_rejects_replaced_source_after_raw_checksums_are_recomputed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+            path = store.save(
+                manifest,
+                bundle.timeline,
+                scenes=self.novel_scenes(),
+                source=self.NOVEL_SOURCE,
+                source_extension="txt",
+            )
+            with zipfile.ZipFile(path, "r") as archive:
+                stored_manifest = json.loads(archive.read("manifest.json"))
+            replacement = b"abcdefghij"
+            replacement_hash = hashlib.sha256(replacement).hexdigest()
+            stored_manifest["source_hash"] = replacement_hash
+            stored_manifest["checksums"]["source.txt"] = replacement_hash
+            manifest_bytes = json.dumps(
+                stored_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            rewrite_members(
+                path,
+                {"manifest.json": manifest_bytes, "source.txt": replacement},
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "source"):
+                store.load(manifest.replay_id)
 
     def test_rejects_novel_claim_with_incomplete_or_mismatched_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -450,7 +529,7 @@ class ReplayStoreTests(unittest.TestCase):
                         manifest,
                         bundle.timeline,
                         scenes=scenes,
-                        source=b"original",
+                        source=self.NOVEL_SOURCE,
                         source_extension="txt",
                     )
 
@@ -511,7 +590,7 @@ class ReplayStoreTests(unittest.TestCase):
                         manifest,
                         bundle.timeline,
                         scenes=scenes,
-                        source=b"original",
+                        source=self.NOVEL_SOURCE,
                         source_extension="txt",
                     )
             with self.subTest(case="chapter mismatch"), self.assertRaises(
@@ -521,7 +600,7 @@ class ReplayStoreTests(unittest.TestCase):
                     chapter_mismatch,
                     bundle.timeline,
                     scenes=self.novel_scenes(),
-                    source=b"original",
+                    source=self.NOVEL_SOURCE,
                     source_extension="txt",
                 )
 
@@ -539,7 +618,7 @@ class ReplayStoreTests(unittest.TestCase):
                 manifest,
                 bundle.timeline,
                 scenes=self.novel_scenes(),
-                source=b"original",
+                source=self.NOVEL_SOURCE,
                 source_extension="txt",
             )
             with zipfile.ZipFile(path, "r") as archive:
@@ -580,7 +659,7 @@ class ReplayStoreTests(unittest.TestCase):
                 manifest,
                 bundle.timeline,
                 scenes=self.novel_scenes(),
-                source=b"original",
+                source=self.NOVEL_SOURCE,
                 source_extension="txt",
             )
             with zipfile.ZipFile(path, "r") as archive:
@@ -624,7 +703,7 @@ class ReplayStoreTests(unittest.TestCase):
                 manifest,
                 bundle.timeline,
                 scenes=self.novel_scenes(),
-                source=b"original",
+                source=self.NOVEL_SOURCE,
                 source_extension="txt",
             )
             with zipfile.ZipFile(path, "r") as archive:

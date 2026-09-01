@@ -194,11 +194,19 @@ class ReplayStore:
             has_scenes=scenes is not None,
             source_extension=source_extension,
         )
+        novel_story_map = None
         if scenes is not None:
             if _claims_novel(manifest):
-                _validate_novel_story_map(manifest, scenes)
+                novel_story_map = _validate_novel_story_map(manifest, scenes)
             else:
                 _validate_scenes(scenes)
+        if _claims_novel(manifest):
+            _validate_novel_source_semantics(
+                manifest,
+                novel_story_map,
+                source,
+                source_extension,
+            )
 
         timeline_bytes = _json_bytes(timeline.to_dict())
         payloads = {"timeline.json": timeline_bytes}
@@ -401,6 +409,7 @@ class ReplayStore:
         _validate_timeline(timeline)
 
         scenes = None
+        novel_story_map = None
         if "scenes.json" in payloads:
             try:
                 strict_novel_scenes = _claims_novel(manifest)
@@ -413,7 +422,7 @@ class ReplayStore:
                     ),
                 )
                 if strict_novel_scenes:
-                    _validate_novel_story_map(manifest, scenes)
+                    novel_story_map = _validate_novel_story_map(manifest, scenes)
                 else:
                     _validate_scenes(scenes)
             except (
@@ -436,6 +445,13 @@ class ReplayStore:
                 manifest.source_hash, source_hash
             ):
                 raise ReplayStoreError("replay source hash mismatch")
+        if _claims_novel(manifest):
+            _validate_novel_source_semantics(
+                manifest,
+                novel_story_map,
+                source,
+                source_name.partition(".")[2] if source_name else None,
+            )
         return ReplayBundle(
             manifest=manifest,
             timeline=timeline,
@@ -577,7 +593,7 @@ def _claims_novel(manifest: ReplayManifest) -> bool:
 
 def _validate_novel_story_map(
     manifest: ReplayManifest, scenes: object
-) -> None:
+) -> object:
     # This runtime-local boundary avoids importing story.session back through
     # backend.story while timeline modules are being initialized.
     from backend.story.story_map_codec import (
@@ -601,6 +617,47 @@ def _validate_novel_story_map(
         chapter.id == metadata["chapter_id"] for chapter in story_map.chapters
     ) != 1:
         raise ReplayStoreError("novel replay scenes chapter mismatch")
+    return story_map
+
+
+def _validate_novel_source_semantics(
+    manifest: ReplayManifest,
+    story_map: object,
+    source: bytes | None,
+    source_extension: str | None,
+) -> None:
+    """Re-import the embedded source at the replay trust boundary.
+
+    The raw-byte manifest hash proves archive integrity.  This independent
+    check proves that those bytes decode to the normalized story identity and
+    length which the novel metadata and StoryMap claim.
+    """
+    from backend.story.models import StoryMap
+    from backend.story.source import StorySourceError, StorySourceLoader
+
+    metadata = manifest.metadata
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(story_map, StoryMap)
+        or source is None
+        or source_extension not in _SOURCE_EXTENSIONS
+    ):
+        raise ReplayStoreError("novel replay source boundary is invalid")
+    try:
+        imported = StorySourceLoader(max_bytes=_MAX_SOURCE_SIZE).load(
+            f"source.{source_extension}",
+            source,
+            encoding=metadata["source_encoding"],
+        )
+    except (StorySourceError, KeyError, TypeError, ValueError) as exc:
+        raise ReplayStoreError("novel replay source could not be imported") from exc
+    expected_hash = metadata["source_text_hash"]
+    if not (
+        hmac.compare_digest(imported.source_sha256, expected_hash)
+        and hmac.compare_digest(imported.source_sha256, story_map.source_hash)
+        and len(imported.text) == story_map.text_length
+    ):
+        raise ReplayStoreError("novel replay source semantic identity mismatch")
 
 
 def _validate_novel_archive(

@@ -288,6 +288,7 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.state.story_source_loader = StorySourceLoader(max_bytes=1024 * 1024)
         self.state.story_source_max_bytes = 1024 * 1024
         self.state.story_analysis_store = AnalysisStore(self.root / "analysis")
+        self.addCleanup(self.state.story_analysis_store.close)
         self.state.story_sources = {}
         self.state.active_story_source_id = None
         self.state.story_source_generation = 0
@@ -955,6 +956,92 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["dlc_version"], self.state.story_dlc_version)
         self.assertEqual(self.llm.call_count, 0)
 
+    async def test_state_snapshot_stalled_analysis_keeps_event_loop_responsive(self):
+        await self._import("story.txt", b"ABCD", "utf-8")
+        stalled = StalledAnalysisStore(
+            self.state.story_analysis_store, fallback_timeout=0.25
+        )
+        self.state.story_analysis_store = stalled
+        ticked_at: list[float] = []
+        started_at = time.perf_counter()
+
+        async def tick() -> None:
+            await asyncio.sleep(0.01)
+            ticked_at.append(time.perf_counter())
+
+        response, _ = await asyncio.gather(
+            self.client.get("/api/state"), tick()
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(stalled.inspect_finished.is_set())
+        self.assertLess(ticked_at[0] - started_at, 0.1)
+        self.assertFalse(self.state.story_source_io_tasks)
+
+    async def test_play_stalled_analysis_never_holds_transition_lock(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        stalled = StalledAnalysisStore(
+            self.state.story_analysis_store, fallback_timeout=0.25
+        )
+        self.state.story_analysis_store = stalled
+        started_at = time.perf_counter()
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+
+        self.assertTrue(
+            await asyncio.to_thread(stalled.inspect_started.wait, 0.5)
+        )
+        async with asyncio.timeout(0.1):
+            async with self.state.timeline_transition_lock:
+                lock_acquired_at = time.perf_counter()
+        stalled.inspect_release.set()
+
+        response = await asyncio.wait_for(play, timeout=1.0)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLess(lock_acquired_at - started_at, 0.1)
+        self.assertFalse(self.state.story_source_io_tasks)
+
+    async def test_play_provenance_and_analysis_io_never_run_on_loop_or_under_lock(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        event_loop_thread = threading.get_ident()
+        original_provenance = main_module.dlc_provenance
+        observations: list[tuple[int, bool]] = []
+
+        def guarded_provenance(*args, **kwargs):
+            observation = (
+                threading.get_ident(),
+                self.state.timeline_transition_lock.locked(),
+            )
+            observations.append(observation)
+            if observation[0] == event_loop_thread or observation[1]:
+                raise AssertionError("story provenance I/O crossed the short lock")
+            return original_provenance(*args, **kwargs)
+
+        with patch.object(
+            main_module, "dlc_provenance", side_effect=guarded_provenance
+        ):
+            response = await self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertGreaterEqual(len(observations), 2)
+        self.assertTrue(all(thread_id != event_loop_thread for thread_id, _ in observations))
+        self.assertTrue(all(not locked for _, locked in observations))
+
     async def test_corrupt_analysis_is_invalid_once_then_missing_without_llm(self):
         source_bytes = b"ABCD"
         imported = await self._import("story.txt", source_bytes, "utf-8")
@@ -1177,6 +1264,28 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ABCD", json.dumps(message))
         self.assertEqual(self.llm.call_count, 0)
 
+    async def test_import_broadcast_reuses_the_validated_ready_lookup(self):
+        source_bytes = b"ABCD"
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        socket = CapturingWebSocket()
+        self.state.ws_clients.add(socket)
+        self.state.broadcast = main_module.AppState.broadcast.__get__(
+            self.state, main_module.AppState
+        )
+
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+
+        self.assertEqual(imported.status_code, 200, imported.text)
+        self.assertEqual(imported.json()["analysis"]["status"], "ready")
+        self.assertEqual(len(socket.messages), 1)
+        story_state = socket.messages[0]["data"]["story"]
+        self.assertEqual(story_state["analysis"]["status"], "ready")
+        self.assertEqual(
+            [chapter["chapter_id"] for chapter in story_state["chapters"]],
+            [chapter.id for chapter in story_map.chapters],
+        )
+
     async def test_disconnect_cancels_blocking_planning_without_waiting_for_model(self):
         source_bytes = b"ABCD"
         imported = await self._import("story.txt", source_bytes, "utf-8")
@@ -1251,6 +1360,60 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.cancelled.is_set())
         self.assertIsNone(self.state.story_planning_task)
         self.assertEqual(self.state.tasks, [])
+
+    async def test_shutdown_clears_before_waiting_for_stalled_novel_archive_save(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        played = await self.client.post(
+            f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+            json={"speed": "standard"},
+        )
+        self.assertEqual(played.status_code, 200, played.text)
+        original_save = self.harness.store.save
+        save_started = threading.Event()
+        save_release = threading.Event()
+
+        def stalled_save(*args, **kwargs):
+            save_started.set()
+            save_release.wait(0.5)
+            return original_save(*args, **kwargs)
+
+        self.state.shutdown = main_module.AppState.shutdown.__get__(
+            self.state, main_module.AppState
+        )
+        self.state._shutdown_cleanup = main_module.AppState._shutdown_cleanup.__get__(
+            self.state, main_module.AppState
+        )
+
+        with patch.object(
+            self.harness.store, "save", side_effect=stalled_save
+        ):
+            finishing = asyncio.create_task(
+                self.client.post("/api/story/finish")
+            )
+            self.assertTrue(await asyncio.to_thread(save_started.wait, 0.5))
+            shutdown = asyncio.create_task(self.state.shutdown())
+            for _ in range(20):
+                if self.harness.safety.estop_active:
+                    break
+                await asyncio.sleep(0.005)
+
+            self.assertTrue(self.harness.safety.estop_active)
+            self.assertTrue(
+                self.harness.loop.output_clear_is_confirmed(("A", "B"))
+            )
+            self.assertFalse(shutdown.done())
+            save_release.set()
+            finished_response, _ = await asyncio.wait_for(
+                asyncio.gather(finishing, shutdown), timeout=0.5
+            )
+
+        self.assertEqual(finished_response.status_code, 200, finished_response.text)
+        self.assertFalse(self.harness.controller._store_io_tasks)
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
 
     async def test_planning_result_is_discarded_when_selected_source_changes(self):
         source_bytes = b"ABCD"
@@ -1376,13 +1539,45 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second.done())
         socket.release_first.set()
         await asyncio.wait_for(asyncio.gather(first, second), timeout=0.2)
-        self.assertEqual(
-            [message["data"]["layout"]["marker"] for message in socket.messages],
-            [1, 2],
+        revisions_by_marker = {
+            message["data"]["layout"]["marker"]: message["data"][
+                "state_revision"
+            ]
+            for message in socket.messages
+        }
+        self.assertEqual(revisions_by_marker, {1: 1, 2: 2})
+
+    async def test_http_snapshot_gets_unique_revision_while_older_ws_send_is_blocked(self):
+        socket = BlockingFirstWebSocket()
+        self.state.ws_clients.add(socket)
+        self.state.broadcast = main_module.AppState.broadcast.__get__(
+            self.state, main_module.AppState
         )
-        self.assertEqual(
-            [message["data"]["state_revision"] for message in socket.messages],
-            [1, 2],
+        self.state.send_state = main_module.AppState.send_state.__get__(
+            self.state, main_module.AppState
+        )
+        self.state.layout = {"marker": "old-ws"}
+
+        old_broadcast = asyncio.create_task(self.state.broadcast())
+        await asyncio.wait_for(socket.first_started.wait(), timeout=0.2)
+        self.state.layout = {"marker": "new-http"}
+        http = await asyncio.wait_for(self.client.get("/api/state"), timeout=0.2)
+        socket.release_first.set()
+        await asyncio.wait_for(old_broadcast, timeout=0.2)
+
+        old_frame = socket.messages[0]["data"]
+        new_snapshot = http.json()
+        self.assertEqual(old_frame["layout"]["marker"], "old-ws")
+        self.assertEqual(new_snapshot["layout"]["marker"], "new-http")
+        self.assertLess(
+            old_frame["state_revision"], new_snapshot["state_revision"]
+        )
+
+        initial = CapturingWebSocket()
+        await self.state.send_state(initial)
+        self.assertGreater(
+            initial.messages[0]["data"]["state_revision"],
+            new_snapshot["state_revision"],
         )
 
     async def test_dlc_change_makes_old_analysis_missing_and_replans_new_identity(self):

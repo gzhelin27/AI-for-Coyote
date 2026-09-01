@@ -4,6 +4,8 @@ from copy import deepcopy
 import io
 import json
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, call, patch
@@ -15,6 +17,7 @@ from fastapi import WebSocketDisconnect
 import backend.main as main_module
 from backend.output_coordinator import OutputIntentKind
 from backend.timeline.models import SessionStatus
+from backend.timeline.player import RecordedCyclePlayer
 from backend.timeline.replay_store import ReplayStore
 from tests.test_game_loop_timeline import (
     make_game_loop_for_test,
@@ -230,6 +233,215 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.state.set_sensors.await_args_list,
             [call(True), call(False), call(True), call(False)],
         )
+
+    async def test_stalled_replay_list_and_download_keep_event_loop_responsive(self):
+        summary = await self._finish_replay_with_cycle()
+        replay_id = summary["replay_id"]
+
+        for method_name, request in (
+            ("list", lambda: self.client.get("/api/replays")),
+            (
+                "read_validated",
+                lambda: self.client.get(f"/api/replays/{replay_id}/download"),
+            ),
+        ):
+            with self.subTest(method=method_name):
+                original = getattr(self.harness.store, method_name)
+                started = threading.Event()
+                release = threading.Event()
+
+                def stalled(*args, **kwargs):
+                    started.set()
+                    release.wait(0.25)
+                    return original(*args, **kwargs)
+
+                ticked_at: list[float] = []
+                started_at = time.perf_counter()
+
+                async def tick() -> None:
+                    await asyncio.sleep(0.01)
+                    ticked_at.append(time.perf_counter())
+
+                with patch.object(
+                    self.harness.store, method_name, side_effect=stalled
+                ):
+                    response, _ = await asyncio.gather(request(), tick())
+                release.set()
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(started.is_set())
+                self.assertLess(ticked_at[0] - started_at, 0.1)
+
+    async def test_stalled_replay_load_never_holds_global_transition_lock(self):
+        summary = await self._finish_replay_with_cycle()
+        original_load = self.harness.store.load
+        started = threading.Event()
+        release = threading.Event()
+
+        def stalled_load(*args, **kwargs):
+            started.set()
+            release.wait(0.25)
+            return original_load(*args, **kwargs)
+
+        started_at = time.perf_counter()
+        with patch.object(
+            self.harness.store, "load", side_effect=stalled_load
+        ):
+            playing = asyncio.create_task(
+                self.client.post(
+                    f"/api/replays/{summary['replay_id']}/play",
+                    json={"cursor": 0},
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+            async with asyncio.timeout(0.1):
+                async with self.state.timeline_transition_lock:
+                    acquired_at = time.perf_counter()
+            release.set()
+            response = await asyncio.wait_for(playing, timeout=0.5)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLess(acquired_at - started_at, 0.1)
+        await self.client.post("/api/replays/playback/stop")
+
+    async def test_shutdown_state_rejects_replay_activation_after_prepare(self):
+        summary = await self._finish_replay_with_cycle()
+        self.state.story_shutting_down = True
+
+        response = await self.client.post(
+            f"/api/replays/{summary['replay_id']}/play",
+            json={"cursor": 0},
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.harness.controller.to_state().status, SessionStatus.IDLE)
+
+    async def test_replay_player_preparation_runs_before_the_short_start_lock(self):
+        summary = await self._finish_replay_with_cycle()
+        original_load = RecordedCyclePlayer.load
+        load_started = threading.Event()
+
+        def stalled_player_load(player, replay):
+            load_started.set()
+            time.sleep(0.25)
+            return original_load(player, replay)
+
+        loop = asyncio.get_running_loop()
+        probe_scheduled_at: list[float] = []
+        probe_ran_at: list[float] = []
+        probe_ran = asyncio.Event()
+
+        def record_probe() -> None:
+            probe_ran_at.append(time.perf_counter())
+            probe_ran.set()
+
+        def schedule_probe_from_worker() -> None:
+            if not load_started.wait(0.5):
+                raise AssertionError("player load did not start")
+            probe_scheduled_at.append(time.perf_counter())
+            loop.call_soon_threadsafe(record_probe)
+
+        with patch.object(
+            RecordedCyclePlayer, "load", new=stalled_player_load
+        ):
+            probe = asyncio.create_task(
+                asyncio.to_thread(schedule_probe_from_worker)
+            )
+            response = await self.client.post(
+                f"/api/replays/{summary['replay_id']}/play",
+                json={"cursor": 0},
+            )
+            await asyncio.wait_for(probe_ran.wait(), timeout=0.5)
+            await probe
+
+        self.assertTrue(load_started.is_set())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLess(probe_ran_at[0] - probe_scheduled_at[0], 0.1)
+        await self.client.post("/api/replays/playback/stop")
+
+    async def test_stalled_finish_save_clears_then_releases_global_transition_lock(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200, started.text)
+        original_save = self.harness.store.save
+        save_started = threading.Event()
+        save_release = threading.Event()
+
+        def stalled_save(*args, **kwargs):
+            save_started.set()
+            save_release.wait(0.25)
+            return original_save(*args, **kwargs)
+
+        with patch.object(
+            self.harness.store, "save", side_effect=stalled_save
+        ):
+            finishing = asyncio.create_task(
+                self.client.post("/api/session/finish")
+            )
+            self.assertTrue(await asyncio.to_thread(save_started.wait, 0.5))
+            lock_wait_started = time.perf_counter()
+            async with asyncio.timeout(0.1):
+                async with self.state.timeline_transition_lock:
+                    acquired_at = time.perf_counter()
+                    self.assertEqual(
+                        self.harness.controller.to_state().status.value,
+                        "finishing",
+                    )
+                    self.assertTrue(
+                        self.harness.loop.output_clear_is_confirmed(("A", "B"))
+                    )
+            disconnect_started = time.perf_counter()
+            await asyncio.wait_for(
+                main_module.AppState.on_relay_event(
+                    self.state, "client_disconnected", {}
+                ),
+                timeout=0.1,
+            )
+            self.assertLess(
+                time.perf_counter() - disconnect_started, 0.1
+            )
+            estop_started = time.perf_counter()
+            estopped = await asyncio.wait_for(
+                self.client.post("/api/estop"), timeout=0.1
+            )
+            self.assertEqual(estopped.status_code, 200, estopped.text)
+            self.assertLess(time.perf_counter() - estop_started, 0.1)
+            save_release.set()
+            response = await asyncio.wait_for(finishing, timeout=0.5)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLess(acquired_at - lock_wait_started, 0.1)
+
+    async def test_cancelled_stalled_finish_still_finalizes_after_archive_save(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200, started.text)
+        original_save = self.harness.store.save
+        save_started = threading.Event()
+        save_release = threading.Event()
+
+        def stalled_save(*args, **kwargs):
+            save_started.set()
+            save_release.wait(0.5)
+            return original_save(*args, **kwargs)
+
+        with patch.object(
+            self.harness.store, "save", side_effect=stalled_save
+        ):
+            finishing = asyncio.create_task(
+                self.client.post("/api/session/finish")
+            )
+            self.assertTrue(await asyncio.to_thread(save_started.wait, 0.2))
+            finishing.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(finishing.done())
+            save_release.set()
+            result = await asyncio.gather(finishing, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.IDLE
+        )
+        self.assertEqual(len(self.harness.store.list()), 1)
+        self.assertFalse(self.harness.controller._store_io_tasks)
 
     async def test_lowering_cap_reduces_active_runner_and_records_current_strength(self):
         await self._start_physical_live(30)
@@ -1760,7 +1972,12 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(websocket.accepted)
-        self.assertEqual(ws_state, state)
+        self.assertGreater(ws_state["state_revision"], state["state_revision"])
+        ws_content = dict(ws_state)
+        http_content = dict(state)
+        ws_content.pop("state_revision")
+        http_content.pop("state_revision")
+        self.assertEqual(ws_content, http_content)
         self.assertEqual(
             set(state["session"]),
             {
@@ -1832,6 +2049,42 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.controller.to_state().status, SessionStatus.IDLE)
         self.assertEqual(len(self.harness.store.list()), 1)
         self.state.set_sensors.assert_awaited_with(False)
+
+    async def test_history_finish_archive_save_never_holds_global_lock(self):
+        started = await self.client.post("/api/session/start")
+        self.assertEqual(started.status_code, 200)
+        self.harness.loop.history = [{"role": "user", "content": "keep me"}]
+        original_save = self.harness.store.save
+        save_started = threading.Event()
+        save_release = threading.Event()
+
+        def stalled_save(*args, **kwargs):
+            save_started.set()
+            save_release.wait(0.5)
+            return original_save(*args, **kwargs)
+
+        with patch.object(
+            self.harness.store, "save", side_effect=stalled_save
+        ):
+            clearing = asyncio.create_task(
+                self.client.post("/api/history/clear", json={})
+            )
+            self.assertTrue(await asyncio.to_thread(save_started.wait, 0.2))
+            async with asyncio.timeout(0.1):
+                async with self.state.timeline_transition_lock:
+                    self.assertEqual(
+                        self.harness.controller.to_state().status,
+                        SessionStatus.FINISHING,
+                    )
+                    self.assertTrue(self.harness.loop.history)
+            save_release.set()
+            cleared = await asyncio.wait_for(clearing, timeout=0.5)
+
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(self.harness.loop.history, [])
+        self.assertEqual(
+            self.harness.controller.to_state().status, SessionStatus.IDLE
+        )
 
     async def test_role_switch_finishes_live_session_before_saving_profile(self):
         started = await self.client.post("/api/session/start")
@@ -1927,6 +2180,8 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         after_state = (await self.client.get("/api/state")).json()
         self.assertEqual(response.status_code, 400)
+        before_state.pop("state_revision", None)
+        after_state.pop("state_revision", None)
         self.assertEqual(after_state, before_state)
         self.assertEqual(
             self.harness.controller.to_state().status,

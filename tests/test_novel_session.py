@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import hashlib
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -23,8 +24,8 @@ from tests.timeline_fakes import SessionHarness
 
 
 def make_novel_inputs() -> tuple[ImportedStory, StoryMap, ValidatedChapterPlan]:
-    source_hash = "a" * 64
     text = "ABCDE12345"
+    source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     first_scene = StoryScene(
         id=StoryScene.stable_id(source_hash, 0, 0),
         index=0,
@@ -446,13 +447,15 @@ class NovelSessionControllerTests(unittest.IsolatedAsyncioTestCase):
         harness, novel, story, story_map, plan = self.make_controller()
         self.addAsyncCleanup(harness.close)
         await novel.start(plan, story, story_map)
-        original_finish = harness.controller.finish
+        original_finalize = harness.controller.finalize_finish
 
-        async def finish_then_cancel():
-            await original_finish()
+        async def finalize_then_cancel(prepared):
+            await original_finalize(prepared)
             raise asyncio.CancelledError
 
-        with patch.object(harness.controller, "finish", finish_then_cancel):
+        with patch.object(
+            harness.controller, "finalize_finish", finalize_then_cancel
+        ):
             with self.assertRaises(asyncio.CancelledError):
                 await novel.finish()
 

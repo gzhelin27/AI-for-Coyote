@@ -444,6 +444,15 @@ class GameLoop:
                 )
             )
 
+    async def start_prepared_replay_session(self, prepared):
+        """Activate an already validated replay through the sole output owner."""
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            return await self._await_timeline_lifecycle(
+                lambda: self.timeline_session.start_prepared_replay(prepared)
+            )
+
     async def pause_replay_session(self):
         """Pause replay without allowing request cancellation to skip clear."""
         async with self._autopilot_transition_lock:
@@ -608,19 +617,43 @@ class GameLoop:
             await self._stop_autopilot_task()
             logger.info("自动运行已停止")
 
-    async def finish_timeline_session(self):
-        """Stop automatic turns and normally finish the current live session."""
+    async def prepare_timeline_finish(self):
+        """Clear/disable live output and freeze an immutable archive payload."""
         async with self._autopilot_transition_lock:
             if self.timeline_session is None:
                 raise RuntimeError("timeline session is unavailable")
             try:
-                result = await self._await_timeline_lifecycle(
-                    self.timeline_session.finish
+                return await self._await_timeline_lifecycle(
+                    self.timeline_session.prepare_finish
                 )
-                self._clear_timeline_character_if_idle()
-                return result
             finally:
-                await self._stop_autopilot_task()
+                await self._stop_autopilot_task(force_after=0.05)
+
+    async def persist_timeline_finish(self, prepared):
+        if self.timeline_session is None:
+            raise RuntimeError("timeline session is unavailable")
+        return await self._await_timeline_lifecycle(
+            lambda: self.timeline_session.persist_finish(prepared)
+        )
+
+    async def finalize_timeline_finish(self, prepared):
+        async with self._autopilot_transition_lock:
+            if self.timeline_session is None:
+                raise RuntimeError("timeline session is unavailable")
+            result = await self._await_timeline_lifecycle(
+                lambda: self.timeline_session.finalize_finish(prepared)
+            )
+            self._clear_timeline_character_if_idle()
+            return result
+
+    async def finish_timeline_session(self):
+        """Clear, persist off-loop, then finalize without a long lifecycle lock."""
+        async def transition():
+            prepared = await self.prepare_timeline_finish()
+            await self.persist_timeline_finish(prepared)
+            return await self.finalize_timeline_finish(prepared)
+
+        return await self._await_timeline_lifecycle(transition)
 
     async def stop_timeline_session(self):
         """Abnormally stop live or replay work without creating an archive."""
@@ -666,13 +699,20 @@ class GameLoop:
                 self.autopilot_interval,
             )
 
-    async def _stop_autopilot_task(self) -> None:
+    async def _stop_autopilot_task(self, *, force_after: float | None = None) -> None:
         self.autopilot = False
         self.autopilot_stop.set()
         task = self.autopilot_task
         self.autopilot_task = None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+            if force_after is not None:
+                done, _pending = await asyncio.wait({task}, timeout=force_after)
+                if not done:
+                    # The production autopilot loop never suppresses cancellation.
+                    # Bound a faulty task that does so after output ownership has
+                    # already been disabled by prepare_finish().
+                    task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
     async def _autopilot_loop(self) -> None:

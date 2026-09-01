@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { mapStoryError, mapTimelineState } from "../src/api.ts";
+import { api, mapStoryError, mapTimelineState, storyErrorMessage } from "../src/api.ts";
 import { ReaderSliceGate, readerPageRange } from "../src/readerPaging.ts";
 import { StateSyncGate } from "../src/stateRefreshGate.ts";
 import { analysisStatusGuidance, buildMissingAnalysisCommand, isStoryReady, resumePayload } from "../src/storyUi.ts";
@@ -69,11 +69,58 @@ test("initial and reconnect fallback HTTP requests belong to their new realtime 
 });
 
 test("story failures map backend codes to stable reader messages", () => {
-  assert.equal(mapStoryError("analysis_missing"), "尚未导入匹配的离线分析");
-  assert.equal(mapStoryError("analysis_invalid"), "离线分析无效，请重新生成并导入");
-  assert.equal(mapStoryError("reader_range_invalid"), "无法读取当前正文片段");
-  assert.equal(mapStoryError("story_import_invalid"), "小说原文无效，请确认格式和编码");
+  const expected = {
+    analysis_missing: "尚未导入匹配的离线分析",
+    analysis_invalid: "离线分析无效，请重新生成并导入",
+    reader_range_invalid: "无法读取当前正文片段",
+    story_not_found: "当前小说不可用，请重新导入",
+    story_reader_missing: "当前小说不可用，请重新导入",
+    chapter_plan_failed: "章节规划未完成，无法启动阅读",
+    story_runtime_busy: "小说会话正在处理中",
+    story_planning_active: "小说会话正在处理中",
+    story_state_changed: "小说状态已变化，请重新选择章节",
+    story_planning_cancelled: "章节规划已取消，请重试",
+    story_import_invalid: "小说原文无效，请确认格式和编码",
+    story_import_failed: "小说导入未完成，请稍后重试",
+    story_output_failed: "设备输出未确认，小说会话未继续",
+    story_transition_invalid: "小说会话当前无法切换",
+    story_transition_failed: "小说会话当前无法切换",
+  };
+  for (const [code, message] of Object.entries(expected)) {
+    assert.equal(mapStoryError(code), message, code);
+  }
   assert.equal(mapStoryError("unexpected_server_detail"), "小说操作失败");
+});
+
+test("story API errors preserve every mapped safe message without exposing backend detail", async () => {
+  const previousFetch = globalThis.fetch;
+  const cases = [
+    ["story_output_failed", "设备输出未确认，小说会话未继续"],
+    ["story_state_changed", "小说状态已变化，请重新选择章节"],
+    ["story_planning_cancelled", "章节规划已取消，请重试"],
+  ];
+  try {
+    for (const [code, expected] of cases) {
+      globalThis.fetch = async () => ({
+        ok: false,
+        status: 409,
+        statusText: "Conflict",
+        json: async () => ({ code, error: "unsafe backend detail" }),
+      });
+      const error = await api.storyPause().catch((cause) => cause);
+      assert.equal(storyErrorMessage(error), expected, code);
+    }
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: async () => ({ code: "unknown_story_code", error: "unsafe backend detail" }),
+    });
+    const unknown = await api.storyPause().catch((cause) => cause);
+    assert.equal(storyErrorMessage(unknown), "小说操作失败");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });
 
 test("reader pages cover short and long scenes without exceeding the API slice bound", () => {

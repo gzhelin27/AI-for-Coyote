@@ -7,7 +7,7 @@ from copy import deepcopy
 import random
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -28,7 +28,7 @@ from .models import (
 )
 from .player import RecordedCyclePlayer
 from .randomizer import TimelineResolver, derive_stream_seed
-from .replay_store import ReplayStore, ReplaySummary
+from .replay_store import ReplayBundle, ReplayStore, ReplaySummary
 
 
 _CHANNELS = ("A", "B")
@@ -56,6 +56,24 @@ class PlannedSessionArchive:
         object.__setattr__(self, "scenes", deepcopy(dict(self.scenes)))
         object.__setattr__(self, "source", bytes(self.source))
         object.__setattr__(self, "metadata", deepcopy(dict(self.metadata)))
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedReplay:
+    bundle: ReplayBundle
+    player: RecordedCyclePlayer
+    cursor: int
+    routing_generation: int
+    identity_adjusted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSessionFinish:
+    token: object
+    manifest: ReplayManifest
+    timeline: Timeline
+    archive: PlannedSessionArchive | None
+    summary: ReplaySummary
 
 
 class _AsyncioSleeper:
@@ -210,6 +228,10 @@ class SessionController:
         self._planned_task: asyncio.Task[None] | None = None
         self._archive: PlannedSessionArchive | None = None
         self._planned_resume_directives: dict[str, ChannelDirective] = {}
+        self._prepared_finish: PreparedSessionFinish | None = None
+        self._finish_terminal = asyncio.Event()
+        self._finish_terminal.set()
+        self._store_io_tasks: set[asyncio.Task] = set()
 
     @property
     def runners(self) -> Mapping[str, ChannelCycleRunner]:
@@ -226,6 +248,68 @@ class SessionController:
     @property
     def routing_generation(self) -> int:
         return self._routing_generation
+
+    @property
+    def archive_persistence_pending(self) -> bool:
+        return self._prepared_finish is not None
+
+    async def wait_for_archive_persistence(self) -> None:
+        await self._finish_terminal.wait()
+
+    def _track_store_io(
+        self, operation: Callable[..., Any], *args: Any, name: str
+    ) -> asyncio.Task:
+        task = asyncio.create_task(
+            asyncio.to_thread(operation, *args), name=name
+        )
+        self._store_io_tasks.add(task)
+
+        def forget(completed: asyncio.Task) -> None:
+            self._store_io_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(forget)
+        return task
+
+    async def run_store_io(
+        self, operation: Callable[..., Any], *args: Any, name: str
+    ) -> Any:
+        """Run one replay-store operation off-loop and retain its lifetime."""
+
+        task = self._track_store_io(operation, *args, name=name)
+        return await asyncio.shield(task)
+
+    async def settle_store_io(self) -> None:
+        """Wait for already-started workers before process-owned resources close."""
+
+        while True:
+            tasks = tuple(task for task in self._store_io_tasks if not task.done())
+            if not tasks:
+                return
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    async def _await_lifecycle_completion(
+        operation: Awaitable[Any], *, name: str
+    ) -> Any:
+        """Reach the authoritative terminal state before propagating cancellation."""
+
+        lifecycle = asyncio.create_task(operation, name=name)
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(lifecycle)
+                break
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                if lifecycle.done():
+                    result = lifecycle.result()
+                    break
+        if cancellation is not None:
+            raise cancellation
+        return result
 
     async def start_live(self) -> SessionState:
         async with self._lock:
@@ -743,8 +827,10 @@ class SessionController:
                 raise RuntimeError("paused session has no mode")
             return self.to_state()
 
-    async def finish(self) -> ReplaySummary:
+    async def prepare_finish(self) -> PreparedSessionFinish:
         async with self._lock:
+            if self._prepared_finish is not None:
+                raise RuntimeError("session archive persistence is already pending")
             if self._mode not in _LIVE_MODES or self._status not in (
                 SessionStatus.RUNNING,
                 SessionStatus.PAUSED,
@@ -785,29 +871,97 @@ class SessionController:
                 replay_id=replay_id,
                 session_id=session_id,
             )
-            try:
-                if self._archive is None:
-                    self.store.save(manifest, timeline)
-                else:
-                    self.store.save(
-                        manifest,
-                        timeline,
-                        scenes=deepcopy(dict(self._archive.scenes)),
-                        source=self._archive.source,
-                        source_extension=self._archive.source_extension,
-                    )
-            except Exception:
-                self._set_status(SessionStatus.PAUSED)
-                raise
-
             summary = ReplaySummary.from_manifest(
                 manifest, cycle_count=len(timeline.cycles)
             )
+            prepared = PreparedSessionFinish(
+                token=object(),
+                manifest=manifest,
+                timeline=timeline,
+                archive=self._archive,
+                summary=summary,
+            )
+            self._prepared_finish = prepared
+            self._finish_terminal.clear()
+            return prepared
+
+    async def persist_finish(
+        self, prepared: PreparedSessionFinish
+    ) -> ReplaySummary:
+        if not isinstance(prepared, PreparedSessionFinish):
+            raise TypeError("prepared finish must be a PreparedSessionFinish")
+        async with self._lock:
+            if (
+                self._prepared_finish is not prepared
+                or self._status is not SessionStatus.FINISHING
+                or self._session_id != prepared.manifest.session_id
+            ):
+                raise RuntimeError("prepared finish is no longer current")
+
+        archive = prepared.archive
+
+        def save_archive() -> None:
+            if archive is None:
+                self.store.save(prepared.manifest, prepared.timeline)
+            else:
+                self.store.save(
+                    prepared.manifest,
+                    prepared.timeline,
+                    scenes=deepcopy(dict(archive.scenes)),
+                    source=archive.source,
+                    source_extension=archive.source_extension,
+                )
+
+        try:
+            await self.run_store_io(
+                save_archive,
+                name=f"replay-save-{prepared.manifest.replay_id}",
+            )
+        except BaseException:
+            await self.fail_finish(prepared)
+            raise
+        return prepared.summary
+
+    async def finalize_finish(
+        self, prepared: PreparedSessionFinish
+    ) -> ReplaySummary:
+        async with self._lock:
+            if (
+                self._prepared_finish is not prepared
+                or self._status is not SessionStatus.FINISHING
+                or self._session_id != prepared.manifest.session_id
+            ):
+                raise RuntimeError("prepared finish is no longer current")
             self._reset_idle()
-            return summary
+            return prepared.summary
+
+    async def fail_finish(self, prepared: PreparedSessionFinish) -> None:
+        async with self._lock:
+            if self._prepared_finish is not prepared:
+                return
+            self._prepared_finish = None
+            if self._mode in _LIVE_MODES and self._status is SessionStatus.FINISHING:
+                self._set_status(SessionStatus.PAUSED)
+            self._finish_terminal.set()
+
+    async def finish(self) -> ReplaySummary:
+        prepared = await self.prepare_finish()
+
+        async def persist_and_finalize() -> ReplaySummary:
+            await self.persist_finish(prepared)
+            return await self.finalize_finish(prepared)
+
+        return await self._await_lifecycle_completion(
+            persist_and_finalize(), name="timeline-finish-lifecycle"
+        )
 
     async def on_disconnect(self) -> SessionState:
         async with self._lock:
+            # Invalidate a bundle prepared outside the lock even when there is
+            # no active session for disconnect to tear down.
+            self._routing_generation += 1
+            if self._prepared_finish is not None:
+                return self.to_state()
             if self._mode == "novel":
                 await self._abort_live_locked("disconnect")
                 return self.to_state()
@@ -840,25 +994,68 @@ class SessionController:
             await self._pause_live_locked("disconnect")
             return self.to_state()
 
-    async def start_replay(
+    async def prepare_replay(
         self, replay_id: str, *, cursor: int = 0
-    ) -> SessionState:
+    ) -> PreparedReplay:
+        if isinstance(cursor, bool) or not isinstance(cursor, int):
+            raise ValueError("cursor is outside the recorded cycle range")
         async with self._lock:
             if self._status is not SessionStatus.IDLE:
                 raise RuntimeError("a timeline session is already active")
             self._require_estop_inactive()
+            routing_generation = self._routing_generation
+
+        def load_and_prepare() -> tuple[
+            ReplayBundle, RecordedCyclePlayer, bool
+        ]:
             bundle = self.store.load(replay_id)
+            if not isinstance(bundle, ReplayBundle):
+                raise TypeError("replay store returned an invalid bundle")
+            playback_bundle = ReplayBundle(
+                manifest=bundle.manifest,
+                timeline=bundle.timeline,
+            )
             player = self._player_factory(
                 executor=self.game_loop,
                 clock=self._clock,
                 sleeper=self._sleeper,
             )
+            if not isinstance(player, RecordedCyclePlayer):
+                raise TypeError("replay player factory returned an invalid player")
+            player.load(playback_bundle)
+            player.validate_cursor(cursor)
+            identity_adjusted = not self._provenance_matches(
+                bundle.manifest, self._current_manifest_metadata()
+            )
+            return playback_bundle, player, identity_adjusted
+
+        bundle, player, identity_adjusted = await self.run_store_io(
+            load_and_prepare,
+            name=f"replay-prepare-{replay_id}",
+        )
+        return PreparedReplay(
+            bundle=bundle,
+            player=player,
+            cursor=cursor,
+            routing_generation=routing_generation,
+            identity_adjusted=identity_adjusted,
+        )
+
+    async def start_prepared_replay(
+        self, prepared: PreparedReplay
+    ) -> SessionState:
+        if not isinstance(prepared, PreparedReplay):
+            raise TypeError("prepared replay must be a PreparedReplay")
+        async with self._lock:
+            if self._status is not SessionStatus.IDLE:
+                raise RuntimeError("a timeline session is already active")
+            self._require_estop_inactive()
+            if self._routing_generation != prepared.routing_generation:
+                raise RuntimeError("timeline state changed while replay was loading")
+            bundle = prepared.bundle
+            cursor = prepared.cursor
+            player = prepared.player
             try:
-                player.load(bundle)
-                player.validate_cursor(cursor)
-                identity_adjusted = not self._provenance_matches(
-                    bundle.manifest, self._current_manifest_metadata()
-                )
                 self._set_player_output_generations(player)
                 self._player = player
                 self._mode = "replay"
@@ -873,14 +1070,25 @@ class SessionController:
             except Exception:
                 self._reset_idle()
                 raise
-            self._replay_identity_adjusted = identity_adjusted
+            self._replay_identity_adjusted = prepared.identity_adjusted
             self._start_player_watcher_locked(player)
             return self.to_state()
+
+    async def start_replay(
+        self, replay_id: str, *, cursor: int = 0
+    ) -> SessionState:
+        prepared = await self.prepare_replay(replay_id, cursor=cursor)
+        return await self.start_prepared_replay(prepared)
 
     async def stop(self) -> SessionState:
         """Abnormally stop active work without creating replay history."""
         async with self._lock:
+            # stop/estop/shutdown are authoritative state changes even while
+            # idle, so a bundle prepared before them can never activate later.
+            self._routing_generation += 1
             if self._status is SessionStatus.IDLE:
+                return self.to_state()
+            if self._prepared_finish is not None:
                 return self.to_state()
             if self._mode == "replay":
                 self._require_output_clear(_CHANNELS)
@@ -1472,6 +1680,8 @@ class SessionController:
         self._planned_task = None
         self._archive = None
         self._planned_resume_directives = {}
+        self._prepared_finish = None
+        self._finish_terminal.set()
         self._runner_executor.clear_owner_generations()
 
     def _set_status(self, status: SessionStatus) -> None:
