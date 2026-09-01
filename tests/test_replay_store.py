@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+from copy import deepcopy
 import tempfile
 import unittest
 import warnings
@@ -71,14 +72,45 @@ def rewrite_member_metadata(
 
 class ReplayStoreTests(unittest.TestCase):
     @staticmethod
+    def novel_scenes() -> dict[str, object]:
+        source_hash = "a" * 64
+        chapter_id = f"ch-{source_hash}-0001"
+        return {
+            "schema_version": 1,
+            "source_hash": source_hash,
+            "text_length": 10,
+            "chapters": [
+                {
+                    "id": chapter_id,
+                    "index": 0,
+                    "start_offset": 0,
+                    "end_offset": 10,
+                    "title": "第一章",
+                    "summary": "完整章节。",
+                    "scenes": [
+                        {
+                            "id": f"{chapter_id}-sc-0001",
+                            "index": 0,
+                            "start_offset": 0,
+                            "end_offset": 10,
+                            "summary": "第一场。",
+                            "pace": 1.0,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    @staticmethod
     def novel_metadata() -> dict[str, str]:
+        source_hash = "a" * 64
         return {
             "analysis_version": "faithful-offline-v1",
-            "chapter_id": "chapter-1",
+            "chapter_id": f"ch-{source_hash}-0001",
             "content_type": "novel",
             "dlc_version": "dlc-v1",
             "source_encoding": "utf-8",
-            "source_text_hash": "a" * 64,
+            "source_text_hash": source_hash,
             "speed": "standard",
         }
 
@@ -360,7 +392,7 @@ class ReplayStoreTests(unittest.TestCase):
                 dlc_version="dlc-v1",
                 metadata=self.novel_metadata(),
             )
-            scenes = {"schema_version": 1, "source_hash": "a" * 64, "chapters": []}
+            scenes = self.novel_scenes()
 
             for missing in ("source", "scenes"):
                 kwargs = {
@@ -397,7 +429,7 @@ class ReplayStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = ReplayStore(Path(tmp))
             bundle = make_replay_bundle(gap_tenths=[], status="completed")
-            scenes = {"schema_version": 1, "source_hash": "a" * 64, "chapters": []}
+            scenes = self.novel_scenes()
             invalid_values = (
                 {key: value for key, value in self.novel_metadata().items() if key != "speed"},
                 {**self.novel_metadata(), "speed": "warp"},
@@ -421,6 +453,199 @@ class ReplayStoreTests(unittest.TestCase):
                         source=b"original",
                         source_extension="txt",
                     )
+
+    def test_novel_save_rejects_story_map_schema_and_identity_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+            invalid_scenes: list[tuple[str, dict[str, object]]] = []
+
+            extra_key = deepcopy(self.novel_scenes())
+            extra_key["unexpected"] = True
+            invalid_scenes.append(("extra root key", extra_key))
+
+            invalid_index = deepcopy(self.novel_scenes())
+            invalid_index["chapters"][0]["scenes"][0]["index"] = 1
+            invalid_scenes.append(("non-contiguous scene index", invalid_index))
+
+            invalid_partition = deepcopy(self.novel_scenes())
+            invalid_partition["chapters"][0]["scenes"][0]["start_offset"] = 1
+            invalid_scenes.append(("scene offset gap", invalid_partition))
+
+            invalid_summary = deepcopy(self.novel_scenes())
+            invalid_summary["chapters"][0]["scenes"][0]["summary"] = "\ud800"
+            invalid_scenes.append(("non-UTF-8 summary", invalid_summary))
+
+            invalid_pace = deepcopy(self.novel_scenes())
+            invalid_pace["chapters"][0]["scenes"][0]["pace"] = 4.1
+            invalid_scenes.append(("out-of-range pace", invalid_pace))
+
+            hash_mismatch = deepcopy(self.novel_scenes())
+            hash_mismatch["source_hash"] = "b" * 64
+            invalid_scenes.append(("source text hash mismatch", hash_mismatch))
+
+            non_ascii_hash = "爱" * 64
+            non_ascii_identity = deepcopy(self.novel_scenes())
+            non_ascii_identity["source_hash"] = non_ascii_hash
+            non_ascii_chapter_id = f"ch-{non_ascii_hash}-0001"
+            non_ascii_identity["chapters"][0]["id"] = non_ascii_chapter_id
+            non_ascii_identity["chapters"][0]["scenes"][0]["id"] = (
+                f"{non_ascii_chapter_id}-sc-0001"
+            )
+            invalid_scenes.append(("non-ASCII source identity", non_ascii_identity))
+
+            chapter_mismatch = replace(
+                manifest,
+                metadata={**self.novel_metadata(), "chapter_id": "missing-chapter"},
+            )
+
+            for label, scenes in invalid_scenes:
+                with self.subTest(case=label), self.assertRaises(ReplayStoreError):
+                    store.save(
+                        manifest,
+                        bundle.timeline,
+                        scenes=scenes,
+                        source=b"original",
+                        source_extension="txt",
+                    )
+            with self.subTest(case="chapter mismatch"), self.assertRaises(
+                ReplayStoreError
+            ):
+                store.save(
+                    chapter_mismatch,
+                    bundle.timeline,
+                    scenes=self.novel_scenes(),
+                    source=b"original",
+                    source_extension="txt",
+                )
+
+    def test_load_rejects_checksummed_malicious_novel_story_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+            path = store.save(
+                manifest,
+                bundle.timeline,
+                scenes=self.novel_scenes(),
+                source=b"original",
+                source_extension="txt",
+            )
+            with zipfile.ZipFile(path, "r") as archive:
+                stored_manifest = json.loads(archive.read("manifest.json"))
+            malicious = deepcopy(self.novel_scenes())
+            malicious["chapters"][0]["scenes"][0]["end_offset"] = 9
+            scenes_bytes = json.dumps(
+                malicious, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+            stored_manifest["checksums"]["scenes.json"] = hashlib.sha256(
+                scenes_bytes
+            ).hexdigest()
+            manifest_bytes = json.dumps(
+                stored_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            rewrite_members(
+                path,
+                {"manifest.json": manifest_bytes, "scenes.json": scenes_bytes},
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "scenes"):
+                store.load(manifest.replay_id)
+
+    def test_load_rejects_checksummed_duplicate_novel_story_map_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+            path = store.save(
+                manifest,
+                bundle.timeline,
+                scenes=self.novel_scenes(),
+                source=b"original",
+                source_extension="txt",
+            )
+            with zipfile.ZipFile(path, "r") as archive:
+                stored_manifest = json.loads(archive.read("manifest.json"))
+                scenes_bytes = archive.read("scenes.json")
+            duplicate_key_bytes = scenes_bytes.replace(
+                b'"pace":1.0', b'"pace":4.0,"pace":1.0'
+            )
+            self.assertNotEqual(duplicate_key_bytes, scenes_bytes)
+            stored_manifest["checksums"]["scenes.json"] = hashlib.sha256(
+                duplicate_key_bytes
+            ).hexdigest()
+            manifest_bytes = json.dumps(
+                stored_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            rewrite_members(
+                path,
+                {
+                    "manifest.json": manifest_bytes,
+                    "scenes.json": duplicate_key_bytes,
+                },
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "scenes"):
+                store.load(manifest.replay_id)
+
+    def test_load_normalizes_recursive_novel_story_map_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+            path = store.save(
+                manifest,
+                bundle.timeline,
+                scenes=self.novel_scenes(),
+                source=b"original",
+                source_extension="txt",
+            )
+            with zipfile.ZipFile(path, "r") as archive:
+                stored_manifest = json.loads(archive.read("manifest.json"))
+            recursive_bytes = b"[" * 5_000 + b"0" + b"]" * 5_000
+            stored_manifest["checksums"]["scenes.json"] = hashlib.sha256(
+                recursive_bytes
+            ).hexdigest()
+            manifest_bytes = json.dumps(
+                stored_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            rewrite_members(
+                path,
+                {"manifest.json": manifest_bytes, "scenes.json": recursive_bytes},
+            )
+
+            with self.assertRaisesRegex(ReplayStoreError, "scenes"):
+                store.load(manifest.replay_id)
 
     def test_rejects_conflicting_duplicate_cycle_records(self):
         with tempfile.TemporaryDirectory() as tmp:

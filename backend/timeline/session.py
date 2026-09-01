@@ -1195,7 +1195,10 @@ class SessionController:
             return
         state = runner.state() if state is None else state
         if state.disconnected:
-            await self._pause_live_locked("disconnect")
+            if self._mode == "novel":
+                await self._abort_live_locked("disconnect")
+            else:
+                await self._pause_live_locked("disconnect")
             return
         if state.failure is not None:
             try:

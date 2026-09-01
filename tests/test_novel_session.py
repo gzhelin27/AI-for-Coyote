@@ -340,12 +340,222 @@ class NovelSessionControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
 
         await harness.on_disconnect()
-        state = novel.to_state()
 
-        self.assertEqual(state.status, NovelSessionStatus.IDLE)
         self.assertIsNone(novel.plan)
+        state = novel.to_state()
+        self.assertEqual(state.status, NovelSessionStatus.IDLE)
         self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
         self.assertEqual(harness.store.list(), [])
+
+    async def test_cancelled_start_reconciles_to_the_started_physical_session(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        original_start = harness.controller.start_planned
+
+        async def start_then_cancel(**kwargs):
+            await original_start(**kwargs)
+            raise asyncio.CancelledError
+
+        with patch.object(harness.controller, "start_planned", start_then_cancel):
+            with self.assertRaises(asyncio.CancelledError):
+                await novel.start(plan, story, story_map)
+
+        self.assertEqual(harness.to_state().status, SessionStatus.RUNNING)
+        self.assertEqual(harness.to_state().mode, "novel")
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.RUNNING)
+        self.assertIs(novel.plan, plan)
+
+    async def test_cancelled_pause_reconciles_to_paused_and_retains_plan(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        original_pause = harness.controller.pause
+
+        async def pause_then_cancel():
+            await original_pause()
+            raise asyncio.CancelledError
+
+        with patch.object(harness.controller, "pause", pause_then_cancel):
+            with self.assertRaises(asyncio.CancelledError):
+                await novel.pause()
+
+        self.assertEqual(harness.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.PAUSED)
+        self.assertIs(novel.plan, plan)
+
+    async def test_estop_rejected_resume_stays_paused_and_can_retry(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await novel.pause()
+        harness.game_loop.safety.estop_active = True
+
+        with self.assertRaisesRegex(RuntimeError, "emergency stop"):
+            await novel.resume(from_="current")
+
+        self.assertEqual(harness.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.PAUSED)
+        self.assertIs(novel.plan, plan)
+
+        harness.game_loop.safety.estop_active = False
+        resumed = await novel.resume(from_="current")
+
+        self.assertEqual(resumed.status, NovelSessionStatus.RUNNING)
+        self.assertIs(novel.plan, plan)
+
+    async def test_cancelled_resume_reconciles_to_the_resumed_physical_session(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await novel.pause()
+        original_resume = harness.controller.resume_planned
+
+        async def resume_then_cancel(cursor):
+            await original_resume(cursor)
+            raise asyncio.CancelledError
+
+        with patch.object(
+            harness.controller, "resume_planned", resume_then_cancel
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await novel.resume(from_="current")
+
+        self.assertEqual(harness.to_state().status, SessionStatus.RUNNING)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.RUNNING)
+        self.assertIs(novel.plan, plan)
+
+    async def test_clear_failure_reconciles_finishing_until_authoritative_stop(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        harness.game_loop.clear_failures_remaining = 1
+
+        with self.assertRaisesRegex(RuntimeError, "clear"):
+            await novel.pause()
+
+        self.assertEqual(harness.to_state().status, SessionStatus.FINISHING)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.FINISHING)
+        self.assertIs(novel.plan, plan)
+
+        await harness.stop()
+
+        self.assertIsNone(novel.plan)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.IDLE)
+
+    async def test_cancelled_finish_reconciles_to_idle_without_swallowing_cancel(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        original_finish = harness.controller.finish
+
+        async def finish_then_cancel():
+            await original_finish()
+            raise asyncio.CancelledError
+
+        with patch.object(harness.controller, "finish", finish_then_cancel):
+            with self.assertRaises(asyncio.CancelledError):
+                await novel.finish()
+
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.IDLE)
+        self.assertIsNone(novel.plan)
+        self.assertEqual(len(harness.store.list()), 1)
+
+    async def test_cancelled_abort_and_disconnect_reconcile_to_idle(self):
+        for operation in ("abort", "on_disconnect"):
+            with self.subTest(operation=operation):
+                harness, novel, story, story_map, plan = self.make_controller()
+                self.addAsyncCleanup(harness.close)
+                await novel.start(plan, story, story_map)
+                physical_method_name = (
+                    "stop" if operation == "abort" else "on_disconnect"
+                )
+                original_transition = getattr(
+                    harness.controller, physical_method_name
+                )
+
+                async def transition_then_cancel():
+                    await original_transition()
+                    raise asyncio.CancelledError
+
+                with patch.object(
+                    harness.controller,
+                    physical_method_name,
+                    transition_then_cancel,
+                ):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await getattr(novel, operation)()
+
+                self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+                self.assertEqual(novel.to_state().status, NovelSessionStatus.IDLE)
+                self.assertIsNone(novel.plan)
+                self.assertEqual(harness.store.list(), [])
+
+    async def test_authoritative_replacement_session_discards_retained_novel_plan(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await novel.pause()
+        await harness.stop()
+        await harness.start_live()
+
+        state = novel.to_state()
+
+        self.assertEqual(harness.to_state().mode, "autopilot")
+        self.assertEqual(state.status, NovelSessionStatus.IDLE)
+        self.assertIsNone(novel.plan)
+
+    async def test_runner_detected_disconnect_aborts_novel_without_archive_or_tasks(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        harness.game_loop.disconnect_on_cycle = 1
+
+        await novel.start(plan, story, story_map)
+        for _ in range(100):
+            if harness.to_state().status is SessionStatus.IDLE:
+                break
+            await asyncio.sleep(0)
+
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.IDLE)
+        self.assertIsNone(novel.plan)
+        self.assertEqual(harness.store.list(), [])
+        self.assertEqual(harness.clear_calls, [None])
+        self.assertEqual(harness.runners, {})
+        self.assertEqual(harness.controller._runner_watchers, {})
+        self.assertIsNone(harness.controller._planned_task)
+
+    async def test_runner_and_explicit_disconnect_converge_on_one_idle_abort(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        harness.game_loop.disconnect_on_cycle = 1
+        original_clear = harness.game_loop.clear_output
+        clear_entered = asyncio.Event()
+        release_clear = asyncio.Event()
+
+        async def block_first_global_clear(channel=None):
+            result = await original_clear(channel)
+            if channel is None and not clear_entered.is_set():
+                clear_entered.set()
+                await release_clear.wait()
+            return result
+
+        harness.game_loop.clear_output = block_first_global_clear
+        await novel.start(plan, story, story_map)
+        await asyncio.wait_for(clear_entered.wait(), timeout=0.2)
+        explicit_disconnect = asyncio.create_task(novel.on_disconnect())
+        await asyncio.sleep(0)
+        release_clear.set()
+        state = await explicit_disconnect
+
+        self.assertEqual(state.status, NovelSessionStatus.IDLE)
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+        self.assertIsNone(novel.plan)
+        self.assertEqual(harness.store.list(), [])
+        self.assertEqual(harness.clear_calls, [None])
+        self.assertEqual(harness.runners, {})
+        self.assertEqual(harness.controller._runner_watchers, {})
+        self.assertIsNone(harness.controller._planned_task)
 
     async def test_exact_replay_never_calls_the_chapter_planner_or_resolver(self):
         harness, novel, story, story_map, plan = self.make_controller()

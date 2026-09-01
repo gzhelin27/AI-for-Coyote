@@ -189,13 +189,16 @@ class ReplayStore:
                 raise ReplayStoreError("replay source must be bytes")
             if source_extension not in _SOURCE_EXTENSIONS:
                 raise ReplayStoreError("replay source extension is not allowed")
-        if scenes is not None:
-            _validate_scenes(scenes)
         _validate_novel_archive(
             manifest,
             has_scenes=scenes is not None,
             source_extension=source_extension,
         )
+        if scenes is not None:
+            if _claims_novel(manifest):
+                _validate_novel_story_map(manifest, scenes)
+            else:
+                _validate_scenes(scenes)
 
         timeline_bytes = _json_bytes(timeline.to_dict())
         payloads = {"timeline.json": timeline_bytes}
@@ -400,9 +403,26 @@ class ReplayStore:
         scenes = None
         if "scenes.json" in payloads:
             try:
-                scenes = json.loads(payloads["scenes.json"])
-                _validate_scenes(scenes)
-            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                strict_novel_scenes = _claims_novel(manifest)
+                scenes = json.loads(
+                    payloads["scenes.json"],
+                    object_pairs_hook=(
+                        _reject_duplicate_object_keys
+                        if strict_novel_scenes
+                        else None
+                    ),
+                )
+                if strict_novel_scenes:
+                    _validate_novel_story_map(manifest, scenes)
+                else:
+                    _validate_scenes(scenes)
+            except (
+                RecursionError,
+                TypeError,
+                ValueError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ) as exc:
                 raise ReplayStoreError("replay scenes have invalid schema") from exc
 
         source_name = source_names[0] if source_names else None
@@ -537,6 +557,52 @@ def _validate_scenes(scenes: object) -> None:
         raise ReplayStoreError("replay scenes have invalid schema")
 
 
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _claims_novel(manifest: ReplayManifest) -> bool:
+    metadata = manifest.metadata
+    return manifest.mode == "novel" or (
+        isinstance(metadata, dict) and metadata.get("content_type") == "novel"
+    )
+
+
+def _validate_novel_story_map(
+    manifest: ReplayManifest, scenes: object
+) -> None:
+    # This runtime-local boundary avoids importing story.session back through
+    # backend.story while timeline modules are being initialized.
+    from backend.story.story_map_codec import (
+        StoryMapCodecError,
+        decode_story_map,
+    )
+
+    metadata = manifest.metadata
+    if not isinstance(metadata, dict):
+        raise ReplayStoreError("novel replay metadata is invalid")
+    try:
+        story_map = decode_story_map(scenes, schema_version=SCHEMA_VERSION)
+    except StoryMapCodecError as exc:
+        raise ReplayStoreError("novel replay scenes have invalid schema") from exc
+    if not hmac.compare_digest(
+        story_map.source_hash.encode("utf-8"),
+        metadata["source_text_hash"].encode("ascii"),
+    ):
+        raise ReplayStoreError("novel replay scenes source hash mismatch")
+    if sum(
+        chapter.id == metadata["chapter_id"] for chapter in story_map.chapters
+    ) != 1:
+        raise ReplayStoreError("novel replay scenes chapter mismatch")
+
+
 def _validate_novel_archive(
     manifest: ReplayManifest,
     *,
@@ -544,10 +610,7 @@ def _validate_novel_archive(
     source_extension: str | None,
 ) -> None:
     metadata = manifest.metadata
-    claims_novel = manifest.mode == "novel" or (
-        isinstance(metadata, dict) and metadata.get("content_type") == "novel"
-    )
-    if not claims_novel:
+    if not _claims_novel(manifest):
         return
     if manifest.mode != "novel" or not isinstance(metadata, dict):
         raise ReplayStoreError("novel replay metadata is invalid")
