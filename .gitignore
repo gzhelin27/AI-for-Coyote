@@ -7,6 +7,7 @@ build_release/
 
 # ============ 运行产物 ============
 logs/
+data/
 *.log
 # 本地/测试环境版本标记（打包版由构建脚本写入自己目录的 version.txt）
 version.txt

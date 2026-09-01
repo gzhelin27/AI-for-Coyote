@@ -52,6 +52,86 @@ class SafetyTargetTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(cmd["value"], 5)
 
+    def test_app_user_overheat_and_absolute_caps_use_strictest_limit(self):
+        safety = make_safety(cap=100)
+        safety.set_user_cap("A", 60)
+        safety.update_device_policy(
+            {
+                "channelA": {
+                    "comfortLimit": {"comfortMax": 50, "absoluteMax": 40}
+                }
+            }
+        )
+
+        self.assertEqual(safety.cap_for("A"), 40)
+
+        safety.overheat["A"] = True
+        self.assertEqual(safety.cap_for("A"), 20)
+
+        safety.set_user_cap("A", 5)
+        self.assertEqual(safety.cap_for("A"), 5)
+
+    def test_missing_absolute_policy_does_not_relax_last_absolute_cap(self):
+        safety = make_safety(cap=100)
+        safety.update_device_policy(
+            {
+                "channelA": {
+                    "comfortLimit": {"comfortMax": 25, "absoluteMax": 10}
+                }
+            }
+        )
+
+        safety.update_device_policy(
+            {"channelA": {"comfortLimit": {"comfortMax": 50}}}
+        )
+
+        self.assertEqual(safety.app_caps["A"], 10)
+        self.assertEqual(safety.cap_for("A"), 10)
+
+    def test_nonfinite_app_caps_are_ignored_without_losing_overheat(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                safety = make_safety(cap=100)
+
+                safety.update_device_policy(
+                    {
+                        "channelA": {
+                            "comfortLimit": {
+                                "overheat": True,
+                                "comfortMax": value,
+                            }
+                        }
+                    }
+                )
+
+                self.assertTrue(safety.overheat["A"])
+                self.assertIsNone(safety.app_caps["A"])
+                self.assertEqual(safety.cap_for("A"), 20)
+
+    def test_invalid_app_caps_are_ignored_and_large_finite_caps_are_clamped(self):
+        for value in (True, "50", -1):
+            with self.subTest(value=value):
+                safety = make_safety(cap=100)
+                safety.update_device_policy(
+                    {
+                        "channelA": {
+                            "comfortLimit": {"comfortMax": value}
+                        }
+                    }
+                )
+                self.assertIsNone(safety.app_caps["A"])
+
+        safety = make_safety(cap=100)
+        safety.update_device_policy(
+            {
+                "channelA": {
+                    "comfortLimit": {"comfortMax": 10_000}
+                }
+            }
+        )
+        self.assertEqual(safety.app_caps["A"], 100)
+        self.assertEqual(safety.cap_for("A"), 100)
+
 
 if __name__ == "__main__":
     unittest.main()

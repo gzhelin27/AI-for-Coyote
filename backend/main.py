@@ -8,9 +8,13 @@
 """
 import asyncio
 import contextlib
+from copy import deepcopy
+import hashlib
 import io
+import json
 import os
 import re
+import secrets
 import socket
 import sys
 import urllib.parse
@@ -20,7 +24,12 @@ from pathlib import Path
 import httpx
 import qrcode
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 
 from .audio import AudioManager
@@ -36,8 +45,12 @@ from .config import (
 from .game_loop import GameLoop
 from .llm import LLM
 from .logging_utils import setup_logging
+from .provenance import runtime_content_fingerprint
 from .relay_client import RelayClient
-from .safety import SafetyManager
+from .safety import DeviceOutputError, SafetyManager
+from .timeline.models import CycleGapPolicy
+from .timeline.replay_store import ReplayStore, ReplayStoreError, ReplaySummary
+from .timeline.session import SessionController
 
 # 打包（PyInstaller）后以 exe 所在目录为项目根；开发时以仓库根
 if getattr(sys, "frozen", False):
@@ -46,15 +59,84 @@ else:
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
-
-def _app_version() -> str:
-    """版本号：打包时写入 version.txt；源码运行时显示 dev。"""
+def _release_version() -> str:
+    """Return only a safe release label suitable for public display."""
     f = PROJECT_ROOT / "version.txt"
     if f.exists():
         v = f.read_text(encoding="utf-8").strip().lstrip("\ufeff")
-        if v:
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", v)
+            and not re.fullmatch(r"[0-9a-fA-F]{40,64}", v)
+        ):
             return v
-    return "dev"
+    return ""
+
+
+def _bundled_runtime_content_fingerprint() -> str:
+    """Read the build-generated content identity embedded beside this module."""
+    resource_path = Path(__file__).with_name("runtime_fingerprint.json")
+    try:
+        payload = json.loads(resource_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("bundled runtime fingerprint is unavailable") from exc
+    fingerprint = payload.get("content_fingerprint") if isinstance(payload, dict) else None
+    if not isinstance(fingerprint, str) or not re.fullmatch(
+        r"source-sha256:[0-9a-f]{64}", fingerprint
+    ):
+        raise RuntimeError("bundled runtime fingerprint is invalid")
+    return fingerprint
+
+
+def _runtime_content_fingerprint() -> str:
+    """Return loose-source identity or the embedded onefile build identity."""
+    if getattr(sys, "frozen", False):
+        return _bundled_runtime_content_fingerprint()
+    return runtime_content_fingerprint(PROJECT_ROOT)
+
+
+def _app_version() -> str:
+    """Return release identity plus the complete runtime content fingerprint."""
+    content_fingerprint = _runtime_content_fingerprint()
+    release = _release_version()
+    return f"{release}+{content_fingerprint}" if release else content_fingerprint
+
+
+def _public_app_version() -> str:
+    """Keep internal content hashes out of browser-visible application state."""
+    return _release_version() or "development"
+
+
+def _dlc_provenance(
+    cfg: dict, *, waveform_policy: str | None = None
+) -> str:
+    character = cfg.get("character") or {}
+    prompt_file = str(character.get("prompt_file") or "")
+    prompt_path = Path(prompt_file)
+    if prompt_file and not prompt_path.is_absolute():
+        prompt_path = PROJECT_ROOT / prompt_path
+    try:
+        prompt_file_sha256 = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        prompt_file_sha256 = ""
+    identity = {
+        "role": str(character.get("role") or "default"),
+        "profile": str(character.get("profile") or "default"),
+        "dlc": str(
+            character.get("dlc_version") or character.get("name") or "default"
+        ),
+        "prompt": str(character.get("prompt") or ""),
+        "examples": list(character.get("examples") or [])[:8],
+        "prompt_file_sha256": prompt_file_sha256,
+        "waveform_policy": str(
+            waveform_policy
+            if waveform_policy is not None
+            else (cfg.get("timeline") or {}).get("waveform_policy") or ""
+        ),
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def get_lan_ip() -> str:
@@ -90,12 +172,68 @@ def build_pair_url(cfg, lan_ip: str, controller_id: str) -> str:
     )
 
 
+class _ReplayNotFoundError(Exception):
+    pass
+
+
+def _session_payload(controller: SessionController) -> dict:
+    return controller.to_state().to_dict()
+
+
+def _replay_summary_payload(summary: ReplaySummary) -> dict:
+    """Serialize the public replay summary without reflecting future internals."""
+    return {
+        "replay_id": summary.replay_id,
+        "session_id": summary.session_id,
+        "status": summary.status.value,
+        "mode": summary.mode,
+        "created_at": summary.created_at,
+        "completed_at": summary.completed_at,
+        "adjusted": summary.adjusted,
+        "model": summary.model,
+        "dlc_role": summary.dlc_role,
+        "dlc_profile": summary.dlc_profile,
+        "title": summary.title,
+        "cycle_count": summary.cycle_count,
+    }
+
+
+def _timeline_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, _ReplayNotFoundError):
+        return JSONResponse({"error": "replay not found"}, status_code=404)
+    if isinstance(exc, DeviceOutputError):
+        return JSONResponse(
+            {"error": "device output was not confirmed"},
+            status_code=exc.status_code,
+        )
+    if isinstance(exc, RuntimeError):
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if isinstance(exc, (ReplayStoreError, TypeError, ValueError)):
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"error": "timeline request failed"}, status_code=500)
+
+
+def _validated_replay_archive(store: ReplayStore, replay_id: str) -> bytes:
+    """Read one contained archive through its validated opened handle."""
+    store._validate_replay_id(replay_id)
+    archive_path = store._path(replay_id)
+    try:
+        resolved = archive_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise _ReplayNotFoundError from exc
+    root = store.root.resolve()
+    if resolved.parent != root:
+        raise ReplayStoreError("replay archive path is unsafe")
+    return store.read_validated(replay_id)
+
+
 class AppState:
     """共享运行对象 + Web 广播。"""
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         self.logger = setup_logging(cfg["log_dir"], cfg["log"]["level"])
+        self.timeline_transition_lock = asyncio.Lock()
 
         self.safety = SafetyManager(cfg)
         self.relay = RelayClient(
@@ -110,6 +248,21 @@ class AppState:
             cfg, on_text=self.on_audio_text, on_moan=self.on_audio_moan
         )
         self.loop = GameLoop(cfg, self.llm, self.safety, self.relay, self.camera, self.audio)
+        timeline_cfg = cfg["timeline"]
+        replay_root = Path(str(timeline_cfg["replay_dir"]))
+        if not replay_root.is_absolute():
+            replay_root = PROJECT_ROOT / replay_root
+        self.replay_store = ReplayStore(replay_root)
+        self.timeline_session = SessionController(
+            game_loop=self.loop,
+            store=self.replay_store,
+            seed_factory=lambda: secrets.randbits(63),
+            strength_jitter=int(timeline_cfg["strength_jitter"]),
+            cycle_gap_policy=CycleGapPolicy.from_dict(timeline_cfg["cycle_gap"]),
+            waveform_policy=str(timeline_cfg["waveform_policy"]),
+            manifest_metadata_factory=self._timeline_manifest_metadata,
+        )
+        self.loop.timeline_session = self.timeline_session
         self.loop.on_ai_turn = self.broadcast_chat  # AI 主动回合推送到页面聊天区
 
         self.ws_clients: set[WebSocket] = set()
@@ -122,6 +275,27 @@ class AppState:
         self.sensor_switches: dict[str, bool] = {
             "camera": bool(self.cfg["camera"].get("enabled", False)),
             "audio": bool(self.cfg["audio"].get("enabled", False)),
+        }
+
+    def _timeline_manifest_metadata(self) -> dict[str, str]:
+        """Snapshot provenance when a new live session actually begins."""
+        app_fingerprint = _app_version()
+        dlc_fingerprint = _dlc_provenance(
+            self.cfg, waveform_policy=self.timeline_session.waveform_policy
+        )
+        dlc_version = str(
+            self.cfg["character"].get("dlc_version") or dlc_fingerprint
+        )
+        return {
+            "app_commit": app_fingerprint,
+            "model": str(self.cfg["llm"].get("model") or "unconfigured"),
+            "dlc_role": str(self.cfg["character"].get("role") or "default"),
+            "dlc_profile": str(
+                self.cfg["character"].get("profile") or "default"
+            ),
+            "dlc_version": dlc_version,
+            "app_fingerprint": app_fingerprint,
+            "dlc_fingerprint": dlc_fingerprint,
         }
 
     # ---------- 麦克风转写回调 ----------
@@ -149,15 +323,17 @@ class AppState:
             # 取第一台设备的 props/slotState 同步给安全层
             client = self.relay.clients.get(self.relay.first_client_id() or "")
             if client:
-                self.safety.update_device_state(
+                await self.loop.update_device_state(
                     client.get("props"), client.get("slotState")
                 )
         elif event == "client_attached" and not self.auto_opened:
             # 首次配对成功：AI 主动开场（挑逗 + 第一个轻微试探）
             self.auto_opened = True
             asyncio.create_task(self._auto_open_and_broadcast())
-        if event == "client_disconnected" and self.cfg["safety"]["auto_clear_on_disconnect"]:
-            self.loop.on_client_disconnected()
+        if event == "client_disconnected":
+            async with self.timeline_transition_lock:
+                await self.loop.on_client_disconnected()
+                await self.set_sensors(False)
             self.logger.warning("APP 断开，自动清零并停止循环波形")
         await self.broadcast()
 
@@ -208,12 +384,10 @@ class AppState:
         state["character"] = self.cfg["character"]["name"]
         state["config_info"] = {
             "model": self.cfg["llm"]["model"],
-            "character_file": str(self.cfg["character_file"]),
-            "waveforms_file": str(PROJECT_ROOT / "config" / "waveforms.yaml"),
             "title": str(self.cfg["app"].get("title", "郊狼 · AI 驯服师")),
             "profile": str(self.cfg["character"].get("profile") or "调教"),
             "player_nick": str(self.cfg["character"].get("player_nick") or "小柳"),
-            "version": _app_version(),
+            "version": _public_app_version(),
         }
         return state
 
@@ -287,24 +461,80 @@ class AppState:
         # 配置里自动运行开着时，启动真正的循环任务（此前只置状态、不启动任务，
         # 导致重启后「假开真停」：AI 一直不说话）
         if self.loop.autopilot:
-            self.loop.set_autopilot(True)
-        # 自动运行开着也只在「已有浏览器接入」时才启动传感器；
-        # 无浏览器时不占摄像头/麦克风，等页面连上后由 _on_ws_clients_change 再启动
-        if self.loop.autopilot and self.ws_clients:
-            await self.set_sensors(True)
+            async with self.timeline_transition_lock:
+                await self.loop.set_autopilot(True)
+                # 自动运行开着也只在「已有浏览器接入」时才启动传感器；
+                # 无浏览器时不占摄像头/麦克风，等页面连上后由 _on_ws_clients_change 再启动
+                if self.ws_clients:
+                    await self.set_sensors(True)
         self.loop.start_observe_loop()
 
     async def shutdown(self) -> None:
-        # 退出时急停（若配置了断开自动清零）
+        cleanup = asyncio.create_task(
+            self._shutdown_cleanup(), name="app-state-shutdown-cleanup"
+        )
+        caller_cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is None or not current.cancelling():
+                    break
+                caller_cancelled = True
+            except BaseException:
+                break
+        if caller_cancelled:
+            if not cleanup.cancelled():
+                cleanup.exception()
+            raise asyncio.CancelledError
+        return cleanup.result()
+
+    async def _shutdown_cleanup(self) -> None:
+        observe_task = self.loop.observe_task
         self.loop.stop_observe_loop()
-        self.loop.set_autopilot(False)
-        await self.camera.stop()
-        await self.audio.stop()
-        if self.cfg["safety"]["auto_clear_on_disconnect"]:
-            with contextlib.suppress(Exception):
-                await self.loop.estop()
-        for task in self.tasks:
-            task.cancel()
+        primary_error: BaseException | None = None
+        try:
+            async with self.timeline_transition_lock:
+                # Process shutdown is always abnormal lifecycle termination: live
+                # work and replay playback clear output but never create an archive.
+                try:
+                    await self.loop.stop_timeline_session()
+                except BaseException as exc:
+                    primary_error = exc
+                try:
+                    await self.set_sensors(False)
+                except BaseException as exc:
+                    if primary_error is None:
+                        primary_error = exc
+
+                if (
+                    primary_error is not None
+                    or self.cfg["safety"]["auto_clear_on_disconnect"]
+                ):
+                    try:
+                        await self.loop.estop()
+                    except BaseException as exc:
+                        self.logger.exception(
+                            "shutdown estop fallback failed: %s", exc
+                        )
+        finally:
+            background = list(self.tasks)
+            if self.sensor_watch_task is not None:
+                background.append(self.sensor_watch_task)
+                self.sensor_watch_task = None
+            if observe_task is not None:
+                background.append(observe_task)
+            unique_tasks = tuple(dict.fromkeys(background))
+            for task in unique_tasks:
+                if task is not asyncio.current_task() and not task.done():
+                    task.cancel()
+            if unique_tasks:
+                await asyncio.gather(*unique_tasks, return_exceptions=True)
+            self.tasks.clear()
+
+        if primary_error is not None:
+            raise primary_error
 
 
 def make_app() -> FastAPI:
@@ -347,6 +577,132 @@ def make_app() -> FastAPI:
     @app.get("/api/state")
     async def api_state() -> JSONResponse:
         return JSONResponse(state.build_state())
+
+    # ---------- 时间线会话 / 重放 ----------
+    @app.post("/api/session/start")
+    async def api_session_start() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                await state.loop.start_timeline_session()
+                await state.set_sensors(True)
+                payload = _session_payload(state.timeline_session)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/session/pause")
+    async def api_session_pause() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                session_state = state.timeline_session.to_state()
+                if session_state.mode != "autopilot":
+                    raise RuntimeError("no live session to pause")
+                await state.loop.set_autopilot(False)
+                await state.set_sensors(False)
+                payload = _session_payload(state.timeline_session)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/session/resume")
+    async def api_session_resume(body: dict) -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                await state.loop.resume_timeline_session(body.get("cursor"))
+                await state.set_sensors(True)
+                payload = _session_payload(state.timeline_session)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/session/finish")
+    async def api_session_finish() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                summary = await state.loop.finish_timeline_session()
+                await state.set_sensors(False)
+                payload = _replay_summary_payload(summary)
+        except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.get("/api/replays")
+    async def api_replays() -> JSONResponse:
+        try:
+            summaries = state.replay_store.list()
+        except ReplayStoreError as exc:
+            return _timeline_error_response(exc)
+        return JSONResponse([_replay_summary_payload(item) for item in summaries])
+
+    @app.post("/api/replays/playback/pause")
+    async def api_replay_pause() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                await state.loop.pause_replay_session()
+                payload = _session_payload(state.timeline_session)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/replays/playback/resume")
+    async def api_replay_resume() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                await state.loop.resume_replay_session()
+                payload = _session_payload(state.timeline_session)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/replays/playback/stop")
+    async def api_replay_stop() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                if state.timeline_session.to_state().mode != "replay":
+                    raise RuntimeError("no replay playback to stop")
+                await state.loop.stop_timeline_session()
+                payload = _session_payload(state.timeline_session)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/replays/{replay_id}/play")
+    async def api_replay_play(replay_id: str, body: dict) -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                session_state = await state.loop.start_replay_session(
+                    replay_id, body.get("cursor", 0)
+                )
+                payload = session_state.to_dict()
+        except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.get("/api/replays/{replay_id}/download")
+    async def api_replay_download(replay_id: str) -> Response:
+        try:
+            archive_bytes = _validated_replay_archive(
+                state.replay_store, replay_id
+            )
+        except (_ReplayNotFoundError, ReplayStoreError) as exc:
+            return _timeline_error_response(exc)
+        return Response(
+            content=archive_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{replay_id}.coyote-replay"'
+                )
+            },
+        )
 
     @app.get("/api/qrcode.png")
     async def api_qrcode() -> Response:
@@ -405,13 +761,20 @@ def make_app() -> FastAPI:
 
     @app.post("/api/estop")
     async def api_estop() -> JSONResponse:
+        # Physical e-stop happens before waiting for API transition bookkeeping.
         result = await state.loop.estop()
+        async with state.timeline_transition_lock:
+            await state.set_sensors(False)
         await state.broadcast()
         return JSONResponse(result)
 
     @app.post("/api/resume")
     async def api_resume() -> JSONResponse:
-        result = await state.loop.resume()
+        try:
+            async with state.timeline_transition_lock:
+                result = await state.loop.resume()
+        except (DeviceOutputError, RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
         await state.broadcast()
         return JSONResponse(result)
 
@@ -420,7 +783,14 @@ def make_app() -> FastAPI:
         """手动控制：与 AI 指令走完全相同的安全链路。"""
         if not isinstance(body, dict) or "op" not in body:
             return JSONResponse({"error": "缺少 op"}, status_code=400)
-        executed, dropped = await state.loop.execute_actions([body])
+        try:
+            async with state.timeline_transition_lock:
+                was_active = state.timeline_session.to_state().status.value != "idle"
+                executed, dropped = await state.loop.execute_manual_action(body)
+                if was_active:
+                    await state.set_sensors(False)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
         await state.broadcast()
         return JSONResponse({"executed": executed, "dropped": dropped})
 
@@ -441,11 +811,21 @@ def make_app() -> FastAPI:
         if ch not in ("A", "B"):
             return JSONResponse({"error": "channel 只能是 A 或 B"}, status_code=400)
         enabled = bool(body.get("enabled"))
-        state.safety.set_channel_enabled(ch, enabled)
         try:
-            save_device_channels(cfg, {ch: {"enabled": enabled}})
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            async with state.timeline_transition_lock:
+                result = await state.loop.set_channel_enabled(ch, enabled)
+                save_device_channels(cfg, {ch: {"enabled": enabled}})
+        except DeviceOutputError as exc:
+            return JSONResponse(
+                {"error": "通道物理清除失败"}, status_code=exc.status_code
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        if result["dropped"]:
+            return JSONResponse(
+                {"error": "通道物理清除失败"},
+                status_code=503,
+            )
         await state.broadcast()
         return JSONResponse({"ok": True, "enabled_channels": state.safety.enabled})
 
@@ -468,7 +848,19 @@ def make_app() -> FastAPI:
     @app.post("/api/history/clear")
     async def api_history_clear(body: dict) -> JSONResponse:
         """清空对话历史（模型上下文 + 页面记录由前端同步清）。"""
-        state.loop.clear_history()
+        try:
+            async with state.timeline_transition_lock:
+                session_state = state.timeline_session.to_state()
+                if (
+                    session_state.mode == "autopilot"
+                    and session_state.status.value != "idle"
+                ):
+                    await state.loop.finish_timeline_session()
+                    await state.set_sensors(False)
+                state.loop.clear_history()
+        except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        await state.broadcast()
         return JSONResponse({"ok": True})
 
     @app.post("/api/layout")
@@ -495,11 +887,20 @@ def make_app() -> FastAPI:
             value = int(body.get("value", 100))
         except (TypeError, ValueError):
             return JSONResponse({"error": "value 必须是整数"}, status_code=400)
-        v = state.safety.set_user_cap(ch, value)
-        # 上限低于当前强度时，立即把设备强度降下来
-        if state.safety.current[ch] > v:
-            await state.loop.execute_actions(
-                [{"op": "hold_strength", "channel": ch, "value": v}]
+        try:
+            async with state.timeline_transition_lock:
+                result = await state.loop.set_runtime_cap(ch, value)
+        except DeviceOutputError as exc:
+            return JSONResponse(
+                {"error": "运行时上限物理降档失败"},
+                status_code=exc.status_code,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
+        if result["dropped"]:
+            return JSONResponse(
+                {"error": "运行时上限物理降档失败"},
+                status_code=503,
             )
         await state.broadcast()
         return JSONResponse(
@@ -513,34 +914,64 @@ def make_app() -> FastAPI:
     @app.post("/api/character/profile")
     async def api_character_profile(body: dict) -> JSONResponse:
         """切换角色/风格：{role: "触手", profile: "调教"}，保存并热加载；目标 DLC 未安装时拒绝。"""
-        role = str(body.get("role") or "").strip()
-        profile = str(body.get("profile") or "").strip()
-        # 以文件当前状态为准：先热加载再校验，避免陈旧内存配置放行未安装的 DLC
-        reload_character(cfg)
-        roles = {r["name"]: r for r in (cfg["character"].get("roles") or [])}
-        if not role:
-            role = str(cfg["character"].get("role") or "")
-        if role not in roles:
-            return JSONResponse({"error": f"未知角色，可用：{list(roles)}"}, status_code=400)
-        rmeta = roles[role]
-        avail = {p["name"]: p["available"] for p in rmeta["profiles"]}
-        if not profile:
-            profile = avail and next(iter(avail))
-        if profile not in avail:
-            return JSONResponse({"error": f"未知风格版本，可用：{list(avail)}"}, status_code=400)
-        if not avail.get(profile, True):
-            return JSONResponse(
-                {
-                    "error": f"「{rmeta['label']}·{profile}」的 DLC 未安装：请先在「角色设置」导入对应 DLC 包。",
-                    "detail": "dlc_missing",
-                },
-                status_code=400,
-            )
-        save_character_runtime(cfg, role=role, profile=profile)
+        requested_role = str(body.get("role") or "").strip()
+        requested_profile = str(body.get("profile") or "").strip()
+        try:
+            async with state.timeline_transition_lock:
+                candidate_cfg = deepcopy(cfg)
+                reload_character(candidate_cfg)
+                roles = {
+                    item["name"]: item
+                    for item in (
+                        candidate_cfg["character"].get("roles") or []
+                    )
+                }
+                role = requested_role or str(
+                    candidate_cfg["character"].get("role") or ""
+                )
+                if role not in roles:
+                    return JSONResponse(
+                        {"error": f"未知角色，可用：{list(roles)}"},
+                        status_code=400,
+                    )
+                profiles = {
+                    item["name"]: item["available"]
+                    for item in roles[role]["profiles"]
+                }
+                profile = requested_profile or next(iter(profiles), "")
+                if profile not in profiles:
+                    return JSONResponse(
+                        {"error": f"未知风格版本，可用：{list(profiles)}"},
+                        status_code=400,
+                    )
+                if not profiles.get(profile, True):
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"「{roles[role]['label']}·{profile}」的 DLC 未安装："
+                                "请先在「角色设置」导入对应 DLC 包。"
+                            ),
+                            "detail": "dlc_missing",
+                        },
+                        status_code=400,
+                    )
+                session_state = state.timeline_session.to_state()
+                if (
+                    session_state.mode == "autopilot"
+                    and session_state.status.value != "idle"
+                ):
+                    await state.loop.finish_timeline_session()
+                    await state.set_sensors(False)
+                save_character_runtime(cfg, role=role, profile=profile)
+                payload = {
+                    "ok": True,
+                    "role": cfg["character"]["role"],
+                    "profile": cfg["character"]["profile"],
+                }
+        except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
         await state.broadcast()
-        return JSONResponse(
-            {"ok": True, "role": cfg["character"]["role"], "profile": cfg["character"]["profile"]}
-        )
+        return JSONResponse(payload)
 
     @app.post("/api/character/nick")
     async def api_character_nick(body: dict) -> JSONResponse:
@@ -704,10 +1135,18 @@ def make_app() -> FastAPI:
     async def api_autopilot(body: dict) -> JSONResponse:
         """自动运行开关：{enabled: true/false}。AI 自主观察、调整设备并发言；摄像头/麦克风跟随启停。"""
         enabled = bool(body.get("enabled"))
-        state.loop.set_autopilot(enabled)
-        await state.set_sensors(enabled)
+        try:
+            async with state.timeline_transition_lock:
+                await state.loop.set_autopilot(enabled)
+                await state.set_sensors(enabled)
+                payload = {
+                    "ok": True,
+                    "autopilot": bool(state.loop.autopilot),
+                }
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return _timeline_error_response(exc)
         await state.broadcast()
-        return JSONResponse({"ok": True, "autopilot": bool(state.loop.autopilot)})
+        return JSONResponse(payload)
 
     # ---------- AI 模型配置（设置页填写，保存即生效） ----------
     @app.get("/api/settings/llm")

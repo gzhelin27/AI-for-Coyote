@@ -1,6 +1,6 @@
 import { useApp } from "../store";
 
-export type ViewName = "control" | "pair" | "settings";
+export type ViewName = "control" | "history" | "pair" | "settings";
 
 interface Props {
   view: ViewName;
@@ -17,21 +17,22 @@ export default function TopBar({ view, onView }: Props) {
 
   const nav: { key: ViewName; label: string }[] = [
     { key: "control", label: "控制台" },
+    { key: "history", label: "历史" },
     { key: "settings", label: "设置" },
   ];
 
   return (
-    <header className="flex h-[60px] flex-none items-center gap-4 border-b border-line bg-ink2 px-5">
+    <header className="flex h-[60px] flex-none items-center gap-2 border-b border-line bg-ink2 px-3 sm:gap-4 sm:px-5">
       <div className="flex items-center gap-2.5 font-bold tracking-wide">
         <span className="h-2.5 w-2.5 rounded-[3px] bg-accent shadow-[0_0_10px_rgba(247,217,122,0.5)]" />
-        {s?.config_info?.title ?? "郊狼 · AI 驯服师"}
+        <span className="hidden sm:inline">{s?.config_info?.title ?? "郊狼 · AI 驯服师"}</span>
       </div>
       <nav className="flex gap-1">
         {nav.map((n) => (
           <button
             key={n.key}
             onClick={() => onView(n.key)}
-            className={`rounded-lg px-3.5 py-2 text-sm transition-colors ${
+            className={`rounded-lg px-2.5 py-2 text-sm transition-colors sm:px-3.5 ${
               view === n.key ? "bg-ink3 text-accent" : "text-muted hover:bg-ink3 hover:text-text"
             }`}
           >
@@ -40,9 +41,11 @@ export default function TopBar({ view, onView }: Props) {
         ))}
       </nav>
       <div className="flex-1" />
-      <Pill cls={st === "paired" ? "ok" : st === "disconnected" ? "off" : "warn"} text={`中继: ${relayText}`} />
-      <Pill cls={clients ? "ok" : "off"} text={`App: ${clients ? clients + " 台在线" : "未接入"}`} />
-      <Pill cls={s?.estop ? "off" : "ok"} text={`急停: ${s?.estop ? "已触发" : "否"}`} />
+      <div className="hidden items-center gap-2 lg:flex">
+        <Pill cls={st === "paired" ? "ok" : st === "disconnected" ? "off" : "warn"} text={`中继: ${relayText}`} />
+        <Pill cls={clients ? "ok" : "off"} text={`App: ${clients ? clients + " 台在线" : "未接入"}`} />
+        <Pill cls={s?.estop ? "off" : "ok"} text={`急停: ${s?.estop ? "已触发" : "否"}`} />
+      </div>
     </header>
   );
 }

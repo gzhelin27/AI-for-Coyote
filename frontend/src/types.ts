@@ -25,7 +25,7 @@ export interface PresetInfo {
   default_duration_s: number;
   max_duration_s: number;
   category: string;
-  frames: string[];
+  frames?: string[];
 }
 export interface ChannelDevice {
   name: string;
@@ -121,6 +121,7 @@ export interface FullState {
     player_nick: string;
     version: string;
   };
+  timeline: TimelineSessionState;
 }
 
 export interface ExecutedItem {
@@ -147,4 +148,66 @@ export interface NetworkInfo {
   public_url: string;
   relay_port: number;
   hint: string;
+}
+
+// ---------- 时间线会话（前端模型） ----------
+export interface ChannelCycleState {
+  phase: "idle" | "cycle" | "gap" | "paused" | "stopped";
+  pattern: string | null;
+  strength: number;
+  cycleIndex: number;
+  nextCycleAtMs: number | null;
+}
+
+export interface TimelineSessionState {
+  sessionId: string | null;
+  status: "idle" | "running" | "paused" | "finishing" | "replaying";
+  mode: "autopilot" | "replay" | null;
+  cursor: number;
+  adjusted: boolean;
+  channels: { A: ChannelCycleState; B: ChannelCycleState };
+}
+
+/** 后端会话/runner 保持领域原生 snake_case；仅在 api.ts 的边界转换。 */
+export interface BackendSessionState {
+  session_id?: string | null;
+  status?: string;
+  mode?: string | null;
+  cursor?: number;
+  adjusted?: boolean;
+  channels?: Partial<Record<"A" | "B", BackendRunnerState>>;
+}
+
+export interface BackendRunnerState {
+  phase?: string;
+  pattern?: string | null;
+  strength?: number;
+  cycle_index?: number;
+  next_cycle_start_ms?: number | null;
+}
+
+export type BackendFullState = Omit<FullState, "timeline"> & {
+  session?: BackendSessionState;
+  runners?: Partial<Record<"A" | "B", BackendRunnerState>>;
+};
+
+export interface ReplayHistoryItem {
+  replayId: string;
+  title: string;
+  completedAt: string | null;
+  dlc: string;
+  cycleCount: number;
+  status: "completed";
+  exact: boolean;
+}
+
+export interface BackendReplaySummary {
+  replay_id: string;
+  status: string;
+  title: string;
+  cycle_count: number;
+  completed_at?: string | null;
+  dlc_role?: string;
+  dlc_profile?: string;
+  adjusted?: boolean;
 }

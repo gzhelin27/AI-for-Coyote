@@ -7,18 +7,39 @@
 3. 单次波形/临时强度时长不超过配置上限（默认 10s），到点自动归零；
 4. 设备过热时，该通道上限临时降到 overheat_reduce_to；
 5. 急停（estop）：清零全部通道 + 清波形 + 暂停 AI 循环；
-6. op 白名单：temp_strength / add_strength / pulse / clear / stop。
+6. op 白名单：强度、波形（含单周期）、清除和停止操作。
 """
 import logging
+import math
 import time
 
 logger = logging.getLogger("ai-for-coyote.safety")
 
-VALID_OPS = {"temp_strength", "hold_strength", "add_strength", "pulse", "pulse_hold", "clear", "stop"}
+VALID_OPS = {
+    "temp_strength", "hold_strength", "add_strength", "pulse", "pulse_hold",
+    "pulse_cycle", "clear", "stop",
+}
 
 
 class SafetyError(Exception):
     """命令被安全层拒绝。"""
+
+
+class DeviceOutputError(RuntimeError):
+    """A requested safety transition was not confirmed by device transport."""
+
+    def __init__(
+        self,
+        message: str = "device output reconciliation failed",
+        *,
+        status_code: int = 503,
+        detail: str | None = None,
+    ) -> None:
+        if status_code not in (409, 503):
+            raise ValueError("device output status must be 409 or 503")
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
 
 
 class SafetyManager:
@@ -43,6 +64,10 @@ class SafetyManager:
         self.current = {"A": 0, "B": 0}       # 本地跟踪的通道基础强度（跟随设备上报）
         self.requested = {"A": None, "B": None}  # 最近一次请求的强度值（用于对照显示）
         self.app_caps = {"A": None, "B": None}   # App 舒适强度上限（设备实际允许的最大值）
+        self._app_policy_caps = {
+            ch: {"comfortMax": None, "absoluteMax": None}
+            for ch in ("A", "B")
+        }
         self.pulse_until = {"A": 0.0, "B": 0.0}  # 波形播放结束时刻（monotonic）
         self.overheat = {"A": False, "B": False}
         self.enabled = {"A": True, "B": True}    # 通道开关（页面可手动开闭）
@@ -51,6 +76,7 @@ class SafetyManager:
             d = cfg.get("device_channels", {}).get(ch) or {}
             if isinstance(d, dict) and "enabled" in d:
                 self.enabled[ch] = bool(d["enabled"])
+        self.desired_enabled = dict(self.enabled)
         self.estop_active = False             # 急停中（AI 循环暂停）
         self.dry_run = bool(cfg["app"].get("dry_run", True))
 
@@ -65,19 +91,18 @@ class SafetyManager:
 
     def cap_for(self, ch: str) -> int:
         cap = min(self.caps[ch], self.user_caps.get(ch, self.caps[ch]))
+        app_cap = self.app_caps.get(ch)
+        if isinstance(app_cap, int) and not isinstance(app_cap, bool) and app_cap > 0:
+            cap = min(cap, app_cap)
         if self.overheat[ch]:
             return min(cap, self.overheat_reduce_to)
         return cap
 
     def set_user_cap(self, ch: str, value: int) -> int:
-        """设置通道运行时强度上限（1~硬上限），并就地钳制当前/请求值。返回生效值。"""
+        """设置通道运行时强度上限，保留设备跟踪值供物理降档使用。"""
         ch = self.norm_channel(ch)
         v = max(1, min(self.caps[ch], int(value)))
         self.user_caps[ch] = v
-        if self.current[ch] > v:
-            self.current[ch] = v
-        if self.requested[ch] is not None and self.requested[ch] > v:
-            self.requested[ch] = v
         return v
 
     # ---------- 校验入口 ----------
@@ -106,6 +131,8 @@ class SafetyManager:
                 return self._validate_pulse(action)
             if op == "pulse_hold":
                 return self._validate_pulse_hold(action)
+            if op == "pulse_cycle":
+                return self._validate_pulse_cycle(action)
             if op == "clear":
                 return self._validate_clear(action)
             if op == "stop":
@@ -115,13 +142,34 @@ class SafetyManager:
         return False, "未知错误", None
 
     def set_channel_enabled(self, ch: str, on: bool) -> None:
-        """手动开关通道；关闭时清零该通道。"""
+        """Set desired and confirmed state for non-transport initialization."""
+        ch = self.norm_channel(ch)
+        enabled = bool(on)
+        self.desired_enabled[ch] = enabled
+        self.enabled[ch] = enabled
+
+    def request_channel_enabled(self, ch: str, on: bool) -> bool:
+        """Set desired policy without publishing an unconfirmed device state."""
+        ch = self.norm_channel(ch)
+        enabled = bool(on)
+        self.desired_enabled[ch] = enabled
+        return enabled
+
+    def confirm_channel_enabled(self, ch: str, on: bool) -> None:
+        """Publish a channel state only after coordinator confirmation."""
         ch = self.norm_channel(ch)
         self.enabled[ch] = bool(on)
-        if not on:
-            self.current[ch] = 0
-            self.pulse_until[ch] = 0.0
-            self.requested[ch] = None
+
+    def confirm_strength(self, ch: str, value: int) -> None:
+        """Publish transport-confirmed physical strength without changing intent."""
+        ch = self.norm_channel(ch)
+        self.current[ch] = max(0, min(200, int(value)))
+
+    def confirm_clear(self, ch: str) -> None:
+        """Publish a transport-confirmed per-channel clear."""
+        ch = self.norm_channel(ch)
+        self.current[ch] = 0
+        self.pulse_until[ch] = 0.0
 
     def _check_enabled(self, ch: str) -> str | None:
         if not self.enabled.get(ch, True):
@@ -180,15 +228,23 @@ class SafetyManager:
         ch = self.norm_channel(a.get("channel"))
         if (reason := self._check_enabled(ch)):
             raise SafetyError(reason)
-        delta = int(float(a.get("delta", 0)))
-        delta = max(-self.max_step, min(delta, self.max_step))  # 步长钳制
+        requested_delta = int(float(a.get("delta", 0)))
+        requested_delta = max(
+            -self.max_step, min(requested_delta, self.max_step)
+        )  # 步长钳制
         cap = self.cap_for(ch)
-        new_value = max(0, min(self.current[ch] + delta, cap))
+        new_value = max(0, min(self.current[ch] + requested_delta, cap))
         actual_delta = new_value - self.current[ch]
         return (
             True,
             f"{ch} 通道增减 {actual_delta}（当前 {self.current[ch]} -> {new_value}）",
-            {"kind": "add", "channel": ch, "delta": actual_delta, "value": new_value},
+            {
+                "kind": "add",
+                "channel": ch,
+                "delta": actual_delta,
+                "requested_delta": requested_delta,
+                "value": new_value,
+            },
         )
 
     def _preset_meta(self, pattern: str) -> dict:
@@ -244,6 +300,29 @@ class SafetyManager:
             },
         )
 
+    def _validate_pulse_cycle(self, a: dict):
+        """单个原始波形周期：不按预设时长补帧或循环。"""
+        ch = self.norm_channel(a.get("channel"))
+        if (reason := self._check_enabled(ch)):
+            raise SafetyError(reason)
+        pattern = str(a.get("pattern", "")).strip()
+        meta = self._preset_meta(pattern)
+        frames = meta.get("frames")
+        if not isinstance(frames, list) or not frames:
+            raise SafetyError(f"波形 {pattern!r} 没有可播放帧")
+        return (
+            True,
+            f"{ch} 通道波形「{pattern}」({meta['waveform']})，单周期 {len(frames) * 100}ms",
+            {
+                "kind": "pulse_cycle",
+                "channel": ch,
+                "pattern": pattern,
+                "wave_key": meta["waveform"],
+                "frames": frames,
+                "duration_ms": len(frames) * 100,
+            },
+        )
+
     def _validate_clear(self, a: dict):
         ch = None
         if a.get("channel") is not None:
@@ -280,6 +359,8 @@ class SafetyManager:
         elif kind == "pulse_hold" and ch:
             # 持续波形：视为长期播放，直到清除
             self.pulse_until[ch] = time.monotonic() + 24 * 3600
+        elif kind == "pulse_cycle" and ch:
+            self.pulse_until[ch] = time.monotonic() + cmd["duration_ms"] / 1000.0
         elif kind == "zero" and ch:
             # 爆发结束自动归零
             self.current[ch] = 0
@@ -296,36 +377,71 @@ class SafetyManager:
             self.pulse_until = {"A": 0.0, "B": 0.0}
 
     # ---------- 设备状态同步 ----------
+    def update_reported_strength(self, props: dict | None) -> set[str]:
+        """Commit strength values directly confirmed by a device report."""
+        if not isinstance(props, dict):
+            props = {}
+        updated: set[str] = set()
+        now = time.monotonic()
+        for ch, key in (("A", "intensityA"), ("B", "intensityB")):
+            if key not in props or now < self.pulse_until[ch]:
+                continue
+            try:
+                self.current[ch] = int(props[key])
+            except (TypeError, ValueError):
+                continue
+            updated.add(ch)
+        return updated
+
+    def update_device_policy(self, slot_state: dict | None) -> set[str]:
+        """Apply desired overheat/app-cap policy without changing output state."""
+        if not isinstance(slot_state, dict):
+            slot_state = {}
+        changed: set[str] = set()
+        for ch, key in (("A", "channelA"), ("B", "channelB")):
+            ch_state = slot_state.get(key)
+            if not isinstance(ch_state, dict):
+                continue
+            comfort = ch_state.get("comfortLimit")
+            if not isinstance(comfort, dict):
+                continue
+            if isinstance(comfort.get("overheat"), bool):
+                overheat = comfort["overheat"]
+                if self.overheat[ch] != overheat:
+                    changed.add(ch)
+                self.overheat[ch] = overheat
+            # Both values are upper bounds. Preserve the last confirmed bound
+            # when a report omits them or contains malformed values.
+            for field in ("comfortMax", "absoluteMax"):
+                value = comfort.get(field)
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and (not isinstance(value, float) or math.isfinite(value))
+                    and value > 0
+                ):
+                    parsed = max(1, int(min(value, self.caps[ch])))
+                    self._app_policy_caps[ch][field] = parsed
+            confirmed_caps = [
+                value
+                for value in self._app_policy_caps[ch].values()
+                if value is not None
+            ]
+            if confirmed_caps:
+                app_cap = min(confirmed_caps)
+                if self.app_caps[ch] != app_cap:
+                    changed.add(ch)
+                self.app_caps[ch] = app_cap
+        return changed
+
     def update_device_state(self, props: dict | None, slot_state: dict | None) -> None:
         """用设备上报的 props / slotState 同步强度与过热状态。
 
         波形播放期间设备会上报当前帧振幅，因此该通道的强度值被忽略，
         避免页面数值跟着波形帧乱跳。
         """
-        if not isinstance(props, dict):
-            props = {}
-        if not isinstance(slot_state, dict):
-            slot_state = {}
-        now = time.monotonic()
-        try:
-            for ch, key in (("A", "intensityA"), ("B", "intensityB")):
-                if key in props and now >= self.pulse_until[ch]:
-                    self.current[ch] = int(props[key])
-        except (TypeError, ValueError):
-            pass
-        for ch, key in (("A", "channelA"), ("B", "channelB")):
-            ch_state = slot_state.get(key)
-            if isinstance(ch_state, dict):
-                comfort = ch_state.get("comfortLimit")
-                if isinstance(comfort, dict):
-                    if "overheat" in comfort:
-                        self.overheat[ch] = bool(comfort["overheat"])
-                    # App 舒适强度上限：comfortMax 优先，其次 absoluteMax
-                    for field in ("comfortMax", "absoluteMax"):
-                        value = comfort.get(field)
-                        if isinstance(value, (int, float)) and value > 0:
-                            self.app_caps[ch] = int(value)
-                            break
+        self.update_reported_strength(props)
+        self.update_device_policy(slot_state)
 
     def pulse_active(self) -> dict:
         now = time.monotonic()

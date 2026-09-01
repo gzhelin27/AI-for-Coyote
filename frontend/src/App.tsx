@@ -6,13 +6,22 @@ import ChannelControl from "./components/ChannelControl";
 import PresetPanel from "./components/PresetPanel";
 import BottomBar from "./components/BottomBar";
 import ChatPanel from "./components/ChatPanel";
+import ReplayPanel from "./components/ReplayPanel";
 import { PairView, SettingsView } from "./components/views";
-import { api } from "./api";
+import { api, mapFullState } from "./api";
+import type { BackendFullState } from "./types";
 import { useApp, useChat, useLayout } from "./store";
 import { doEstop } from "./commands";
+import { isTimelineStateActive } from "./timelineState";
+import {
+  applyRealtimeState,
+  invalidateStateRefresh,
+  refreshAppState,
+} from "./stateRefresh";
 
 /** 空格长按触发急停的时长（毫秒，与进度条动画同步） */
 const ESTOP_HOLD_MS = 1000;
+const ACTIVE_STATE_POLL_MS = 1000;
 
 export default function App() {
   const [view, setView] = useState<ViewName>("control");
@@ -21,9 +30,12 @@ export default function App() {
   const updateLayout = useLayout((s) => s.updateLayout);
   // 全局缩放：按窗口宽度缩放整页布局（0.8 ~ 1.3 倍）
   const [zoom, setZoom] = useState(1);
+  const [compact, setCompact] = useState(false);
   useEffect(() => {
     const calc = () => {
-      setZoom(Math.min(1.3, Math.max(0.8, window.innerWidth / 1600)));
+      const isCompact = window.innerWidth < 900;
+      setCompact(isCompact);
+      setZoom(isCompact ? 1 : Math.min(1.3, Math.max(0.8, window.innerWidth / 1600)));
       updateLayout(); // 三栏按固定比例随窗口宽度重算
     };
     calc();
@@ -59,17 +71,57 @@ export default function App() {
   };
 
   useEffect(() => {
+    let pollTimer: number | null = null;
+    let polling = false;
+    let closed = false;
+    const clearPollTimer = () => {
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    };
+    const canPoll = () =>
+      !closed &&
+      document.visibilityState === "visible" &&
+      isTimelineStateActive(useApp.getState().state?.timeline);
+    const schedulePoll = () => {
+      clearPollTimer();
+      if (canPoll()) pollTimer = window.setTimeout(pollState, ACTIVE_STATE_POLL_MS);
+    };
+    const refreshState = async () => {
+      const state = await refreshAppState();
+      if (state?.config_info?.title) document.title = state.config_info.title;
+      return state;
+    };
+    const pollState = async () => {
+      pollTimer = null;
+      if (!canPoll()) return;
+      if (polling) {
+        schedulePoll();
+        return;
+      }
+      polling = true;
+      try {
+        await refreshState();
+      } catch {
+        // Polling is passive; transition errors remain visible in their initiating control.
+      } finally {
+        polling = false;
+        schedulePoll();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void pollState();
+      else {
+        clearPollTimer();
+        invalidateStateRefresh();
+      }
+    };
+
     // 初始状态
-    api
-      .state()
-      .then((s) => {
-        useApp.getState().setState(s);
-        if (s.config_info?.title) document.title = s.config_info.title;
-      })
-      .catch(() => {});
+    refreshState().then(schedulePoll).catch(() => {});
     // WebSocket 实时同步
     let ws: WebSocket;
-    let closed = false;
     const connect = () => {
       if (closed) return;
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -77,7 +129,8 @@ export default function App() {
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.type === "state") {
-          useApp.getState().setState(msg.data);
+          applyRealtimeState(mapFullState(msg.data as BackendFullState));
+          schedulePoll();
         } else if (msg.type === "chat") {
           const extra: string[] = [];
           for (const e of msg.executed ?? []) extra.push("▶ " + e.label);
@@ -88,6 +141,7 @@ export default function App() {
       ws.onclose = () => setTimeout(connect, 2000);
     };
     connect();
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // 空格长按 1s 急停（防误触：松手 / 窗口失焦即取消；已急停时不重复触发）
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName ?? "").toUpperCase();
@@ -112,6 +166,9 @@ export default function App() {
     return () => {
       closed = true;
       ws?.close();
+      clearPollTimer();
+      invalidateStateRefresh();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
@@ -122,8 +179,8 @@ export default function App() {
     <div className="flex h-full flex-col" style={{ zoom }}>
       <TopBar view={view} onView={setView} />
       <div
-        className="grid min-h-0 flex-1"
-        style={{ gridTemplateColumns: `${sidebarW}px 1fr ${controlW}px` }}
+        className={`grid min-h-0 flex-1 ${compact ? "grid-cols-1 overflow-y-auto" : ""}`}
+        style={{ gridTemplateColumns: compact ? "minmax(0, 1fr)" : `${sidebarW}px 1fr ${controlW}px` }}
       >
         <Sidebar view={view} onView={setView} />
         <ChatPanel />
@@ -135,8 +192,10 @@ export default function App() {
               </div>
               <ChannelControl />
               <PresetPanel />
+              <ReplayPanel historyOnly={false} />
             </div>
           )}
+          {view === "history" && <ReplayPanel historyOnly />}
           {view === "pair" && <PairView />}
           {view === "settings" && <SettingsView />}
         </main>

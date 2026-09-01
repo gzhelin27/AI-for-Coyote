@@ -1,8 +1,15 @@
 import type {
+  BackendFullState,
+  BackendReplaySummary,
+  BackendRunnerState,
+  BackendSessionState,
+  ChannelCycleState,
   ChatResult,
   FullState,
   ManualResult,
   NetworkInfo,
+  ReplayHistoryItem,
+  TimelineSessionState,
 } from "./types";
 
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
@@ -26,8 +33,87 @@ const json = (body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
+const emptyChannel = () => ({
+  phase: "idle" as const,
+  pattern: null,
+  strength: 0,
+  cycleIndex: 0,
+  nextCycleAtMs: null,
+});
+
+function mapPhase(
+  phase: unknown,
+  status: TimelineSessionState["status"],
+): ChannelCycleState["phase"] {
+  if (phase === "cycle" || phase === "gap" || phase === "idle") return phase;
+  if (phase === "stopped") return status === "paused" ? "paused" : "stopped";
+  return status === "paused" ? "paused" : "idle";
+}
+
+function mapChannel(
+  runner: BackendRunnerState | undefined,
+  status: TimelineSessionState["status"],
+): ChannelCycleState {
+  if (!runner) return { ...emptyChannel(), phase: status === "paused" ? "paused" : "idle" };
+  return {
+    phase: mapPhase(runner.phase, status),
+    pattern: typeof runner.pattern === "string" ? runner.pattern : null,
+    strength: typeof runner.strength === "number" ? runner.strength : 0,
+    cycleIndex: typeof runner.cycle_index === "number" ? runner.cycle_index : 0,
+    nextCycleAtMs:
+      typeof runner.next_cycle_start_ms === "number" ? runner.next_cycle_start_ms : null,
+  };
+}
+
+function mapStatus(status: unknown): TimelineSessionState["status"] {
+  if (status === "running" || status === "paused" || status === "finishing" || status === "replaying") {
+    return status;
+  }
+  return "idle";
+}
+
+/** Translate the backend's domain-native session/runners once, at the frontend boundary. */
+export function mapTimelineState(
+  session: BackendSessionState | undefined,
+  runners?: Partial<Record<"A" | "B", BackendRunnerState>>,
+): TimelineSessionState {
+  const status = mapStatus(session?.status);
+  const mode = session?.mode === "autopilot" || session?.mode === "replay" ? session.mode : null;
+  return {
+    sessionId: typeof session?.session_id === "string" ? session.session_id : null,
+    status,
+    mode,
+    cursor: typeof session?.cursor === "number" ? session.cursor : 0,
+    adjusted: session?.adjusted === true,
+    channels: {
+      A: mapChannel(session?.channels?.A ?? runners?.A, status),
+      B: mapChannel(session?.channels?.B ?? runners?.B, status),
+    },
+  };
+}
+
+export function mapFullState(raw: BackendFullState): FullState {
+  const { session, runners, ...state } = raw;
+  return { ...state, timeline: mapTimelineState(session, runners) };
+}
+
+function mapReplaySummary(raw: BackendReplaySummary): ReplayHistoryItem {
+  if (raw.status !== "completed") throw new Error("回放记录状态无效");
+  const role = typeof raw.dlc_role === "string" ? raw.dlc_role : "未标注 DLC";
+  const profile = typeof raw.dlc_profile === "string" ? raw.dlc_profile : "";
+  return {
+    replayId: raw.replay_id,
+    title: typeof raw.title === "string" && raw.title.trim() ? raw.title : `回放 ${raw.replay_id.slice(0, 8)}`,
+    completedAt: typeof raw.completed_at === "string" ? raw.completed_at : null,
+    dlc: profile ? `${role} · ${profile}` : role,
+    cycleCount: typeof raw.cycle_count === "number" && raw.cycle_count >= 0 ? raw.cycle_count : 0,
+    status: "completed",
+    exact: raw.adjusted !== true,
+  };
+}
+
 export const api = {
-  state: () => j<FullState>("/api/state"),
+  state: () => j<BackendFullState>("/api/state").then(mapFullState),
   chat: (message: string) => j<ChatResult>("/api/chat", json({ message })),
   manual: (action: Record<string, unknown>) =>
     j<ManualResult>("/api/manual", json(action)),
@@ -72,6 +158,24 @@ export const api = {
   },
   setAutopilot: (enabled: boolean) =>
     j<{ ok: boolean }>("/api/autopilot", json({ enabled })),
+  timelineStart: () =>
+    j<BackendSessionState>("/api/session/start", json({})).then((session) => mapTimelineState(session)),
+  timelinePause: () =>
+    j<BackendSessionState>("/api/session/pause", json({})).then((session) => mapTimelineState(session)),
+  timelineResume: () =>
+    j<BackendSessionState>("/api/session/resume", json({})).then((session) => mapTimelineState(session)),
+  timelineFinish: () =>
+    j<BackendReplaySummary>("/api/session/finish", json({})).then(mapReplaySummary),
+  replays: () => j<BackendReplaySummary[]>("/api/replays").then((items) => items.map(mapReplaySummary)),
+  replayPlay: (replayId: string) =>
+    j<BackendSessionState>(`/api/replays/${encodeURIComponent(replayId)}/play`, json({})).then((session) => mapTimelineState(session)),
+  replayPause: () =>
+    j<BackendSessionState>("/api/replays/playback/pause", json({})).then((session) => mapTimelineState(session)),
+  replayResume: () =>
+    j<BackendSessionState>("/api/replays/playback/resume", json({})).then((session) => mapTimelineState(session)),
+  replayStop: () =>
+    j<BackendSessionState>("/api/replays/playback/stop", json({})).then((session) => mapTimelineState(session)),
+  replayDownloadUrl: (replayId: string) => `/api/replays/${encodeURIComponent(replayId)}/download`,
   getLlm: () =>
     j<{
       base_url: string;

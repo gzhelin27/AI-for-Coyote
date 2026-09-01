@@ -28,6 +28,17 @@ llm:
 
 character_file: config/character.yaml    # 角色设定文件（自己写，可随时改）
 
+# ============ Timeline 与回放（项目统一策略，不提供 DLC/UI 覆盖） ============
+timeline:
+  strength_jitter: 4
+  waveform_policy: all_allowed
+  cycle_gap:
+    zero_weight: 40
+    short_weight: 30
+    long_weight: 30
+    frame_ms: 100
+  replay_dir: data/replays
+
 # ============ 安全（任何来源的命令都经过这里钳制） ============
 safety:
   channels:

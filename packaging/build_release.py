@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 # 控制台编码可能不是 UTF-8（如 CI 的 cp1252），强制 UTF-8 输出，避免中文打印崩溃
@@ -27,6 +28,9 @@ CI = "--ci" in sys.argv  # CI 模式：用当前解释器（依赖已装好）�
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build_release"
 PKG = BUILD / f"Coyote-in-Cradle-v{VERSION}"
+sys.path.insert(0, str(ROOT))
+
+from backend.provenance import runtime_content_fingerprint
 
 
 def step(msg: str) -> None:
@@ -104,6 +108,16 @@ GPL-3.0。源码：https://github.com/indhg/AI-for-Coyote
 
 
 def main() -> None:
+    BUILD.mkdir(parents=True, exist_ok=True)
+    runtime_fingerprint_file = BUILD / "runtime_fingerprint.json"
+    runtime_fingerprint_file.write_text(
+        json.dumps(
+            {"content_fingerprint": runtime_content_fingerprint(ROOT)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
     if CI:
         py = Path(sys.executable)
         pyinstaller = None
@@ -170,6 +184,7 @@ def main() -> None:
             "--hidden-import", "uvicorn.lifespan.on",
             "--hidden-import", "multipart",
             "--hidden-import", "multipart.multipart",
+            "--add-data", f"{runtime_fingerprint_file}{os.pathsep}backend",
             str(ROOT / "run_app.py"),
         ]
     )
