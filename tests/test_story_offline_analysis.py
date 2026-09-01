@@ -23,7 +23,7 @@ def _matches_controlled_candidate_open(
     path: object,
     *,
     candidate_path: Path,
-    candidate_root_identity: tuple[int, int],
+    captured_pinned_root_fd: int | None,
     dir_fd: int | None,
 ) -> bool:
     """Identify only the candidate open that the controlled race should swap."""
@@ -33,12 +33,28 @@ def _matches_controlled_candidate_open(
         except TypeError:
             return False
     try:
-        if os.fspath(path) != candidate_path.name:
-            return False
-        root_details = os.fstat(dir_fd)
-    except (OSError, TypeError, ValueError):
+        return (
+            os.fspath(path) == candidate_path.name
+            and captured_pinned_root_fd is not None
+            and dir_fd == captured_pinned_root_fd
+        )
+    except TypeError:
         return False
-    return (root_details.st_dev, root_details.st_ino) == candidate_root_identity
+
+
+def _matches_controlled_candidate_root_open(
+    path: object,
+    *,
+    candidate_directory: Path,
+    dir_fd: int | None,
+) -> bool:
+    """Identify the production call whose returned descriptor pins the root."""
+    if dir_fd is not None:
+        return False
+    try:
+        return Path(path) == candidate_directory
+    except TypeError:
+        return False
 
 
 class CountingAnalysisStore(AnalysisStore):
@@ -174,26 +190,24 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 self.source_path, linked, encoding="utf-8", dlc_version="dlc1-v1"
             )
 
-    def test_controlled_swap_hook_matches_only_posix_basename_in_pinned_root(self):
+    def test_controlled_swap_hook_matches_only_posix_basename_with_exact_pinned_root_fd(self):
         other_directory = self.root / "other-candidates"
         other_directory.mkdir()
         candidate_root = offline_analysis._open_directory_without_redirect(
             self.candidate_directory
         )
+        second_candidate_root = offline_analysis._open_directory_without_redirect(
+            self.candidate_directory
+        )
         other_root = offline_analysis._open_directory_without_redirect(other_directory)
         self.addCleanup(candidate_root.close)
+        self.addCleanup(second_candidate_root.close)
         self.addCleanup(other_root.close)
-        candidate_root_details = os.fstat(candidate_root.fileno())
-        candidate_root_identity = (
-            candidate_root_details.st_dev,
-            candidate_root_details.st_ino,
-        )
-
         self.assertTrue(
             _matches_controlled_candidate_open(
                 self.candidate_path.name,
                 candidate_path=self.candidate_path,
-                candidate_root_identity=candidate_root_identity,
+                captured_pinned_root_fd=candidate_root.fileno(),
                 dir_fd=candidate_root.fileno(),
             )
         )
@@ -201,7 +215,15 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
             _matches_controlled_candidate_open(
                 self.candidate_path.name,
                 candidate_path=self.candidate_path,
-                candidate_root_identity=candidate_root_identity,
+                captured_pinned_root_fd=candidate_root.fileno(),
+                dir_fd=second_candidate_root.fileno(),
+            )
+        )
+        self.assertFalse(
+            _matches_controlled_candidate_open(
+                self.candidate_path.name,
+                candidate_path=self.candidate_path,
+                captured_pinned_root_fd=candidate_root.fileno(),
                 dir_fd=other_root.fileno(),
             )
         )
@@ -209,7 +231,7 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
             _matches_controlled_candidate_open(
                 "unrelated.json",
                 candidate_path=self.candidate_path,
-                candidate_root_identity=candidate_root_identity,
+                captured_pinned_root_fd=candidate_root.fileno(),
                 dir_fd=candidate_root.fileno(),
             )
         )
@@ -221,13 +243,7 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
         outside.write_text(json.dumps(attacker, ensure_ascii=False), encoding="utf-8")
         held = self.root / "held-candidate.json"
         original_open = offline_analysis.os.open
-        candidate_root_details = os.stat(
-            self.candidate_directory, follow_symlinks=False
-        )
-        candidate_root_identity = (
-            candidate_root_details.st_dev,
-            candidate_root_details.st_ino,
-        )
+        captured_pinned_root_fd: int | None = None
         swapped = False
 
         def replace_candidate() -> None:
@@ -238,11 +254,18 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 swapped = True
 
         def open_with_race(path, flags, *args, **kwargs):
+            nonlocal captured_pinned_root_fd
             descriptor = original_open(path, flags, *args, **kwargs)
+            if _matches_controlled_candidate_root_open(
+                path,
+                candidate_directory=self.candidate_directory,
+                dir_fd=kwargs.get("dir_fd"),
+            ):
+                captured_pinned_root_fd = descriptor
             if _matches_controlled_candidate_open(
                 path,
                 candidate_path=self.candidate_path,
-                candidate_root_identity=candidate_root_identity,
+                captured_pinned_root_fd=captured_pinned_root_fd,
                 dir_fd=kwargs.get("dir_fd"),
             ):
                 try:
@@ -269,13 +292,7 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
         attacker["chapters"][0]["scenes"][0]["summary"] = "目录外符号链接内容。"
         outside.write_text(json.dumps(attacker, ensure_ascii=False), encoding="utf-8")
         original_open = offline_analysis.os.open
-        candidate_root_details = os.stat(
-            self.candidate_directory, follow_symlinks=False
-        )
-        candidate_root_identity = (
-            candidate_root_details.st_dev,
-            candidate_root_details.st_ino,
-        )
+        captured_pinned_root_fd: int | None = None
         swapped = False
 
         def replace_candidate() -> None:
@@ -289,11 +306,18 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 swapped = True
 
         def open_with_race(path, flags, *args, **kwargs):
+            nonlocal captured_pinned_root_fd
             descriptor = original_open(path, flags, *args, **kwargs)
+            if _matches_controlled_candidate_root_open(
+                path,
+                candidate_directory=self.candidate_directory,
+                dir_fd=kwargs.get("dir_fd"),
+            ):
+                captured_pinned_root_fd = descriptor
             if _matches_controlled_candidate_open(
                 path,
                 candidate_path=self.candidate_path,
-                candidate_root_identity=candidate_root_identity,
+                captured_pinned_root_fd=captured_pinned_root_fd,
                 dir_fd=kwargs.get("dir_fd"),
             ):
                 try:

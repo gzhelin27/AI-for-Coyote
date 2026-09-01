@@ -148,3 +148,27 @@ Implemented and committed as `feat: import Codex story analysis offline`.
 
 - This Windows host has no installed WSL runtime and denies replacement of the opened candidate with `WinError 32`, so both true filesystem races retain explicit platform skips. The new non-skipped regression uses real directory handles to cover the exact POSIX `dir_fd` hook shape locally; replace-capable POSIX hosts execute the full swap and typed fail-closed assertions.
 - No external model, network, device action, push, or tag was invoked.
+
+## Fix round 5/5
+
+### RED evidence
+
+- The tightened controlled-swap regression opened a second descriptor for the same candidate-root directory and failed with `AssertionError: True is not false`: the old hook compared only `(st_dev, st_ino)`, so it could not distinguish that unrelated descriptor from the descriptor pinned by production.
+
+### GREEN evidence
+
+- The exact hook regression passes: the candidate basename with the captured production-pinned root FD is true, while a second FD for the same directory, an FD for another directory, and an unrelated basename are all false.
+- Focused source/store/importer/CLI/AppState-provenance suite: 97 tests passed, 5 skipped only for unavailable Windows symlink privilege or Windows' non-replaceable opened-file/directory semantics.
+- Full `unittest discover -s tests -p "test_*.py" -q` suite: 448 tests passed, 5 platform skips, in 22.709s.
+- `D:\AI-for-Coyote\.venv\Scripts\python.exe -m compileall -q backend tests` and `git diff --check` exited 0.
+
+### Fixes and modified files
+
+- `tests/test_story_offline_analysis.py`: the controlled race wrappers now capture the concrete descriptor returned by production's candidate-root `os.open` call. A later POSIX `os.open(candidate_basename, dir_fd=...)` triggers the swap only when `dir_fd` equals that captured descriptor; inode-equivalent descriptors no longer match.
+- The real move-outside-root and swap-to-symlink paths retain their typed `OfflineAnalysisError` fail-closed assertions and require `swapped` to be true whenever the platform permits the controlled replacement.
+- No production implementation was changed.
+
+### Self-review and residual risk
+
+- Windows still blocks the two true opened-file replacements with `WinError 32`, so those paths remain explicit platform skips here. The non-skipped exact-descriptor regression runs with real directory handles on this host; replace-capable POSIX hosts exercise the captured production descriptor through the full swap paths.
+- No external model, network, device action, push, or tag was invoked.
