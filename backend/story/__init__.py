@@ -1,22 +1,33 @@
-"""Local story-source import and analysis domain helpers."""
+"""Local story-source and offline faithful-analysis domain helpers."""
 
-from .analyzer import ContextLimitError, StoryAnalysisError, StoryAnalyzer
-from .analysis_store import AnalysisStore, AnalysisStoreError
+from .analysis_store import AnalysisLookup, AnalysisStore, AnalysisStoreError
 from .models import AnalysisKey, ImportedStory, StoryChapter, StoryMap, StoryScene
+from .offline_analysis import (
+    OFFLINE_ANALYSIS_VERSION,
+    OFFLINE_PRODUCER,
+    OfflineAnalysisError,
+    OfflineAnalysisImporter,
+    ValidatedOfflineAnalysis,
+    offline_analysis_key,
+)
 from .source import StorySourceEncoding, StorySourceError, StorySourceLoader
 
 __all__ = (
     "AnalysisKey",
+    "AnalysisLookup",
     "AnalysisStore",
     "AnalysisStoreError",
-    "ContextLimitError",
     "ImportedStory",
+    "OFFLINE_ANALYSIS_VERSION",
+    "OFFLINE_PRODUCER",
+    "OfflineAnalysisError",
+    "OfflineAnalysisImporter",
     "StoryChapter",
     "StoryMap",
-    "StoryAnalyzer",
-    "StoryAnalysisError",
     "StoryScene",
     "StorySourceEncoding",
     "StorySourceError",
     "StorySourceLoader",
+    "ValidatedOfflineAnalysis",
+    "offline_analysis_key",
 )

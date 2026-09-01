@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
+from typing import Mapping
 
 
 RUNTIME_FINGERPRINT_FILES = (
@@ -32,6 +34,46 @@ RUNTIME_FINGERPRINT_FILES = (
     "config/config.example.yaml",
     "config/waveforms.yaml",
 )
+
+
+def dlc_provenance(
+    cfg: Mapping[str, object], *, project_root: Path, waveform_policy: str | None = None
+) -> str:
+    """Return the stable DLC identity used by both import and runtime lookup.
+
+    The JSON shape and serialization deliberately match the former AppState
+    helper byte-for-byte so existing cache identities remain addressable.
+    """
+
+    character_value = cfg.get("character")
+    character = character_value if isinstance(character_value, Mapping) else {}
+    prompt_file = str(character.get("prompt_file") or "")
+    prompt_path = Path(prompt_file)
+    if prompt_file and not prompt_path.is_absolute():
+        prompt_path = project_root / prompt_path
+    try:
+        prompt_file_sha256 = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        prompt_file_sha256 = ""
+    timeline_value = cfg.get("timeline")
+    timeline = timeline_value if isinstance(timeline_value, Mapping) else {}
+    identity = {
+        "role": str(character.get("role") or "default"),
+        "profile": str(character.get("profile") or "default"),
+        "dlc": str(character.get("dlc_version") or character.get("name") or "default"),
+        "prompt": str(character.get("prompt") or ""),
+        "examples": list(character.get("examples") or [])[:8],
+        "prompt_file_sha256": prompt_file_sha256,
+        "waveform_policy": str(
+            waveform_policy
+            if waveform_policy is not None
+            else timeline.get("waveform_policy") or ""
+        ),
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def runtime_content_fingerprint(project_root: Path) -> str:

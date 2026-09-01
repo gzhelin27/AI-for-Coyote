@@ -131,6 +131,20 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual(len(quarantined), 1)
         self.assertEqual(quarantined[0].parent, self.cache_directory)
 
+    def test_inspect_reports_invalid_only_while_it_quarantines_matching_cache(self):
+        store = AnalysisStore(self.cache_directory)
+        store.save(self.key, self.scene_map)
+        cache_path = store.cache_path(self.key)
+        cache_path.write_text("not valid JSON", encoding="utf-8")
+
+        first = store.inspect(self.key)
+        second = store.inspect(self.key)
+
+        self.assertEqual(first.status, "invalid")
+        self.assertIsNone(first.story_map)
+        self.assertEqual(second.status, "missing")
+        self.assertIsNone(second.story_map)
+
     def test_load_rejects_unknown_fields_future_schema_without_using_them(self):
         store = AnalysisStore(self.cache_directory)
         store.save(self.key, self.scene_map)

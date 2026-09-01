@@ -9,7 +9,6 @@
 import asyncio
 import contextlib
 from copy import deepcopy
-import hashlib
 import io
 import json
 import os
@@ -45,7 +44,7 @@ from .config import (
 from .game_loop import GameLoop
 from .llm import LLM
 from .logging_utils import setup_logging
-from .provenance import runtime_content_fingerprint
+from .provenance import dlc_provenance, runtime_content_fingerprint
 from .relay_client import RelayClient
 from .safety import DeviceOutputError, SafetyManager
 from .timeline.models import CycleGapPolicy
@@ -109,34 +108,11 @@ def _public_app_version() -> str:
 def _dlc_provenance(
     cfg: dict, *, waveform_policy: str | None = None
 ) -> str:
-    character = cfg.get("character") or {}
-    prompt_file = str(character.get("prompt_file") or "")
-    prompt_path = Path(prompt_file)
-    if prompt_file and not prompt_path.is_absolute():
-        prompt_path = PROJECT_ROOT / prompt_path
-    try:
-        prompt_file_sha256 = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
-    except (OSError, ValueError):
-        prompt_file_sha256 = ""
-    identity = {
-        "role": str(character.get("role") or "default"),
-        "profile": str(character.get("profile") or "default"),
-        "dlc": str(
-            character.get("dlc_version") or character.get("name") or "default"
-        ),
-        "prompt": str(character.get("prompt") or ""),
-        "examples": list(character.get("examples") or [])[:8],
-        "prompt_file_sha256": prompt_file_sha256,
-        "waveform_policy": str(
-            waveform_policy
-            if waveform_policy is not None
-            else (cfg.get("timeline") or {}).get("waveform_policy") or ""
-        ),
-    }
-    encoded = json.dumps(
-        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    """Compatibility delegate retaining the historical public digest contract."""
+
+    return dlc_provenance(
+        cfg, project_root=PROJECT_ROOT, waveform_policy=waveform_policy
+    )
 
 
 def get_lan_ip() -> str:
@@ -280,8 +256,10 @@ class AppState:
     def _timeline_manifest_metadata(self) -> dict[str, str]:
         """Snapshot provenance when a new live session actually begins."""
         app_fingerprint = _app_version()
-        dlc_fingerprint = _dlc_provenance(
-            self.cfg, waveform_policy=self.timeline_session.waveform_policy
+        dlc_fingerprint = dlc_provenance(
+            self.cfg,
+            project_root=PROJECT_ROOT,
+            waveform_policy=self.timeline_session.waveform_policy,
         )
         dlc_version = str(
             self.cfg["character"].get("dlc_version") or dlc_fingerprint

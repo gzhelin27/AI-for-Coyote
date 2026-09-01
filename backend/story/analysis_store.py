@@ -1,13 +1,14 @@
 """Atomic, schema-versioned local storage for faithful story analysis."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import secrets
 import stat
 import threading
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from .models import AnalysisKey, StoryChapter, StoryMap, StoryScene
 
@@ -22,6 +23,14 @@ _SCENE_KEYS = frozenset(("id", "index", "start_offset", "end_offset", "summary",
 
 class AnalysisStoreError(OSError):
     """A local analysis cache entry could not be written safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisLookup:
+    """One cache inspection result, including first-read corruption state."""
+
+    status: Literal["ready", "missing", "invalid"]
+    story_map: StoryMap | None
 
 
 class _CacheValidationError(ValueError):
@@ -77,27 +86,35 @@ class AnalysisStore:
         return (directory if directory is not None else self._directory) / f"{key.digest()}.json"
 
     def load(self, key: AnalysisKey) -> StoryMap | None:
+        """Return a valid map, preserving the legacy ``None``-on-failure API."""
+
+        return self.inspect(key).story_map
+
+    def inspect(self, key: AnalysisKey) -> AnalysisLookup:
+        """Report whether a matching entry is ready, absent, or quarantined now."""
+
         cache_path = self.cache_path(key)
         if self._resolved_directory() is None:
-            return None
+            return AnalysisLookup("missing", None)
         with _cache_path_lock(cache_path):
             self._reclaim_stale_temporaries(cache_path)
             if self._resolved_directory() is None or _is_redirect(cache_path):
-                return None
+                return AnalysisLookup("missing", None)
             identity = _regular_file_identity(cache_path)
             if identity is None:
-                return None
+                return AnalysisLookup("missing", None)
             try:
                 document = json.loads(
                     cache_path.read_text(encoding="utf-8"),
                     object_pairs_hook=_reject_duplicate_object,
                 )
-                return self._decode_document(document, key)
+                return AnalysisLookup("ready", self._decode_document(document, key))
             except (json.JSONDecodeError, UnicodeDecodeError, _CacheValidationError):
-                self._quarantine(cache_path, identity)
-                return None
+                if self._quarantine(cache_path, identity):
+                    return AnalysisLookup("invalid", None)
+                return AnalysisLookup("missing", None)
             except OSError:
-                return None
+                return AnalysisLookup("missing", None)
 
     def save(self, key: AnalysisKey, story_map: StoryMap) -> None:
         if not isinstance(key, AnalysisKey):
@@ -232,24 +249,25 @@ class AnalysisStore:
         finally:
             os.close(descriptor)
 
-    def _quarantine(self, cache_path: Path, expected_identity: tuple[int, int]) -> None:
+    def _quarantine(self, cache_path: Path, expected_identity: tuple[int, int]) -> bool:
         if self._resolved_directory() is None or _is_redirect(cache_path):
-            return
+            return False
         if _regular_file_identity(cache_path) != expected_identity:
-            return
+            return False
         for _ in range(32):
             invalid_path = cache_path.with_name(f"{cache_path.name}.{secrets.token_hex(16)}.invalid")
             try:
                 if invalid_path.exists() or _is_redirect(invalid_path):
                     continue
                 cache_path.rename(invalid_path)
-                return
+                return True
             except FileNotFoundError:
-                return
+                return False
             except FileExistsError:
                 continue
             except OSError:
-                return
+                return False
+        return False
 
     @staticmethod
     def _encode_document(key: AnalysisKey, story_map: StoryMap) -> dict[str, object]:

@@ -44,7 +44,8 @@ story:
   import_dir: data/stories
   analysis_dir: data/story_analysis
   max_source_mb: 20
-  analysis_prompt_version: faithful-v1
+  # Codex 候选离线导入的固定分析身份；运行时不会调用整本小说分析模型。
+  analysis_prompt_version: faithful-offline-v1
   reading_speed_cpm:
     slow: 250
     standard: 400
