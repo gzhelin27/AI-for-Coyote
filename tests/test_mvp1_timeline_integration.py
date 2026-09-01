@@ -251,45 +251,59 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(executed), 1)
         self.assertEqual(dropped, [])
 
-        executed, dropped = await harness.loop.execute_actions(
-            [{"op": "hold_strength", "channel": "A", "value": 5}]
-        )
-        self.assertEqual(len(executed), 1)
-        self.assertEqual(dropped, [])
-        a_helper = harness.loop.loop_tasks["A"]
-        a_helper_generation = harness.loop.output_coordinator.helper_generation("A")
-        harness.safety.pulse_until["A"] = 0.0
+        a_helper_resend = asyncio.Event()
+        a_helper_sends = 0
+        original_send = harness.relay.send_frame
 
-        identical = await harness.loop.update_device_state(
-            {"intensityA": 5}, None
-        )
+        async def observe_a_helper(frame):
+            nonlocal a_helper_sends
+            sent = await original_send(frame)
+            method, payload = harness.relay._operation(frame)
+            if (
+                sent
+                and method == "device.op"
+                and harness.relay.is_waveform_helper(frame)
+                and harness.relay._channel_name(payload) == "A"
+            ):
+                a_helper_sends += 1
+                if a_helper_sends == 2:
+                    a_helper_resend.set()
+            return sent
 
-        self.assertEqual(identical, {})
-        self.assertIs(harness.loop.loop_tasks["A"], a_helper)
-        self.assertFalse(a_helper.done())
-        self.assertEqual(
-            harness.loop.output_coordinator.helper_generation("A"),
-            a_helper_generation,
-        )
-        for _ in range(25):
-            a_helper_frames = [
-                frame
-                for frame in harness.relay.attempts
-                if harness.relay.is_waveform_helper(frame)
-                and harness.relay._channel_name(harness.relay._operation(frame)[1])
-                == "A"
-            ]
-            if len(a_helper_frames) >= 2:
-                break
-            await asyncio.sleep(0.02)
-        else:
-            self.fail("identical report stopped A helper before its resend")
+        with patch.object(
+            harness.relay, "send_frame", side_effect=observe_a_helper
+        ):
+            executed, dropped = await harness.loop.execute_actions(
+                [{"op": "hold_strength", "channel": "A", "value": 5}]
+            )
+            self.assertEqual(len(executed), 1)
+            self.assertEqual(dropped, [])
+            a_helper = harness.loop.loop_tasks["A"]
+            a_helper_generation = (
+                harness.loop.output_coordinator.helper_generation("A")
+            )
+            harness.safety.pulse_until["A"] = 0.0
+
+            identical = await harness.loop.update_device_state(
+                {"intensityA": 5}, None
+            )
+
+            self.assertEqual(identical, {})
+            self.assertIs(harness.loop.loop_tasks["A"], a_helper)
+            self.assertFalse(a_helper.done())
+            self.assertEqual(
+                harness.loop.output_coordinator.helper_generation("A"),
+                a_helper_generation,
+            )
+            await asyncio.wait_for(a_helper_resend.wait(), timeout=1)
 
         blocker_started = asyncio.Event()
         release_blocker = asyncio.Event()
         reconciliation_started = asyncio.Event()
         reconciliation_returned = asyncio.Event()
         normal_queued = asyncio.Event()
+        normal_channel_task = None
+        attempts_at_report_acceptance = None
 
         async def block_b_channel(snapshot):
             blocker_started.set()
@@ -304,13 +318,19 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
         original_run_locked = harness.loop.output_coordinator._run_channel_locked
 
         async def observe_reconcile(*args, **kwargs):
+            nonlocal attempts_at_report_acceptance
             reconciliation_started.set()
             result = await original_reconcile(*args, **kwargs)
+            attempts_at_report_acceptance = len(harness.relay.attempts)
             reconciliation_returned.set()
             return result
 
         async def observe_normal_queue(*args, **kwargs):
-            normal_queued.set()
+            nonlocal normal_channel_task
+            operation = kwargs.get("operation", args[-1])
+            if operation is not block_b_channel:
+                normal_channel_task = asyncio.current_task()
+                normal_queued.set()
             return await original_run_locked(*args, **kwargs)
 
         blocker = asyncio.create_task(
@@ -353,7 +373,15 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
                         ]
                     )
                 )
+                await asyncio.sleep(0)
                 await asyncio.wait_for(normal_queued.wait(), timeout=1)
+                self.assertFalse(normal.done())
+                self.assertIsNotNone(normal_channel_task)
+                self.assertFalse(normal_channel_task.done())
+                self.assertFalse(blocker.done())
+                self.assertTrue(
+                    harness.loop.output_coordinator._slots["B"].lock.locked()
+                )
                 release_blocker.set()
                 await asyncio.wait_for(reconciliation_returned.wait(), timeout=1)
 
@@ -369,7 +397,21 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report_result["B"]["dropped"], [])
             self.assertEqual(normal_result[0], [])
             self.assertEqual(len(normal_result[1]), 1)
-            self.assertEqual(harness.loop.output_coordinator.confirmed("B").strength, 20)
+            self.assertEqual(
+                harness.loop.output_coordinator.confirmed("B").strength, 20
+            )
+            self.assertIsNotNone(attempts_at_report_acceptance)
+            b_normal_waveforms = [
+                frame
+                for frame in harness.relay.attempts[attempts_at_report_acceptance:]
+                for method, payload in (harness.relay._operation(frame),)
+                if method == "device.op"
+                and payload.get("t") == 0
+                and payload.get("c") == 1
+                and payload.get("v")
+                == ["integration-frame-0", "integration-frame-1"]
+            ]
+            self.assertEqual(b_normal_waveforms, [])
         finally:
             release_blocker.set()
             await asyncio.gather(
@@ -386,19 +428,25 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
         original_run_locked = harness.loop.output_coordinator._run_channel_locked
         b_helper = None
         resend_task = None
-        run_count = 0
+        b_helper_generation_before_retirement = None
+        b_helper_frames_before_retirement = None
+        b_run_count = 0
         primary_cancellation_injected = False
 
         async def observe_helper_resend(*args, **kwargs):
-            nonlocal resend_task, run_count
-            run_count += 1
-            if run_count == 2:
-                resend_task = asyncio.current_task()
-                resend_queued.set()
+            nonlocal resend_task, b_run_count
+            if args[0] is harness.loop.output_coordinator._slots["B"]:
+                b_run_count += 1
+                if b_run_count == 2:
+                    resend_task = asyncio.current_task()
+                    resend_queued.set()
             return await original_run_locked(*args, **kwargs)
 
         async def cancel_b_primary(frame):
-            nonlocal b_helper, primary_cancellation_injected
+            nonlocal b_helper
+            nonlocal b_helper_frames_before_retirement
+            nonlocal b_helper_generation_before_retirement
+            nonlocal primary_cancellation_injected
             method, payload = harness.relay._operation(frame)
             channel = harness.relay._channel_name(payload)
             if method == "device.op" and payload.get("t") == 0 and channel == "B":
@@ -414,6 +462,20 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await helper_delivered.wait()
                 b_helper = harness.loop.loop_tasks.get("B")
                 await resend_queued.wait()
+                b_helper_generation_before_retirement = (
+                    harness.loop.output_coordinator.helper_generation("B")
+                )
+                b_helper_frames_before_retirement = len(
+                    [
+                        attempt
+                        for attempt in harness.relay.attempts
+                        if harness.relay.is_waveform_helper(attempt)
+                        and harness.relay._channel_name(
+                            harness.relay._operation(attempt)[1]
+                        )
+                        == "B"
+                    ]
+                )
                 primary_cancellation_injected = True
                 primary_cancelled.set()
                 raise asyncio.CancelledError
@@ -438,19 +500,49 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 await asyncio.wait_for(primary_cancelled.wait(), timeout=1)
-                estop_attempt_start = len(harness.relay.attempts)
-                stopping = asyncio.create_task(harness.loop.estop())
-                done, _ = await asyncio.wait({request, stopping}, timeout=1)
+                request_result = (
+                    await asyncio.gather(request, return_exceptions=True)
+                )[0]
 
-            self.assertIn(request, done)
-            self.assertIn(stopping, done)
-            request_result, estop_result = await asyncio.gather(
-                request, stopping, return_exceptions=True
-            )
             self.assertIsInstance(request_result, asyncio.CancelledError)
-            self.assertEqual(estop_result, {"estop": True, "sent": True})
             self.assertIsNotNone(b_helper)
             self.assertTrue(b_helper.done())
+            self.assertIsNotNone(b_helper_generation_before_retirement)
+            self.assertGreater(
+                harness.loop.output_coordinator.helper_generation("B"),
+                b_helper_generation_before_retirement,
+            )
+            self.assertIsNotNone(b_helper_frames_before_retirement)
+            b_helper_frames_after_retirement = len(
+                [
+                    attempt
+                    for attempt in harness.relay.attempts
+                    if harness.relay.is_waveform_helper(attempt)
+                    and harness.relay._channel_name(
+                        harness.relay._operation(attempt)[1]
+                    )
+                    == "B"
+                ]
+            )
+            self.assertEqual(
+                b_helper_frames_after_retirement,
+                b_helper_frames_before_retirement,
+            )
+            b_confirmed = harness.loop.output_coordinator.confirmed("B")
+            b_pending = harness.loop.output_coordinator.pending("B")
+            if b_pending.clear_required:
+                self.assertEqual(b_confirmed.strength, 20)
+                self.assertEqual(b_confirmed.waveform, "呼吸")
+                self.assertEqual(b_confirmed.waveform_mode, "finite")
+            else:
+                self.assertEqual(b_confirmed.strength, 0)
+                self.assertIsNone(b_confirmed.waveform)
+                self.assertIsNone(b_confirmed.waveform_mode)
+
+            estop_attempt_start = len(harness.relay.attempts)
+            stopping = asyncio.create_task(harness.loop.estop())
+            estop_result = await asyncio.wait_for(stopping, timeout=1)
+            self.assertEqual(estop_result, {"estop": True, "sent": True})
             reset_channels = [
                 payload.get("c")
                 for frame in harness.relay.attempts[estop_attempt_start:]
@@ -468,18 +560,25 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(harness.loop.loop_tasks, {})
             self.assertEqual(harness.loop.loop_events, {})
-            attempts_after_settlement = len(harness.relay.attempts)
-            await asyncio.sleep(0)
-            self.assertEqual(len(harness.relay.attempts), attempts_after_settlement)
+            known_worker_tasks = tuple(
+                {task for task in (a_helper, b_helper, resend_task) if task is not None}
+            )
+            self.assertTrue(all(task.done() for task in known_worker_tasks))
+            await asyncio.gather(*known_worker_tasks, return_exceptions=True)
         finally:
-            if resend_task is not None and not resend_task.done():
-                resend_task.cancel()
             harness.loop._cancel_loops(None)
-            for task in (request, stopping, b_helper, resend_task):
+            cleanup_tasks = tuple(
+                {
+                    task
+                    for task in (request, stopping, a_helper, b_helper, resend_task)
+                    if task is not None
+                }
+            )
+            for task in cleanup_tasks:
                 if task is not None and not task.done():
                     task.cancel()
             await asyncio.gather(
-                *(task for task in (request, stopping, b_helper, resend_task) if task),
+                *cleanup_tasks,
                 return_exceptions=True,
             )
 
