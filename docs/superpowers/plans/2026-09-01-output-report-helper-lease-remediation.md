@@ -6,7 +6,7 @@
 
 **Architecture:** Add one coordinator-owned reported-strength transaction that atomically commits report truth and any required safety ownership. Retire helper resend ownership synchronously inside the parent transaction, perform clear without waiting for the helper worker, and reap the retired worker only after the coordinator lock is released.
 
-**Tech Stack:** Python 3.11+, asyncio, FastAPI backend, unittest/pytest-compatible test suite, TypeScript/Vitest frontend verification.
+**Tech Stack:** Python 3.11+, asyncio, FastAPI backend, Python `unittest`, TypeScript/Vitest frontend verification.
 
 **Spec:** `docs/superpowers/specs/2026-09-01-output-report-helper-lease-remediation-design.md`
 
@@ -57,7 +57,7 @@ For a changed safe report, assert confirmed strength and revision change but mai
 Run:
 
 ```powershell
-D:\AI-for-Coyote\.venv\Scripts\python.exe -m pytest tests/test_output_coordinator.py -q
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest tests.test_output_coordinator -v
 ```
 
 Expected: FAIL because `reconcile_reported_strength` and `ReportReconciliation` do not exist.
@@ -133,7 +133,7 @@ Do not add a broad `_action_lock` around report processing.
 Run:
 
 ```powershell
-D:\AI-for-Coyote\.venv\Scripts\python.exe -m pytest tests/test_output_coordinator.py tests/test_game_loop_cycle.py tests/test_session_endpoints.py -q
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest tests.test_output_coordinator tests.test_game_loop_cycle tests.test_session_endpoints -v
 ```
 
 Expected: PASS with no transport in the report-to-reduction gap.
@@ -232,8 +232,8 @@ Assert:
 Run:
 
 ```powershell
-D:\AI-for-Coyote\.venv\Scripts\python.exe -m pytest tests/test_game_loop_cycle.py tests/test_session_endpoints.py -q
-$env:PYTHONASYNCIODEBUG='1'; D:\AI-for-Coyote\.venv\Scripts\python.exe -m pytest tests/test_game_loop_cycle.py tests/test_session_endpoints.py -q
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest tests.test_game_loop_cycle tests.test_session_endpoints -v
+$env:PYTHONASYNCIODEBUG='1'; D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest tests.test_game_loop_cycle tests.test_session_endpoints -v
 ```
 
 Expected: PASS with no pending asyncio tasks or un-retrieved exceptions.
@@ -276,8 +276,8 @@ Run the test against a controlled fault seam or temporarily invert one assertion
 Run:
 
 ```powershell
-D:\AI-for-Coyote\.venv\Scripts\python.exe -m pytest -q
-$env:PYTHONASYNCIODEBUG='1'; D:\AI-for-Coyote\.venv\Scripts\python.exe -m pytest -q
+D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+$env:PYTHONASYNCIODEBUG='1'; D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 D:\AI-for-Coyote\.venv\Scripts\python.exe -m compileall -q backend tests
 ```
 
