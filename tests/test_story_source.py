@@ -3,22 +3,32 @@ import io
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 import tempfile
+from typing import get_args
 import unittest
 import zipfile
 
 from docx import Document
 import yaml
 
+import backend.story as story_domain
 from backend.config import DEFAULTS, load_config
 from backend.story.models import ImportedStory
 from backend.story.source import StorySourceError, StorySourceLoader
+
+
+_AMBIGUOUS_GB18030_CASES = (
+    ("D2BB", bytes.fromhex("d2bb"), "一"),
+    ("D2BBD2B5", bytes.fromhex("d2bbd2b5"), "一业"),
+    ("repeated D2BB", bytes.fromhex("d2bb") * 8, "一" * 8),
+)
+_MULTILINGUAL_TEXTS = ("中文", "😊", "Привет", "café")
 
 
 class StorySourceTests(unittest.TestCase):
     def test_txt_normalizes_newlines_and_hashes_original_bytes(self):
         original = "甲\r\n乙".encode("utf-8")
 
-        imported = StorySourceLoader(max_bytes=1024).load("novel.txt", original)
+        imported = self._load_with_encoding("novel.txt", original, "utf-8")
 
         self.assertEqual(imported.text, "甲\n乙")
         self.assertEqual(imported.filename, "novel.txt")
@@ -42,50 +52,75 @@ class StorySourceTests(unittest.TestCase):
             hashlib.sha256(original).hexdigest(),
         )
 
-    def test_prefers_gb18030_for_ambiguous_chinese_bytes(self):
-        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", bytes.fromhex("d2bb"))
+    def test_story_source_encoding_options_are_public(self):
+        encoding_type = getattr(story_domain, "StorySourceEncoding", None)
 
-        self.assertEqual(imported.text, "一")
+        self.assertEqual(get_args(encoding_type), ("auto", "utf-8", "gb18030"))
 
-    def test_rejects_repeated_ambiguous_gb18030_bytes(self):
-        loader = StorySourceLoader(max_bytes=1024)
+    def test_auto_rejects_ambiguous_gb18030_samples(self):
+        for label, payload, _expected in _AMBIGUOUS_GB18030_CASES:
+            with self.subTest(label=label), self.assertRaisesRegex(
+                StorySourceError, "encoding is ambiguous"
+            ):
+                self._load_with_encoding("chapter.txt", payload, "auto")
 
-        for repeats in (2, 3, 8):
-            with self.subTest(repeats=repeats), self.assertRaises(StorySourceError):
-                loader.load("chapter.txt", bytes.fromhex("d2bb") * repeats)
+    def test_default_encoding_is_auto(self):
+        with self.assertRaisesRegex(StorySourceError, "encoding is ambiguous"):
+            StorySourceLoader(max_bytes=1024).load("chapter.txt", bytes.fromhex("d2bb"))
 
-    def test_preserves_real_utf8_chinese_when_gb18030_also_decodes(self):
-        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "中文".encode("utf-8"))
+    def test_explicit_gb18030_preserves_ambiguous_chinese_samples(self):
+        for label, payload, expected in _AMBIGUOUS_GB18030_CASES:
+            with self.subTest(label=label):
+                imported = self._load_with_encoding("chapter.txt", payload, "gb18030")
 
-        self.assertEqual(imported.text, "中文")
+                self.assertEqual(imported.text, expected)
 
-    def test_preserves_utf8_emoji_when_gb18030_also_decodes(self):
-        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "😊".encode("utf-8"))
+    def test_explicit_encodings_preserve_multilingual_text(self):
+        for encoding in ("utf-8", "gb18030"):
+            for expected in _MULTILINGUAL_TEXTS:
+                with self.subTest(encoding=encoding, expected=expected):
+                    imported = self._load_with_encoding(
+                        "chapter.txt", expected.encode(encoding), encoding
+                    )
 
-        self.assertEqual(imported.text, "😊")
+                    self.assertEqual(imported.text, expected)
 
-    def test_preserves_multi_character_utf8_cyrillic_when_gb18030_also_decodes(self):
-        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "Привет".encode("utf-8"))
+    def test_auto_rejects_bomless_multilingual_utf8_when_decodings_differ(self):
+        for text in _MULTILINGUAL_TEXTS:
+            with self.subTest(text=text), self.assertRaisesRegex(
+                StorySourceError, "encoding is ambiguous"
+            ):
+                self._load_with_encoding("chapter.txt", text.encode("utf-8"), "auto")
 
-        self.assertEqual(imported.text, "Привет")
+    def test_auto_accepts_a_unique_utf8_decoding(self):
+        imported = self._load_with_encoding("chapter.txt", b"\xe0\xa0\x80", "auto")
 
-    def test_preserves_utf8_latin_accents_when_gb18030_also_decodes(self):
-        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", "café".encode("utf-8"))
+        self.assertEqual(imported.text, "\u0800")
 
-        self.assertEqual(imported.text, "café")
+    def test_utf8_bom_is_definitive_in_auto_and_explicit_utf8(self):
+        original = b"\xef\xbb\xbf" + "开篇😊".encode("utf-8")
 
-    def test_rejects_equally_plausible_conflicting_text_decodings(self):
-        ambiguous = bytes.fromhex("d2bbceb1")
+        for encoding in ("auto", "utf-8"):
+            with self.subTest(encoding=encoding):
+                imported = self._load_with_encoding("chapter.txt", original, encoding)
 
-        with self.assertRaises(StorySourceError):
-            StorySourceLoader(max_bytes=1024).load("chapter.txt", ambiguous)
+                self.assertEqual(imported.text, "开篇😊")
 
-    def test_utf8_bom_is_definitive_and_not_in_normalized_text(self):
-        original = b"\xef\xbb\xbf" + "开篇".encode("utf-8")
+    def test_rejects_invalid_encoding_name(self):
+        with self.assertRaisesRegex(StorySourceError, "encoding must be one of"):
+            self._load_with_encoding("chapter.txt", b"text", "latin-1")
 
-        imported = StorySourceLoader(max_bytes=1024).load("chapter.txt", original)
+    def test_wrong_explicit_encoding_fails_without_fallback(self):
+        cases = (
+            ("utf-8", "第一章".encode("gb18030")),
+            ("gb18030", b"\xe0\xa0\x80"),
+        )
 
-        self.assertEqual(imported.text, "开篇")
+        for encoding, payload in cases:
+            with self.subTest(encoding=encoding), self.assertRaisesRegex(
+                StorySourceError, f"not valid {encoding}"
+            ):
+                self._load_with_encoding("chapter.txt", payload, encoding)
 
     def test_docx_preserves_heading_order_and_paragraph_text(self):
         document = Document()
@@ -103,6 +138,15 @@ class StorySourceTests(unittest.TestCase):
         self.assertEqual(imported.extension, ".docx")
         self.assertEqual(imported.source_sha256, hashlib.sha256(original).hexdigest())
 
+    def test_docx_rejects_plain_text_encoding_override(self):
+        original = self._generated_docx_bytes()
+
+        for encoding in ("utf-8", "gb18030"):
+            with self.subTest(encoding=encoding), self.assertRaisesRegex(
+                StorySourceError, "DOCX.*encoding"
+            ):
+                self._load_with_encoding("novel.docx", original, encoding)
+
     def test_rejects_unsupported_extension_and_oversize_input(self):
         loader = StorySourceLoader(max_bytes=3)
 
@@ -111,8 +155,10 @@ class StorySourceTests(unittest.TestCase):
         with self.assertRaises(StorySourceError):
             loader.load("novel.txt", b"abcd")
 
-    def test_accepts_exact_byte_limit_and_normalizes_uppercase_extension(self):
-        imported = StorySourceLoader(max_bytes=4).load("NOVEL.TXT", b"text")
+    def test_auto_accepts_identical_ascii_at_exact_byte_limit(self):
+        imported = StorySourceLoader(max_bytes=4).load(
+            "NOVEL.TXT", b"text", encoding="auto"
+        )
 
         self.assertEqual(imported.filename, "NOVEL.TXT")
         self.assertEqual(imported.extension, ".txt")
@@ -193,6 +239,18 @@ class StorySourceTests(unittest.TestCase):
             flags = int.from_bytes(marked[position + 8:position + 10], "little")
             marked[position + 8:position + 10] = (flags | 0x1).to_bytes(2, "little")
             position += 4
+
+    def _load_with_encoding(
+        self, filename: str, payload: bytes, encoding: str
+    ) -> ImportedStory:
+        try:
+            return StorySourceLoader(max_bytes=1024 * 1024).load(
+                filename, payload, encoding=encoding
+            )
+        except TypeError as exc:
+            if "encoding" in str(exc):
+                self.fail("StorySourceLoader.load does not expose the encoding option")
+            raise
 
 
 class StoryConfigurationTests(unittest.TestCase):
