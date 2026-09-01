@@ -203,13 +203,13 @@ python -m backend.main                 REM 窗口 2：主程序（端口 8000）
 ```powershell
 $source = Read-Host '本地 TXT/MD/DOCX 完整路径'
 $map = Read-Host 'data/story_candidates 下的候选 JSON 完整路径'
-& .venv\Scripts\python.exe -m backend.story.import_analysis validate --source $source --map $map --encoding auto
-& .venv\Scripts\python.exe -m backend.story.import_analysis import --source $source --map $map --encoding auto
+python -m backend.story.import_analysis validate --source $source --map $map --encoding auto
+python -m backend.story.import_analysis import --source $source --map $map --encoding auto
 ```
 
 候选 JSON 必须是 `data/story_candidates/` 的直接子文件；对于已确认的 GB18030 文本，把两条命令末尾的 `--encoding auto` 改为 `--encoding gb18030`。`validate` 不写缓存，`import` 才原子写入 `data/story_analysis/`。导入后在阅读器选择该书、速度（慢 250／标准 400／快 600 字符/分钟）和章节；只有章节完整规划、解析和本地安全预检全部通过后才会自动开始。
 
-缓存身份由规范化原文哈希、离线候选生产者/版本以及当前 DLC 身份共同决定。改变原文内容或解码结果，或改变角色、档位、DLC 标识、提示词（含提示词文件）、示例或波形策略后，旧缓存会显示 `missing`，应重新生成候选并执行上述验证/导入。`ready` 表示当前身份下有完整可信的缓存；`missing` 表示尚未导入或身份已失效；`invalid` 表示发现损坏缓存，系统已隔离它，需重新导入。状态查询和章节列表不发送模型请求。
+缓存身份由规范化原文哈希、离线候选分析版本以及当前 DLC provenance 共同决定。改变原文内容或解码结果、分析版本，或改变 provenance 覆盖的角色、profile、DLC 标识、提示词（含提示词文件）、前 8 条示例或波形策略后，旧缓存会显示 `missing`，应重新生成候选并执行上述验证/导入。`ready` 表示当前身份下有完整可信的缓存；`missing` 表示尚未导入或身份已失效；`invalid` 表示发现损坏缓存，系统已隔离它，需重新导入。状态查询和章节列表不发送模型请求。
 
 播放时「暂停」会立即清除 A/B 输出并保留安全事件游标；「继续」可从当前事件、章节开头或整段开头恢复。完成后会在 `data/replays/*.coyote-replay` 保存 ZIP 归档，内含 `manifest.json`、完整已解析时间线、`scenes.json` 及原始 `source.<txt|md|docx>`。精确重放只使用归档时间线，不重新请求模型或抽取随机数；当前安全上限或来源指纹不同时会标记为已调整。
 

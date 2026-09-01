@@ -40,12 +40,18 @@ class LocalChapterPlannerClient:
     model = "mvp2-local-planner"
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[dict[str, str]] = []
 
     async def complete_json(
         self, _system_prompt: str, user_content: str, schema_name: str
     ) -> dict[str, object]:
-        self.calls.append((schema_name, user_content))
+        self.calls.append(
+            {
+                "schema_name": schema_name,
+                "system_prompt": _system_prompt,
+                "user_content": user_content,
+            }
+        )
         request = json.loads(user_content)
         return {
             "scenes": [
@@ -156,6 +162,7 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         source_path.write_bytes(source_bytes)
         story = self.state.story_source_loader.load("fixture.docx", source_bytes)
         candidate_path = self._write_candidate(story)
+        logical_actions, logical_clears = self._record_game_loop_boundaries()
 
         self._run_candidate_cli("validate", source_path, candidate_path)
         self._run_candidate_cli("import", source_path, candidate_path)
@@ -185,16 +192,58 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(played.status_code, 200, played.text)
         self.assertEqual(played.json()["status"], "running")
-        self.assertEqual([schema for schema, _ in self.llm.calls], ["chapter_plan"])
+        self._assert_selected_chapter_request(story)
 
         await self._advance_until(
-            lambda: bool(self.harness.controller.recorded_cycles),
-            "the dry-run chapter should execute at least one resolved cycle",
+            lambda: (
+                bool(self.harness.controller.recorded_cycles)
+                and self.harness.safety.current["A"] > 0
+                and self.harness.safety.current["B"] > 0
+            ),
+            "the dry-run chapter should execute resolved A/B cycles",
         )
+        before_pause = self.state.novel_session.to_state()
+        before_strengths = dict(self.harness.safety.current)
+        self.assertEqual(before_pause.status.value, "running")
+        self.assertTrue(before_pause.current_scene_id)
+        self.assertGreater(before_strengths["A"], 0)
+        self.assertGreater(before_strengths["B"], 0)
+        clear_start = len(logical_clears)
         paused = await self.client.post("/api/story/pause")
-        resumed = await self.client.post("/api/story/resume", json={"from": "current"})
         self.assertEqual(paused.json()["status"], "paused")
+        self.assertEqual(paused.json()["cursor"], before_pause.cursor)
+        self.assertEqual(paused.json()["current_scene_id"], before_pause.current_scene_id)
+        pause_clears = logical_clears[clear_start:]
+        self.assertEqual([channel for channel, _ in pause_clears], [None])
+        pause_executed, pause_dropped = pause_clears[0][1]
+        self.assertEqual(pause_dropped, [])
+        self.assertEqual(pause_executed[0]["action"], {"op": "stop"})
+        self.assertEqual(
+            pause_executed[0]["effective"]["channels"],
+            {
+                "A": {
+                    "effective_strength": 0,
+                    "pattern": None,
+                    "waveform_mode": None,
+                },
+                "B": {
+                    "effective_strength": 0,
+                    "pattern": None,
+                    "waveform_mode": None,
+                },
+            },
+        )
+        self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+        resumed = await self.client.post("/api/story/resume", json={"from": "current"})
         self.assertEqual(resumed.json()["status"], "running")
+        await self._advance_until(
+            lambda: (
+                self.state.novel_session.to_state().cursor == before_pause.cursor
+                and self.state.novel_session.to_state().current_scene_id
+                == before_pause.current_scene_id
+            ),
+            "resume current should restart the paused safe event",
+        )
         self.assertEqual(self.harness.relay.sent_frames, [])
 
         finished = await self.client.post("/api/story/finish")
@@ -202,6 +251,8 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished.json()["replay"]["status"], "completed")
         replay_id = finished.json()["replay"]["replay_id"]
         archive = self.harness.store.load(replay_id)
+        completed_cycles = tuple(cycle for cycle in archive.timeline.cycles if cycle.completed)
+        self.assertTrue(completed_cycles)
         expected_scenes = self._expected_scenes(story)
         self.assertEqual(archive.source, source_bytes)
         self.assertEqual(archive.manifest.source_hash, hashlib.sha256(source_bytes).hexdigest())
@@ -211,6 +262,7 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(archive.scenes["source_hash"], story.source_sha256)
 
+        replay_action_start = len(logical_actions)
         replayed = await self.client.post(
             f"/api/replays/{replay_id}/play", json={"cursor": 0}
         )
@@ -221,7 +273,15 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "exact replay should complete from the archived timeline",
         )
         self.assertEqual(self.harness.relay.sent_frames, [])
-        self.assertEqual([schema for schema, _ in self.llm.calls], ["chapter_plan"])
+        self.assertEqual([call["schema_name"] for call in self.llm.calls], ["chapter_plan"])
+        replay_actions = logical_actions[replay_action_start:]
+        self.assertEqual(
+            [self._cycle_action_identity(actions) for actions in replay_actions],
+            [
+                (cycle.channel, cycle.pattern, cycle.requested_strength)
+                for cycle in completed_cycles
+            ],
+        )
 
     def _two_chapter_docx(self) -> bytes:
         document = Document()
@@ -276,6 +336,120 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(story_map)
         return encode_story_map(story_map, schema_version=SCHEMA_VERSION)
+
+    def _assert_selected_chapter_request(self, story) -> None:
+        self.assertEqual(len(self.llm.calls), 1)
+        call = self.llm.calls[0]
+        self.assertEqual(call["schema_name"], "chapter_plan")
+        request = json.loads(call["user_content"])
+        story_map = self.state.story_analysis_store.load(
+            offline_analysis_key(story, self.state.story_dlc_version)
+        )
+        self.assertIsNotNone(story_map)
+        chapter = story_map.chapters[0]
+        scene = chapter.scenes[0]
+        self.assertEqual(
+            request,
+            {
+                "chapter": {
+                    "id": chapter.id,
+                    "index": 0,
+                    "start_offset": chapter.start_offset,
+                    "end_offset": chapter.end_offset,
+                    "title": chapter.title,
+                    "summary": chapter.summary,
+                },
+                "chapter_text": story.text[chapter.start_offset : chapter.end_offset],
+                "scenes": [
+                    {
+                        "scene_id": scene.id,
+                        "index": 0,
+                        "start_offset": scene.start_offset,
+                        "end_offset": scene.end_offset,
+                        "summary": scene.summary,
+                    }
+                ],
+                "capabilities": {
+                    "A": {
+                        "modes": ["keep", "set", "stop"],
+                        "set_fields": ["base_strength"],
+                        "effective_cap": self.harness.safety.cap_for("A"),
+                    },
+                    "B": {
+                        "modes": ["keep", "set", "stop"],
+                        "set_fields": ["base_strength"],
+                        "effective_cap": self.harness.safety.cap_for("B"),
+                    },
+                },
+                "constraints": {
+                    "faithful_mode": True,
+                    "preserve_scene_order": True,
+                    "one_entry_per_scene": True,
+                    "waveform_source": "seeded_resolver",
+                },
+            },
+        )
+        second_chapter = story_map.chapters[1]
+        forbidden = (
+            story.text[second_chapter.start_offset : second_chapter.end_offset],
+            second_chapter.id,
+            second_chapter.scenes[0].id,
+            second_chapter.summary,
+            second_chapter.scenes[0].summary,
+            "whole_book",
+            "other_chapters",
+            "chat",
+            "camera",
+            "microphone",
+        )
+        for content in (call["system_prompt"], call["user_content"]):
+            for forbidden_value in forbidden:
+                self.assertNotIn(forbidden_value, content)
+        mutated = dict(request)
+        mutated["chapter_text"] = request["chapter_text"] + story.text[
+            second_chapter.start_offset : second_chapter.end_offset
+        ]
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated, request)
+
+    def _record_game_loop_boundaries(self):
+        logical_actions: list[tuple[dict[str, object], ...]] = []
+        logical_clears: list[tuple[str | None, tuple[list, list]]] = []
+        original_timeline_actions = self.harness.loop.execute_timeline_actions
+        original_clear_output = self.harness.loop.clear_output
+
+        async def record_timeline_actions(actions, owner_generations):
+            logical_actions.append(tuple(deepcopy(actions)))
+            return await original_timeline_actions(actions, owner_generations)
+
+        async def record_clear_output(channel=None):
+            result = await original_clear_output(channel)
+            logical_clears.append((channel, result))
+            return result
+
+        self.harness.loop.execute_timeline_actions = record_timeline_actions
+        self.harness.loop.clear_output = record_clear_output
+        self.addCleanup(
+            setattr,
+            self.harness.loop,
+            "execute_timeline_actions",
+            original_timeline_actions,
+        )
+        self.addCleanup(
+            setattr, self.harness.loop, "clear_output", original_clear_output
+        )
+        return logical_actions, logical_clears
+
+    @staticmethod
+    def _cycle_action_identity(actions):
+        if len(actions) != 2:
+            raise AssertionError("replay must execute a strength and one cycle action")
+        strength, cycle = actions
+        if strength.get("op") != "hold_strength" or cycle.get("op") != "pulse_cycle":
+            raise AssertionError("replay did not execute the recorded cycle actions")
+        if strength.get("channel") != cycle.get("channel"):
+            raise AssertionError("replay cycle actions used different channels")
+        return strength["channel"], cycle.get("pattern"), strength.get("value")
 
     def _run_candidate_cli(self, action: str, source_path: Path, candidate_path: Path) -> None:
         stdout = io.StringIO()
