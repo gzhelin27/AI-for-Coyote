@@ -475,9 +475,10 @@ class GameLoop:
                 session_state = controller.to_state()
                 session_takeover_active = session_state.mode in (
                     "autopilot",
+                    "novel",
                     "replay",
                 )
-                if session_state.mode == "autopilot" and session_state.status.value in (
+                if session_state.mode in ("autopilot", "novel") and session_state.status.value in (
                     "running",
                     "paused",
                     "finishing",

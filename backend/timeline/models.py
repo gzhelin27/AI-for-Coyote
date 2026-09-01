@@ -342,6 +342,7 @@ class ReplayManifest:
     completed_at: str | None = None
     source_hash: str | None = None
     checksums: Mapping[str, str] | None = None
+    metadata: Mapping[str, Any] | None = None
     adjusted: bool = False
 
     def __post_init__(self) -> None:
@@ -373,6 +374,7 @@ class ReplayManifest:
             (self.random_profile, "random_profile"),
             (self.safety_caps, "safety_caps"),
             (self.checksums, "checksums"),
+            (self.metadata, "metadata"),
         ):
             if value is not None:
                 mapping = _require_mapping(value, name)
@@ -411,6 +413,9 @@ class ReplayManifest:
             "completed_at": self.completed_at,
             "source_hash": self.source_hash,
             "checksums": dict(self.checksums or {}),
+            "metadata": (
+                None if self.metadata is None else dict(self.metadata)
+            ),
             "adjusted": self.adjusted,
         }
 
@@ -434,7 +439,7 @@ class ReplayManifest:
             "app_commit", "model", "dlc_role", "dlc_profile", "dlc_version",
             "app_fingerprint", "dlc_fingerprint",
             "random_profile", "safety_caps", "created_at", "completed_at",
-            "source_hash", "checksums", "adjusted",
+            "source_hash", "checksums", "metadata", "adjusted",
         ):
             if field in data:
                 values[field] = data[field]
@@ -508,8 +513,8 @@ class SessionState:
     def __post_init__(self) -> None:
         if not isinstance(self.status, SessionStatus):
             raise ValueError("status must be a SessionStatus")
-        if self.mode is not None and self.mode not in ("autopilot", "replay"):
-            raise ValueError("mode must be autopilot, replay, or None")
+        if self.mode is not None and self.mode not in ("autopilot", "novel", "replay"):
+            raise ValueError("mode must be autopilot, novel, replay, or None")
         _require_non_negative_int(self.cursor, "cursor")
         if not isinstance(self.adjusted, bool):
             raise ValueError("adjusted must be a boolean")

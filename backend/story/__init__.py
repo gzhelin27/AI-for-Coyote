@@ -11,6 +11,12 @@ from .offline_analysis import (
     offline_analysis_key,
 )
 from .source import StorySourceEncoding, StorySourceError, StorySourceLoader
+from .session import (
+    NovelSessionController,
+    NovelSessionError,
+    NovelSessionState,
+    NovelSessionStatus,
+)
 
 __all__ = (
     "AnalysisKey",
@@ -22,6 +28,10 @@ __all__ = (
     "OFFLINE_PRODUCER",
     "OfflineAnalysisError",
     "OfflineAnalysisImporter",
+    "NovelSessionController",
+    "NovelSessionError",
+    "NovelSessionState",
+    "NovelSessionStatus",
     "StoryChapter",
     "StoryMap",
     "StoryScene",

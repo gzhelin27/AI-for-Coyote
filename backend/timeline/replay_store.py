@@ -39,6 +39,17 @@ _MAX_COMPRESSED_MEMBER_SIZES = {
 _MAX_COMPRESSED_SOURCE_SIZE = 33 * 1024 * 1024
 _MAX_ARCHIVE_SIZE = 50 * 1024 * 1024
 _ALLOWED_COMPRESSION_METHODS = frozenset((zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED))
+_NOVEL_METADATA_KEYS = frozenset(
+    (
+        "analysis_version",
+        "chapter_id",
+        "content_type",
+        "dlc_version",
+        "source_encoding",
+        "source_text_hash",
+        "speed",
+    )
+)
 
 
 def _path_key(path: Path) -> str:
@@ -180,6 +191,11 @@ class ReplayStore:
                 raise ReplayStoreError("replay source extension is not allowed")
         if scenes is not None:
             _validate_scenes(scenes)
+        _validate_novel_archive(
+            manifest,
+            has_scenes=scenes is not None,
+            source_extension=source_extension,
+        )
 
         timeline_bytes = _json_bytes(timeline.to_dict())
         payloads = {"timeline.json": timeline_bytes}
@@ -361,6 +377,13 @@ class ReplayStore:
             manifest = ReplayManifest.from_dict(manifest_data)
         except (TypeError, ValueError) as exc:
             raise ReplayStoreError("replay archive has invalid schema") from exc
+        _validate_novel_archive(
+            manifest,
+            has_scenes="scenes.json" in payloads,
+            source_extension=(
+                source_names[0].partition(".")[2] if source_names else None
+            ),
+        )
         _validate_checksums(manifest.checksums, payloads)
         try:
             timeline = Timeline.from_dict(json.loads(payloads["timeline.json"]))
@@ -512,6 +535,40 @@ def _validate_payload_sizes(payloads: dict[str, bytes]) -> None:
 def _validate_scenes(scenes: object) -> None:
     if not isinstance(scenes, dict) or scenes.get("schema_version") != SCHEMA_VERSION:
         raise ReplayStoreError("replay scenes have invalid schema")
+
+
+def _validate_novel_archive(
+    manifest: ReplayManifest,
+    *,
+    has_scenes: bool,
+    source_extension: str | None,
+) -> None:
+    metadata = manifest.metadata
+    claims_novel = manifest.mode == "novel" or (
+        isinstance(metadata, dict) and metadata.get("content_type") == "novel"
+    )
+    if not claims_novel:
+        return
+    if manifest.mode != "novel" or not isinstance(metadata, dict):
+        raise ReplayStoreError("novel replay metadata is invalid")
+    if set(metadata) != _NOVEL_METADATA_KEYS:
+        raise ReplayStoreError("novel replay metadata fields are invalid")
+    if not all(isinstance(value, str) and value.strip() for value in metadata.values()):
+        raise ReplayStoreError("novel replay metadata values are invalid")
+    if metadata["content_type"] != "novel":
+        raise ReplayStoreError("novel replay metadata content type is invalid")
+    if metadata["speed"] not in ("slow", "standard", "fast"):
+        raise ReplayStoreError("novel replay metadata speed is invalid")
+    if metadata["source_encoding"] not in ("auto", "utf-8", "gb18030"):
+        raise ReplayStoreError("novel replay metadata source encoding is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", metadata["source_text_hash"]) is None:
+        raise ReplayStoreError("novel replay metadata source hash is invalid")
+    if metadata["dlc_version"] != manifest.dlc_version:
+        raise ReplayStoreError("novel replay metadata DLC version is invalid")
+    if not has_scenes or source_extension not in _SOURCE_EXTENSIONS:
+        raise ReplayStoreError(
+            "novel replay requires exactly one source member and scenes.json"
+        )
 
 
 def _validate_timeline(timeline: Timeline) -> None:

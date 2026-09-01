@@ -70,6 +70,18 @@ def rewrite_member_metadata(
 
 
 class ReplayStoreTests(unittest.TestCase):
+    @staticmethod
+    def novel_metadata() -> dict[str, str]:
+        return {
+            "analysis_version": "faithful-offline-v1",
+            "chapter_id": "chapter-1",
+            "content_type": "novel",
+            "dlc_version": "dlc-v1",
+            "source_encoding": "utf-8",
+            "source_text_hash": "a" * 64,
+            "speed": "standard",
+        }
+
     def test_save_writes_zip_through_open_exclusive_temp_handle(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ReplayStore(Path(tmp))
@@ -337,6 +349,78 @@ class ReplayStoreTests(unittest.TestCase):
                 {"timeline.json", "scenes.json", "source.md"},
             )
             self.assertIsNotNone(loaded.manifest.source_hash)
+
+    def test_novel_archive_requires_source_scenes_and_exact_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            manifest = replace(
+                bundle.manifest,
+                mode="novel",
+                dlc_version="dlc-v1",
+                metadata=self.novel_metadata(),
+            )
+            scenes = {"schema_version": 1, "source_hash": "a" * 64, "chapters": []}
+
+            for missing in ("source", "scenes"):
+                kwargs = {
+                    "scenes": scenes,
+                    "source": b"original",
+                    "source_extension": "txt",
+                }
+                if missing == "source":
+                    kwargs.update(source=None, source_extension=None)
+                else:
+                    kwargs["scenes"] = None
+                with self.subTest(missing=missing), self.assertRaisesRegex(
+                    ReplayStoreError, "novel"
+                ):
+                    store.save(manifest, bundle.timeline, **kwargs)
+
+            path = store.save(
+                manifest,
+                bundle.timeline,
+                scenes=scenes,
+                source=b"original",
+                source_extension="txt",
+            )
+            loaded = store.load(manifest.replay_id)
+
+            self.assertTrue(path.is_file())
+            self.assertEqual(loaded.manifest.metadata, self.novel_metadata())
+            self.assertEqual(
+                set(loaded.manifest.checksums or {}),
+                {"timeline.json", "scenes.json", "source.txt"},
+            )
+
+    def test_rejects_novel_claim_with_incomplete_or_mismatched_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReplayStore(Path(tmp))
+            bundle = make_replay_bundle(gap_tenths=[], status="completed")
+            scenes = {"schema_version": 1, "source_hash": "a" * 64, "chapters": []}
+            invalid_values = (
+                {key: value for key, value in self.novel_metadata().items() if key != "speed"},
+                {**self.novel_metadata(), "speed": "warp"},
+                {**self.novel_metadata(), "dlc_version": "other-dlc"},
+            )
+
+            for metadata in invalid_values:
+                manifest = replace(
+                    bundle.manifest,
+                    mode="novel",
+                    dlc_version="dlc-v1",
+                    metadata=metadata,
+                )
+                with self.subTest(metadata=metadata), self.assertRaisesRegex(
+                    ReplayStoreError, "metadata"
+                ):
+                    store.save(
+                        manifest,
+                        bundle.timeline,
+                        scenes=scenes,
+                        source=b"original",
+                        source_extension="txt",
+                    )
 
     def test_rejects_conflicting_duplicate_cycle_records(self):
         with tempfile.TemporaryDirectory() as tmp:

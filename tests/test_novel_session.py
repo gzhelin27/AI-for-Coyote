@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from backend.story.models import ImportedStory, StoryChapter, StoryMap, StoryScene
+from backend.story.planner import ChapterTimelineRequest, ValidatedChapterPlan
+from backend.story.session import (
+    NovelSessionController,
+    NovelSessionError,
+    NovelSessionStatus,
+)
+from backend.timeline.models import (
+    ChannelDirective,
+    CycleGapPolicy,
+    DirectiveMode,
+    PlotEvent,
+    SessionStatus,
+)
+from tests.timeline_fakes import SessionHarness
+
+
+def make_novel_inputs() -> tuple[ImportedStory, StoryMap, ValidatedChapterPlan]:
+    source_hash = "a" * 64
+    text = "ABCDE12345"
+    first_scene = StoryScene(
+        id=StoryScene.stable_id(source_hash, 0, 0),
+        index=0,
+        start_offset=0,
+        end_offset=5,
+        summary="第一场。",
+        pace=1.0,
+    )
+    second_scene = StoryScene(
+        id=StoryScene.stable_id(source_hash, 0, 1),
+        index=1,
+        start_offset=5,
+        end_offset=10,
+        summary="第二场。",
+        pace=1.0,
+    )
+    chapter = StoryChapter(
+        id=StoryChapter.stable_id(source_hash, 0),
+        index=0,
+        start_offset=0,
+        end_offset=10,
+        title="第一章",
+        summary="完整章节。",
+        scenes=(first_scene, second_scene),
+    )
+    story_map = StoryMap(
+        source_hash=source_hash,
+        text_length=len(text),
+        chapters=(chapter,),
+    )
+    story = ImportedStory(
+        filename="original.txt",
+        extension=".txt",
+        original_bytes=text.encode("utf-8"),
+        text=text,
+        source_sha256=source_hash,
+    )
+    first_event = PlotEvent(
+        event_id=f"{chapter.id}-evt-0001",
+        scene_id=first_scene.id,
+        offset_ms=0,
+        channels={
+            "A": ChannelDirective(
+                channel="A",
+                mode=DirectiveMode.SET,
+                pattern="呼吸",
+                base_strength=20,
+                resolved_strength=22,
+            ),
+            "B": ChannelDirective(channel="B", mode=DirectiveMode.KEEP),
+        },
+    )
+    second_event = PlotEvent(
+        event_id=f"{chapter.id}-evt-0002",
+        scene_id=second_scene.id,
+        offset_ms=1_000,
+        channels={
+            "A": ChannelDirective(channel="A", mode=DirectiveMode.STOP),
+            "B": ChannelDirective(
+                channel="B",
+                mode=DirectiveMode.SET,
+                pattern="呼吸",
+                base_strength=10,
+                resolved_strength=12,
+            ),
+        },
+    )
+    request = ChapterTimelineRequest(
+        plot_events=(first_event, second_event),
+        chapter_duration_ms=2_000,
+        cycle_gap_policy=CycleGapPolicy(),
+    )
+    plan = ValidatedChapterPlan(
+        source_hash=source_hash,
+        chapter_id=chapter.id,
+        speed="standard",
+        seed=71,
+        plot_events=request.plot_events,
+        chapter_duration_ms=request.chapter_duration_ms,
+        timeline_request=request,
+    )
+    return story, story_map, plan
+
+
+class NovelSessionControllerTests(unittest.IsolatedAsyncioTestCase):
+    def make_controller(
+        self,
+    ) -> tuple[SessionHarness, NovelSessionController, ImportedStory, StoryMap, ValidatedChapterPlan]:
+        harness = SessionHarness.create(seed=71)
+        novel = NovelSessionController(
+            harness.controller,
+            source_encoding="utf-8",
+            analysis_version="faithful-offline-v1",
+            dlc_version="dlc-test-v1",
+        )
+        story, story_map, plan = make_novel_inputs()
+        return harness, novel, story, story_map, plan
+
+    async def wait_for_scene(
+        self, novel: NovelSessionController, scene_id: str
+    ) -> None:
+        for _ in range(100):
+            if novel.to_state().current_scene_id == scene_id:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError(f"novel session did not reach scene {scene_id}")
+
+    async def advance_to_scene(
+        self,
+        harness: SessionHarness,
+        novel: NovelSessionController,
+        scene_id: str,
+    ) -> None:
+        for _ in range(100):
+            if novel.to_state().current_scene_id == scene_id:
+                return
+            remaining = harness.clock.next_remaining_ms
+            if remaining is not None:
+                harness.clock.advance(remaining)
+            await asyncio.sleep(0)
+        raise AssertionError(f"novel session did not advance to scene {scene_id}")
+
+    async def test_validated_plan_autoplays_through_the_injected_session_owner(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+
+        state = await novel.start(plan, story, story_map)
+        await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
+
+        self.assertEqual(state.status, NovelSessionStatus.RUNNING)
+        self.assertEqual(harness.to_state().mode, "novel")
+        self.assertIsNone(harness.player)
+        self.assertEqual(harness.resolver.calls, [])
+        self.assertIs(novel.session_controller, harness.controller)
+
+    async def test_invalid_plan_fails_before_any_output_or_archive(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        forged = replace(plan, source_hash="b" * 64)
+
+        with self.assertRaises(NovelSessionError):
+            await novel.start(forged, story, story_map)
+
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.IDLE)
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(harness.game_loop.execute_calls, [])
+        self.assertEqual(harness.clear_calls, [])
+        self.assertEqual(harness.store.list(), [])
+
+    async def test_pause_clears_immediately_and_preserves_the_event_cursor(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await self.advance_to_scene(
+            harness, novel, plan.plot_events[1].scene_id
+        )
+        before = novel.to_state()
+
+        paused = await novel.pause()
+
+        self.assertEqual(paused.status, NovelSessionStatus.PAUSED)
+        self.assertEqual(paused.cursor, before.cursor)
+        self.assertEqual(paused.current_scene_id, before.current_scene_id)
+        self.assertEqual(harness.clear_calls[-1:], [None])
+        self.assertEqual(harness.store.list(), [])
+
+    async def test_chapter_duration_stops_the_last_scene_without_early_archive(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+
+        for _ in range(200):
+            if harness.to_state().status is SessionStatus.PAUSED:
+                break
+            remaining = harness.clock.next_remaining_ms
+            if remaining is not None:
+                harness.clock.advance(remaining)
+            await asyncio.sleep(0)
+
+        self.assertEqual(harness.to_state().status, SessionStatus.PAUSED)
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.PAUSED)
+        self.assertEqual(harness.clear_calls[-1:], [None])
+        self.assertEqual(harness.store.list(), [])
+
+    async def test_all_resume_positions_clear_then_reposition_authoritatively(self):
+        for from_, expected_cursor in (
+            ("current", 1),
+            ("chapter_start", 0),
+            ("beginning", 0),
+        ):
+            with self.subTest(from_=from_):
+                harness, novel, story, story_map, plan = self.make_controller()
+                self.addAsyncCleanup(harness.close)
+                await novel.start(plan, story, story_map)
+                await self.advance_to_scene(
+                    harness, novel, plan.plot_events[1].scene_id
+                )
+                await novel.pause()
+                clear_count = len(harness.clear_calls)
+
+                resumed = await novel.resume(from_=from_)
+                expected_scene = plan.plot_events[expected_cursor].scene_id
+                await self.wait_for_scene(novel, expected_scene)
+
+                self.assertEqual(resumed.status, NovelSessionStatus.RUNNING)
+                self.assertEqual(novel.to_state().cursor, expected_cursor)
+                self.assertEqual(novel.to_state().current_scene_id, expected_scene)
+                resume_clears = harness.clear_calls[clear_count:]
+                self.assertEqual(resume_clears[0], None)
+                self.assertEqual(resume_clears.count(None), 1)
+                self.assertIsNone(harness.player)
+                await novel.abort()
+
+    async def test_resume_current_materializes_prior_set_for_a_keep_scene(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        keep_event = replace(
+            plan.plot_events[1],
+            channels={
+                "A": ChannelDirective(channel="A", mode=DirectiveMode.KEEP),
+                "B": ChannelDirective(channel="B", mode=DirectiveMode.KEEP),
+            },
+        )
+        request = replace(
+            plan.timeline_request,
+            plot_events=(plan.plot_events[0], keep_event),
+        )
+        keep_plan = replace(
+            plan,
+            plot_events=request.plot_events,
+            timeline_request=request,
+        )
+        await novel.start(keep_plan, story, story_map)
+        await self.advance_to_scene(harness, novel, keep_event.scene_id)
+        await novel.pause()
+
+        await novel.resume(from_="current")
+        await self.wait_for_scene(novel, keep_event.scene_id)
+
+        runner = harness.runners.get("A")
+        self.assertIsNotNone(runner)
+        self.assertEqual(runner.state().directive.pattern, "呼吸")
+        self.assertEqual(runner.state().directive.requested_strength, 22)
+
+    async def test_chat_actions_cannot_mutate_the_validated_novel_plan(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
+
+        with self.assertRaisesRegex(RuntimeError, "novel"):
+            await harness.process_live_turn(
+                [{"op": "hold_strength", "channel": "B", "value": 99}]
+            )
+        self.assertIs(novel.plan, plan)
+        summary = await novel.finish()
+        archived = harness.store.load(summary.replay_id)
+
+        self.assertEqual(archived.timeline.plot_events, plan.plot_events)
+        self.assertEqual(harness.resolver.calls, [])
+
+    async def test_finish_embeds_exact_source_scenes_and_novel_metadata(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
+
+        summary = await novel.finish()
+        archived = harness.store.load(summary.replay_id)
+
+        self.assertEqual(novel.to_state().status, NovelSessionStatus.IDLE)
+        self.assertEqual(archived.source, story.original_bytes)
+        self.assertEqual(archived.source_extension, "txt")
+        self.assertEqual(archived.scenes["source_hash"], story_map.source_hash)
+        self.assertEqual(
+            [item["id"] for item in archived.scenes["chapters"]],
+            [chapter.id for chapter in story_map.chapters],
+        )
+        self.assertEqual(
+            archived.manifest.metadata,
+            {
+                "analysis_version": "faithful-offline-v1",
+                "chapter_id": plan.chapter_id,
+                "content_type": "novel",
+                "dlc_version": "dlc-test-v1",
+                "source_encoding": "utf-8",
+                "source_text_hash": story.source_sha256,
+                "speed": plan.speed,
+            },
+        )
+        self.assertEqual(
+            set(archived.manifest.checksums or {}),
+            {"timeline.json", "scenes.json", "source.txt"},
+        )
+
+    async def test_disconnect_aborts_without_creating_history(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
+
+        state = await novel.on_disconnect()
+
+        self.assertEqual(state.status, NovelSessionStatus.IDLE)
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(harness.store.list(), [])
+        self.assertEqual(harness.clear_calls[-1:], [None])
+
+    async def test_authoritative_session_disconnect_reconciles_novel_state(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
+
+        await harness.on_disconnect()
+        state = novel.to_state()
+
+        self.assertEqual(state.status, NovelSessionStatus.IDLE)
+        self.assertIsNone(novel.plan)
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+        self.assertEqual(harness.store.list(), [])
+
+    async def test_exact_replay_never_calls_the_chapter_planner_or_resolver(self):
+        harness, novel, story, story_map, plan = self.make_controller()
+        self.addAsyncCleanup(harness.close)
+        await novel.start(plan, story, story_map)
+        await self.wait_for_scene(novel, plan.plot_events[0].scene_id)
+        harness.clock.advance(200)
+        await asyncio.sleep(0)
+        summary = await novel.finish()
+        resolver_calls = list(harness.resolver.calls)
+
+        with patch(
+            "backend.story.planner.ChapterPlanner.plan",
+            new=AsyncMock(side_effect=AssertionError("planner called during replay")),
+        ) as planning:
+            await harness.start_replay(summary.replay_id)
+            for _ in range(100):
+                if harness.to_state().status is SessionStatus.IDLE:
+                    break
+                remaining = harness.clock.next_remaining_ms
+                if remaining is not None:
+                    harness.clock.advance(remaining)
+                await asyncio.sleep(0)
+
+        planning.assert_not_awaited()
+        self.assertEqual(harness.resolver.calls, resolver_calls)
+        self.assertEqual(harness.to_state().status, SessionStatus.IDLE)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import random
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
 from .cycle_runner import ChannelCycleRunner, CycleDirective, RunnerPhase
 from .models import (
     SCHEMA_VERSION,
+    ChannelDirective,
     ChannelPlaybackState,
     CycleGapPolicy,
     CycleRecord,
@@ -30,6 +32,30 @@ from .replay_store import ReplayStore, ReplaySummary
 
 
 _CHANNELS = ("A", "B")
+_LIVE_MODES = ("autopilot", "novel")
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedSessionArchive:
+    """Immutable novel attachments handed to the existing session owner."""
+
+    scenes: Mapping[str, Any]
+    source: bytes
+    source_extension: str
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scenes, Mapping):
+            raise TypeError("planned archive scenes must be a mapping")
+        if not isinstance(self.source, bytes):
+            raise TypeError("planned archive source must be bytes")
+        if self.source_extension not in ("txt", "md", "docx"):
+            raise ValueError("planned archive source extension is invalid")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("planned archive metadata must be a mapping")
+        object.__setattr__(self, "scenes", deepcopy(dict(self.scenes)))
+        object.__setattr__(self, "source", bytes(self.source))
+        object.__setattr__(self, "metadata", deepcopy(dict(self.metadata)))
 
 
 class _AsyncioSleeper:
@@ -179,6 +205,11 @@ class SessionController:
         self._safety_caps: dict[str, int] = {}
         self._live_clear_required = False
         self._output_generations: dict[str, int] = {}
+        self._planned_events: tuple[PlotEvent, ...] = ()
+        self._planned_duration_ms = 0
+        self._planned_task: asyncio.Task[None] | None = None
+        self._archive: PlannedSessionArchive | None = None
+        self._planned_resume_directives: dict[str, ChannelDirective] = {}
 
     @property
     def runners(self) -> Mapping[str, ChannelCycleRunner]:
@@ -244,6 +275,88 @@ class SessionController:
                 self._install_runner(channel)
             return self.to_state()
 
+    async def start_planned(
+        self,
+        *,
+        plot_events: Sequence[PlotEvent],
+        chapter_duration_ms: int,
+        seed: int,
+        cycle_gap_policy: CycleGapPolicy,
+        archive: PlannedSessionArchive,
+    ) -> SessionState:
+        """Start a prevalidated chapter without a second player or output owner."""
+
+        events = tuple(plot_events)
+        if not events or not all(isinstance(event, PlotEvent) for event in events):
+            raise ValueError("planned session requires PlotEvent values")
+        if tuple(event.offset_ms for event in events)[0] != 0 or any(
+            current.offset_ms <= previous.offset_ms
+            for previous, current in zip(events, events[1:])
+        ):
+            raise ValueError("planned session event offsets must start at zero and increase")
+        if (
+            isinstance(chapter_duration_ms, bool)
+            or not isinstance(chapter_duration_ms, int)
+            or chapter_duration_ms <= events[-1].offset_ms
+        ):
+            raise ValueError("planned session duration must extend beyond its events")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("planned session seed must be an integer")
+        if not isinstance(cycle_gap_policy, CycleGapPolicy):
+            raise TypeError("cycle_gap_policy must be a CycleGapPolicy")
+        if not isinstance(archive, PlannedSessionArchive):
+            raise TypeError("archive must be a PlannedSessionArchive")
+        for event in events:
+            if set(event.channels) != set(_CHANNELS):
+                raise ValueError("planned events must provide exactly A and B")
+            for directive in event.channels.values():
+                if (
+                    directive.mode is DirectiveMode.SET
+                    and directive.pattern not in self._frames
+                ):
+                    raise ValueError("planned event waveform is unavailable")
+
+        async with self._lock:
+            self._require_estop_inactive()
+            if self._status is not SessionStatus.IDLE:
+                raise RuntimeError("a timeline session is already active")
+            metadata = self._current_manifest_metadata()
+            metadata["dlc_version"] = archive.metadata.get("dlc_version", "")
+            session_id = self._require_id(
+                self._session_id_factory(), "session ID"
+            )
+            created_at = self._timestamp_factory()
+            safety_caps = self._current_caps()
+            cycle_rngs = self._new_cycle_rngs_for_seed(seed)
+
+            self._set_status(SessionStatus.RUNNING)
+            self._mode = "novel"
+            self._manifest_metadata = metadata
+            self.seed = seed
+            self.policy = cycle_gap_policy
+            self._session_id = session_id
+            self._replay_id = None
+            self._resolver = None
+            self._cycle_rngs = cycle_rngs
+            self._plot_events = list(events)
+            self._cycle_records = {}
+            self._retained = {}
+            self._event_cursor = 0
+            self._current_event_id = None
+            self._created_at = created_at
+            self._active_started_at = self._clock()
+            self._pause_started_at = None
+            self._paused_total_ms = 0
+            self._safety_caps = safety_caps
+            self._live_clear_required = False
+            self._runners = {}
+            self._planned_events = events
+            self._planned_duration_ms = chapter_duration_ms
+            self._archive = archive
+            self._planned_resume_directives = {}
+            self._start_planned_task_locked(0)
+            return self.to_state()
+
     async def process_live_turn(
         self,
         actions: Sequence[Mapping[str, Any]],
@@ -261,6 +374,8 @@ class SessionController:
                     and self._routing_generation != expected_routing_generation
                 ):
                     return None
+                if self._mode == "novel":
+                    raise RuntimeError("novel sessions reject live chat actions")
                 if (
                     self._status is not SessionStatus.RUNNING
                     or self._mode != "autopilot"
@@ -283,56 +398,11 @@ class SessionController:
                 )
                 if not isinstance(resolved, PlotEvent):
                     raise TypeError("resolver must return a PlotEvent")
-                self._plot_events.append(resolved)
-                self._current_event_id = resolved.event_id
-
-                requested_stops = tuple(
-                    channel
-                    for channel, directive in resolved.channels.items()
-                    if directive.mode is DirectiveMode.STOP
+                submissions = await self._activate_event_locked(
+                    resolved,
+                    cursor=self._event_cursor,
+                    append=True,
                 )
-                if requested_stops:
-                    self._require_output_clear(requested_stops)
-
-                stopped_channels: list[str] = []
-                for channel, directive in resolved.channels.items():
-                    if directive.mode is DirectiveMode.KEEP:
-                        continue
-                    if directive.mode is DirectiveMode.STOP:
-                        self._retained.pop(channel, None)
-                        await self._retire_runner_locked(channel, "plot_stop")
-                        stopped_channels.append(channel)
-                        continue
-
-                    cycle_directive = CycleDirective(
-                        channel=channel,
-                        plot_event_id=resolved.event_id,
-                        pattern=directive.pattern or "",
-                        requested_strength=(
-                            directive.resolved_strength
-                            if directive.resolved_strength is not None
-                            else 0
-                        ),
-                    )
-                    self._retained[channel] = cycle_directive
-                    runner = self._runners.get(channel)
-                    if runner is not None and runner.state().phase is RunnerPhase.STOPPED:
-                        await self._settle_stopped_runner_locked(channel, runner)
-                        if self._status is not SessionStatus.RUNNING:
-                            continue
-                        runner = self._runners.get(channel)
-                    if runner is None:
-                        runner = self._install_runner(channel)
-                    submissions.append((channel, runner, cycle_directive))
-
-                if stopped_channels:
-                    if set(stopped_channels) == set(_CHANNELS):
-                        result = await self.game_loop.clear_output()
-                        self._require_clear_result(result)
-                    else:
-                        for channel in stopped_channels:
-                            result = await self.game_loop.clear_output(channel)
-                            self._require_clear_result(result, channel)
 
             for channel, runner, directive in submissions:
                 async with self._lock:
@@ -348,6 +418,224 @@ class SessionController:
                             continue
                     raise
             return resolved
+
+    async def _dispatch_planned_event(
+        self,
+        event: PlotEvent,
+        *,
+        cursor: int,
+        routing_generation: int,
+    ) -> bool:
+        async with self._turn_lock:
+            async with self._lock:
+                if (
+                    self._routing_generation != routing_generation
+                    or self._status is not SessionStatus.RUNNING
+                    or self._mode != "novel"
+                    or cursor >= len(self._planned_events)
+                    or self._planned_events[cursor] != event
+                ):
+                    return False
+                submissions = await self._activate_event_locked(
+                    event,
+                    cursor=cursor,
+                    append=False,
+                )
+
+            for channel, runner, directive in submissions:
+                async with self._lock:
+                    if not self._submission_is_current(channel, runner, directive):
+                        continue
+                try:
+                    await runner.submit(directive)
+                except RuntimeError:
+                    async with self._lock:
+                        if not self._submission_is_current(
+                            channel, runner, directive
+                        ):
+                            continue
+                    raise
+            return True
+
+    async def _activate_event_locked(
+        self,
+        resolved: PlotEvent,
+        *,
+        cursor: int,
+        append: bool,
+    ) -> list[tuple[str, ChannelCycleRunner, CycleDirective]]:
+        if append:
+            self._plot_events.append(resolved)
+        self._event_cursor = cursor
+        self._current_event_id = resolved.event_id
+
+        requested_stops = tuple(
+            channel
+            for channel, directive in resolved.channels.items()
+            if directive.mode is DirectiveMode.STOP
+        )
+        if requested_stops:
+            self._require_output_clear(requested_stops)
+
+        submissions: list[tuple[str, ChannelCycleRunner, CycleDirective]] = []
+        stopped_channels: list[str] = []
+        for channel, directive in resolved.channels.items():
+            if directive.mode is DirectiveMode.KEEP:
+                resumed = self._planned_resume_directives.pop(channel, None)
+                if resumed is None:
+                    continue
+                directive = resumed
+            if directive.mode is DirectiveMode.STOP:
+                self._retained.pop(channel, None)
+                await self._retire_runner_locked(channel, "plot_stop")
+                stopped_channels.append(channel)
+                continue
+
+            cycle_directive = CycleDirective(
+                channel=channel,
+                plot_event_id=resolved.event_id,
+                pattern=directive.pattern or "",
+                requested_strength=(
+                    directive.resolved_strength
+                    if directive.resolved_strength is not None
+                    else 0
+                ),
+            )
+            self._retained[channel] = cycle_directive
+            runner = self._runners.get(channel)
+            if runner is not None and runner.state().phase is RunnerPhase.STOPPED:
+                await self._settle_stopped_runner_locked(channel, runner)
+                if self._status is not SessionStatus.RUNNING:
+                    continue
+                runner = self._runners.get(channel)
+            if runner is None:
+                runner = self._install_runner(channel)
+            submissions.append((channel, runner, cycle_directive))
+
+        if stopped_channels:
+            if set(stopped_channels) == set(_CHANNELS):
+                result = await self.game_loop.clear_output()
+                self._require_clear_result(result)
+            else:
+                for channel in stopped_channels:
+                    result = await self.game_loop.clear_output(channel)
+                    self._require_clear_result(result, channel)
+        self._planned_resume_directives = {}
+        return submissions
+
+    def _start_planned_task_locked(self, cursor: int) -> None:
+        previous = self._planned_task
+        if previous is not None and not previous.done():
+            raise RuntimeError("planned session scheduler is already active")
+        generation = self._routing_generation
+        self._planned_task = asyncio.create_task(
+            self._run_planned_events(cursor, generation),
+            name="timeline-planned-session",
+        )
+
+    async def _run_planned_events(
+        self,
+        cursor: int,
+        routing_generation: int,
+    ) -> None:
+        current_task = asyncio.current_task()
+        try:
+            previous_offset = self._planned_events[cursor].offset_ms
+            for index in range(cursor, len(self._planned_events)):
+                event = self._planned_events[index]
+                if index != cursor:
+                    await self._sleeper.sleep(event.offset_ms - previous_offset)
+                    previous_offset = event.offset_ms
+                if not await self._dispatch_planned_event(
+                    event,
+                    cursor=index,
+                    routing_generation=routing_generation,
+                ):
+                    return
+            await self._sleeper.sleep(
+                self._planned_duration_ms - self._planned_events[-1].offset_ms
+            )
+            async with self._lock:
+                if (
+                    self._planned_task is current_task
+                    and self._routing_generation == routing_generation
+                    and self._status is SessionStatus.RUNNING
+                    and self._mode == "novel"
+                ):
+                    await self._pause_live_locked("planned_session_complete")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            async with self._lock:
+                if (
+                    self._planned_task is current_task
+                    and self._status is SessionStatus.RUNNING
+                    and self._mode == "novel"
+                ):
+                    await self._pause_live_locked("planned_session_failure")
+        finally:
+            if self._planned_task is current_task:
+                self._planned_task = None
+
+    async def _cancel_planned_task_locked(self) -> None:
+        task = self._planned_task
+        if task is None:
+            return
+        if task is asyncio.current_task():
+            self._planned_task = None
+            return
+        self._planned_task = None
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def resume_planned(self, cursor: int) -> SessionState:
+        """Clear, reposition, then resume a validated planned session."""
+
+        async with self._lock:
+            if self._mode != "novel" or self._status is not SessionStatus.PAUSED:
+                raise RuntimeError("no paused novel session to resume")
+            if (
+                isinstance(cursor, bool)
+                or not isinstance(cursor, int)
+                or not 0 <= cursor < len(self._planned_events)
+            ):
+                raise ValueError("planned session cursor is out of range")
+            self._require_estop_inactive()
+            await self._clear_live_output_locked()
+            if self._pause_started_at is None:
+                raise RuntimeError("paused novel session has no pause timestamp")
+            paused_ms = max(
+                0, int(round((self._clock() - self._pause_started_at) * 1000))
+            )
+            self._paused_total_ms += paused_ms
+            self._pause_started_at = None
+            self._retained = {}
+            self._runners = {}
+            self._planned_resume_directives = self._resume_directives(cursor)
+            self._event_cursor = cursor
+            self._current_event_id = None
+            self._set_status(SessionStatus.RUNNING)
+            self._start_planned_task_locked(cursor)
+            return self.to_state()
+
+    def _resume_directives(self, cursor: int) -> dict[str, ChannelDirective]:
+        current = self._planned_events[cursor]
+        materialized: dict[str, ChannelDirective] = {}
+        for channel in _CHANNELS:
+            active: ChannelDirective | None = None
+            for event in self._planned_events[: cursor + 1]:
+                directive = event.channels[channel]
+                if directive.mode is DirectiveMode.SET:
+                    active = directive
+                elif directive.mode is DirectiveMode.STOP:
+                    active = None
+            if (
+                current.channels[channel].mode is DirectiveMode.KEEP
+                and active is not None
+            ):
+                materialized[channel] = active
+        return materialized
 
     async def suspend_channel_for_safety(
         self, channel: str, *, reason: str
@@ -365,7 +653,7 @@ class SessionController:
             async with self._lock:
                 if (
                     self._status is not SessionStatus.RUNNING
-                    or self._mode != "autopilot"
+                    or self._mode not in _LIVE_MODES
                 ):
                     return False
                 if channel in self._runners:
@@ -380,7 +668,7 @@ class SessionController:
             async with self._lock:
                 if (
                     self._status is not SessionStatus.RUNNING
-                    or self._mode != "autopilot"
+                    or self._mode not in _LIVE_MODES
                     or not self._enabled_channels().get(channel, False)
                 ):
                     return
@@ -399,14 +687,14 @@ class SessionController:
                     self._set_status(SessionStatus.FINISHING)
                     await self._player.pause()
                     self._set_status(SessionStatus.PAUSED)
-                elif self._mode == "autopilot" and self._live_clear_required:
+                elif self._mode in _LIVE_MODES and self._live_clear_required:
                     await self._pause_live_locked("operator_pause_retry")
                 return self.to_state()
             if self._status is SessionStatus.FINISHING:
                 if self._mode == "replay" and self._player is not None:
                     await self._player.pause()
                     self._set_status(SessionStatus.PAUSED)
-                elif self._mode == "autopilot" and self._live_clear_required:
+                elif self._mode in _LIVE_MODES and self._live_clear_required:
                     await self._pause_live_locked("operator_pause_retry")
                 else:
                     raise RuntimeError("session cleanup is still pending")
@@ -418,13 +706,15 @@ class SessionController:
                 await self._player.pause()
                 self._set_status(SessionStatus.PAUSED)
                 return self.to_state()
-            if self._status is not SessionStatus.RUNNING or self._mode != "autopilot":
+            if self._status is not SessionStatus.RUNNING or self._mode not in _LIVE_MODES:
                 raise RuntimeError("no running session to pause")
             await self._pause_live_locked("operator_pause")
             return self.to_state()
 
     async def resume(self, cursor: int | None = None) -> SessionState:
         async with self._lock:
+            if self._mode == "novel":
+                raise RuntimeError("novel sessions must resume through resume_planned")
             if self._mode == "autopilot" and cursor is not None:
                 raise ValueError("live sessions do not accept a replay cursor")
             if self._status is SessionStatus.RUNNING and self._mode == "autopilot":
@@ -455,7 +745,7 @@ class SessionController:
 
     async def finish(self) -> ReplaySummary:
         async with self._lock:
-            if self._mode != "autopilot" or self._status not in (
+            if self._mode not in _LIVE_MODES or self._status not in (
                 SessionStatus.RUNNING,
                 SessionStatus.PAUSED,
                 SessionStatus.FINISHING,
@@ -471,6 +761,7 @@ class SessionController:
             self._require_output_clear(_CHANNELS)
             runners = tuple(self._runners.values())
             try:
+                await self._cancel_planned_task_locked()
                 await self._cancel_runner_watchers_locked()
                 await self._quiesce_runners(runners, reason="finish", clear=True)
                 self._require_estop_inactive()
@@ -495,7 +786,16 @@ class SessionController:
                 session_id=session_id,
             )
             try:
-                self.store.save(manifest, timeline)
+                if self._archive is None:
+                    self.store.save(manifest, timeline)
+                else:
+                    self.store.save(
+                        manifest,
+                        timeline,
+                        scenes=deepcopy(dict(self._archive.scenes)),
+                        source=self._archive.source,
+                        source_extension=self._archive.source_extension,
+                    )
             except Exception:
                 self._set_status(SessionStatus.PAUSED)
                 raise
@@ -508,6 +808,9 @@ class SessionController:
 
     async def on_disconnect(self) -> SessionState:
         async with self._lock:
+            if self._mode == "novel":
+                await self._abort_live_locked("disconnect")
+                return self.to_state()
             if self._status is SessionStatus.PAUSED:
                 if self._mode == "replay" and self._player is not None:
                     self._set_status(SessionStatus.FINISHING)
@@ -593,23 +896,27 @@ class SessionController:
                 self._reset_idle()
                 return self.to_state()
 
-            if self._status is SessionStatus.RUNNING:
-                await self._pause_live_locked("stop")
-            elif self._status in (
-                SessionStatus.PAUSED,
-                SessionStatus.FINISHING,
-            ) and self._live_clear_required:
-                await self._pause_live_locked("stop")
-            await self._cancel_runner_watchers_locked()
-            await asyncio.gather(
-                *(
-                    runner.stop(clear=False, reason="stop")
-                    for runner in self._runners.values()
-                ),
-                return_exceptions=True,
-            )
-            self._reset_idle()
+            await self._abort_live_locked("stop")
             return self.to_state()
+
+    async def _abort_live_locked(self, reason: str) -> None:
+        await self._cancel_planned_task_locked()
+        if self._status is SessionStatus.RUNNING:
+            await self._pause_live_locked(reason)
+        elif self._status in (
+            SessionStatus.PAUSED,
+            SessionStatus.FINISHING,
+        ) and self._live_clear_required:
+            await self._pause_live_locked(reason)
+        await self._cancel_runner_watchers_locked()
+        await asyncio.gather(
+            *(
+                runner.stop(clear=False, reason=reason)
+                for runner in self._runners.values()
+            ),
+            return_exceptions=True,
+        )
+        self._reset_idle()
 
     def to_state(self) -> SessionState:
         cursor = (
@@ -640,7 +947,7 @@ class SessionController:
                 channel: ChannelPlaybackState.from_dict(value)
                 for channel, value in self._player.channel_states().items()
             }
-        if self._mode != "autopilot" or self._status is SessionStatus.IDLE:
+        if self._mode not in _LIVE_MODES or self._status is SessionStatus.IDLE:
             return {channel: ChannelPlaybackState() for channel in _CHANNELS}
 
         channels: dict[str, ChannelPlaybackState] = {}
@@ -673,6 +980,7 @@ class SessionController:
         return channels
 
     async def _pause_live_locked(self, reason: str) -> None:
+        await self._cancel_planned_task_locked()
         if self._pause_started_at is None:
             self._pause_started_at = self._clock()
         self._live_clear_required = True
@@ -822,7 +1130,7 @@ class SessionController:
             async with self._lock:
                 if (
                     self._status is SessionStatus.RUNNING
-                    and self._mode == "autopilot"
+                    and self._mode in _LIVE_MODES
                     and self._runners.get(channel) is runner
                 ):
                     await self._settle_stopped_runner_locked(channel, runner, state)
@@ -1019,7 +1327,7 @@ class SessionController:
             session_id=session_id,
             seed=self.seed,
             status=SessionStatus.COMPLETED,
-            mode="autopilot",
+            mode=self._mode or "autopilot",
             random_profile={
                 "strength_jitter": self.strength_jitter,
                 "waveform_policy": self.waveform_policy,
@@ -1028,6 +1336,11 @@ class SessionController:
             safety_caps=dict(self._safety_caps),
             created_at=self._created_at,
             completed_at=self._timestamp_factory(),
+            metadata=(
+                deepcopy(dict(self._archive.metadata))
+                if self._archive is not None
+                else None
+            ),
             adjusted=False,
             **allowed_metadata,
         )
@@ -1052,11 +1365,14 @@ class SessionController:
         return True
 
     def _new_cycle_rngs(self) -> dict[str, Any]:
+        return self._new_cycle_rngs_for_seed(self.seed)
+
+    def _new_cycle_rngs_for_seed(self, session_seed: int) -> dict[str, Any]:
         if self._provided_cycle_rngs is not None:
             return dict(self._provided_cycle_rngs)
         return {
             channel: random.Random(
-                derive_stream_seed(self.seed, f"cycle:{channel}")
+                derive_stream_seed(session_seed, f"cycle:{channel}")
             )
             for channel in _CHANNELS
         }
@@ -1078,7 +1394,7 @@ class SessionController:
     ) -> bool:
         return (
             self._status is SessionStatus.RUNNING
-            and self._mode == "autopilot"
+            and self._mode in _LIVE_MODES
             and self._runners.get(channel) is runner
             and self._retained.get(channel) == directive
         )
@@ -1148,6 +1464,11 @@ class SessionController:
         self._safety_caps = {}
         self._live_clear_required = False
         self._output_generations = {}
+        self._planned_events = ()
+        self._planned_duration_ms = 0
+        self._planned_task = None
+        self._archive = None
+        self._planned_resume_directives = {}
         self._runner_executor.clear_owner_generations()
 
     def _set_status(self, status: SessionStatus) -> None:
