@@ -90,8 +90,8 @@ export default function ChatPanel() {
 
   return (
     <aside className="flex min-h-[340px] flex-col border-l border-line bg-ink2">
-      <div className="flex flex-none items-center border-b border-line px-4 py-2">
-        <div className="flex items-center gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-1">
+      <div className="chat-header flex flex-none items-center border-b border-line px-4 py-2">
+        <div className="min-w-0 flex items-center gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-1">
           <span className="text-[11px] text-faint">当前主题</span>
           <span className="text-[12px] font-semibold text-text">{role}</span>
           <span
@@ -100,9 +100,9 @@ export default function ChatPanel() {
             {LEVEL_LABELS[level] ?? level}
           </span>
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <span className="rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-muted">{sessionLabel}</span>
-          <span className="rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-warn">不改变原文剧情</span>
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
+          <span className="min-w-0 break-words rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-muted">{sessionLabel}</span>
+          <span className="min-w-0 break-words rounded-md border border-line bg-ink3 px-2 py-1 text-[11px] text-warn">不改变原文剧情</span>
           <button
             onClick={() => {
               if (!window.confirm("清空对话历史？将清空聊天记录与 AI 的记忆上下文，设备强度不受影响。")) return;

@@ -16,7 +16,9 @@ import { doEstop } from "./commands";
 import { isTimelineStateActive } from "./timelineState";
 import {
   applyRealtimeState,
+  beginRealtimeEpoch,
   invalidateStateRefresh,
+  isCurrentRealtimeEpoch,
   refreshAppState,
 } from "./stateRefresh";
 
@@ -125,12 +127,14 @@ export default function App() {
     let ws: WebSocket;
     const connect = () => {
       if (closed) return;
+      const epoch = beginRealtimeEpoch();
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(proto + "//" + location.host + "/ws");
       ws.onmessage = (ev) => {
+        if (!isCurrentRealtimeEpoch(epoch)) return;
         const msg = JSON.parse(ev.data);
         if (msg.type === "state") {
-          applyRealtimeState(mapFullState(msg.data as BackendFullState));
+          applyRealtimeState(mapFullState(msg.data as BackendFullState), epoch);
           schedulePoll();
         } else if (msg.type === "chat") {
           const extra: string[] = [];
@@ -139,7 +143,9 @@ export default function App() {
           useChat.getState().push({ role: "ai", text: msg.line ?? "", actions: extra.join("\n") });
         }
       };
-      ws.onclose = () => setTimeout(connect, 2000);
+      ws.onclose = () => {
+        if (isCurrentRealtimeEpoch(epoch)) setTimeout(connect, 2000);
+      };
     };
     connect();
     document.addEventListener("visibilitychange", onVisibilityChange);

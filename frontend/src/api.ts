@@ -13,6 +13,7 @@ import type {
   ReplayHistoryItem,
   StoryAnalysisDetail,
   StoryChapterSummary,
+  StoryFinishResult,
   StorySourceSummary,
   TimelineSessionState,
 } from "./types";
@@ -38,13 +39,21 @@ export function mapStoryError(code: unknown): string {
   }
 }
 
+export function storyErrorMessage(error: unknown): string {
+  const text = error instanceof Error ? error.message : "";
+  return Object.values({
+    a: mapStoryError("analysis_missing"), b: mapStoryError("analysis_invalid"), c: mapStoryError("reader_range_invalid"),
+    d: mapStoryError("story_not_found"), e: mapStoryError("chapter_plan_failed"), f: mapStoryError("story_runtime_busy"),
+  }).includes(text) ? text : mapStoryError(undefined);
+}
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
     let msg = `${resp.status} ${resp.statusText}`;
     try {
       const data = (await resp.json()) as { code?: unknown; error?: string };
-      if (typeof data?.code === "string" && (data.code.startsWith("story_") || data.code.startsWith("analysis_") || data.code === "reader_range_invalid" || data.code === "chapter_plan_failed")) {
+      if (path.startsWith("/api/story/") || path === "/api/story/import") {
         msg = mapStoryError(data.code);
       } else if (data?.error) msg = data.error;
     } catch {
@@ -213,7 +222,7 @@ export const api = {
   storyPause: () => j<NovelSessionState>("/api/story/pause", json({})),
   storyResume: (from: "current" | "chapter_start" | "beginning") =>
     j<NovelSessionState>("/api/story/resume", json({ from })),
-  storyFinish: () => j<{ session: NovelSessionState }>("/api/story/finish", json({})),
+  storyFinish: () => j<StoryFinishResult>("/api/story/finish", json({})),
   setAutopilot: (enabled: boolean) =>
     j<{ ok: boolean }>("/api/autopilot", json({ enabled })),
   timelineStart: () =>

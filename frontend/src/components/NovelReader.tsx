@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { api } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { api, storyErrorMessage } from "../api";
+import { ReaderSliceGate, readerPageRange } from "../readerPaging";
 import { refreshAppState } from "../stateRefresh";
 import { useApp } from "../store";
 import type { ReaderTextSlice, StoryChapterSummary } from "../types";
@@ -18,7 +19,12 @@ export default function NovelReader() {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [slice, setSlice] = useState<ReaderTextSlice | null>(null);
+  const [pageStart, setPageStart] = useState<number | null>(null);
+  const sliceGate = useRef(new ReaderSliceGate());
   const session = story?.session;
+
+  const page = session?.reader_start_offset !== null && session?.reader_start_offset !== undefined && session.reader_end_offset !== null && session.reader_end_offset !== undefined
+    ? readerPageRange(session.reader_start_offset, session.reader_end_offset, pageStart) : null;
 
   useEffect(() => {
     if (story?.chapters.length && !story.chapters.some((chapter) => chapter.chapter_id === chapterId)) {
@@ -33,17 +39,17 @@ export default function NovelReader() {
       session.reader_start_offset === null ||
       session.reader_end_offset === null
     ) {
-      setSlice(null);
+      setSlice(null); setError(""); setPageStart(null);
       return;
     }
-    const start = session.reader_start_offset;
-    const end = Math.min(session.reader_end_offset, start + 8192);
-    let cancelled = false;
-    api.storyReaderText(start, end)
-      .then((next) => { if (!cancelled) setSlice(next); })
-      .catch(() => { if (!cancelled) setError("无法读取当前正文片段"); });
-    return () => { cancelled = true; };
-  }, [session?.status, session?.reader_start_offset, session?.reader_end_offset, session?.current_scene_id]);
+    if (!page) return;
+    const key = `${session.current_scene_id ?? "scene"}:${page.start}:${page.end}`;
+    const token = sliceGate.current.begin(key);
+    setSlice(null); setError("");
+    api.storyReaderText(page.start, page.end)
+      .then((next) => { if (sliceGate.current.isCurrent(token, key)) { setSlice(next); setError(""); } })
+      .catch((cause) => { if (sliceGate.current.isCurrent(token, key)) setError(storyErrorMessage(cause)); });
+  }, [session?.status, session?.reader_start_offset, session?.reader_end_offset, session?.current_scene_id, page?.start, page?.end]);
 
   const run = async (action: () => Promise<unknown>) => {
     if (pending) return;
@@ -52,8 +58,8 @@ export default function NovelReader() {
     try {
       await action();
       await refreshAppState();
-    } catch {
-      setError("小说操作未完成，请检查当前离线分析和会话状态。");
+    } catch (cause) {
+      setError(storyErrorMessage(cause));
     } finally {
       setPending(false);
     }
@@ -83,7 +89,7 @@ export default function NovelReader() {
       {(session?.status === "running" || session?.status === "paused") && (
         <>
           <SessionStatus chapter={activeChapter} progress={session.progress} sceneId={session.current_scene_id} status={session.status} />
-          <ReaderText slice={slice} />
+          <ReaderText slice={slice} page={page} onPage={setPageStart} />
           <ChannelPublicState current={state?.current} patterns={state?.patterns} />
           <div className="mt-3 flex flex-wrap gap-2">
             {session.status === "running" && <ActionButton disabled={pending} onClick={() => void run(() => api.storyPause())}>暂停</ActionButton>}
@@ -120,9 +126,9 @@ function SessionStatus({ chapter, progress, sceneId, status }: { chapter: StoryC
   return <div className="mt-3 rounded-lg border border-line bg-ink2 p-3"><div className="flex flex-wrap justify-between gap-2 text-[12px]"><span>{status === "paused" ? "阅读已暂停" : "忠实阅读中"}</span><span className="text-muted">{chapter ? `第 ${chapter.index + 1} 章` : "章节加载中"} · {percent}%</span></div><div className="mt-2 h-1.5 overflow-hidden rounded bg-ink3"><div className="h-full bg-accent" style={{ width: `${percent}%` }} /></div><p className="mt-2 text-[11px] text-muted">当前场景：{sceneId ?? "等待场景"}</p></div>;
 }
 
-function ReaderText({ slice }: { slice: ReaderTextSlice | null }) {
+function ReaderText({ slice, page, onPage }: { slice: ReaderTextSlice | null; page: ReturnType<typeof readerPageRange> | null; onPage: (start: number) => void }) {
   if (!slice) return <div className="mt-3 rounded-lg border border-line bg-ink2 p-3 text-sm text-muted">正在加载当前原文片段…</div>;
-  return <article className="reader-text mt-3 rounded-lg border border-line bg-ink2 p-4 text-[14px] leading-7 text-text"><p className="mb-2 text-[10px] text-faint">原文片段 {slice.start}–{slice.end} / {slice.text_length}</p>{slice.text}</article>;
+  return <article className="reader-text mt-3 rounded-lg border border-line bg-ink2 p-4 text-[14px] leading-7 text-text"><p className="mb-2 text-[10px] text-faint">原文片段 {slice.start}–{slice.end} / {slice.text_length}</p>{slice.text}{page && (page.hasPrevious || page.hasNext) && <div className="mt-3 flex gap-2"><ActionButton disabled={!page.hasPrevious} onClick={() => onPage(page.start - 8192)}>上一页</ActionButton><ActionButton disabled={!page.hasNext} onClick={() => onPage(page.end)}>下一页</ActionButton></div>}</article>;
 }
 
 function ChannelPublicState({ current, patterns }: { current: Record<"A" | "B", number> | undefined; patterns: Record<"A" | "B", string | null> | undefined }) {

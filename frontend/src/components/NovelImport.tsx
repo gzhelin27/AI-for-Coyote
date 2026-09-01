@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { api } from "../api";
 import { refreshAppState } from "../stateRefresh";
 import { useApp } from "../store";
+import { analysisStatusGuidance, buildMissingAnalysisCommand } from "../storyUi";
 import type { StorySourceSummary } from "../types";
 
 const encodings: { value: StorySourceSummary["encoding"]; label: string }[] = [
@@ -24,8 +25,12 @@ export default function NovelImport() {
     setNotice("");
     try {
       await api.storyImport(file, encoding);
-      await refreshAppState();
-      setNotice("原文已导入，本地分析状态已刷新。");
+      try {
+        await refreshAppState();
+        setNotice("原文已导入，本地分析状态已刷新。");
+      } catch {
+        setNotice("原文已导入，正在等待状态刷新。");
+      }
     } catch {
       setNotice("小说导入失败，请确认文件格式和编码后重试。");
     } finally {
@@ -72,7 +77,8 @@ export default function NovelImport() {
           <div>原文标识：{source.hash_prefix} · {source.encoding}</div>
         </div>
       )}
-      {analysis?.status === "missing" && <MissingAnalysis hashPrefix={analysis.hash_prefix} />}
+      {analysis && <div className="mt-2 text-[10px] leading-relaxed text-faint">{analysisStatusGuidance(analysis.status)}<br />分析版本：{analysis.analysis_version}<br />DLC：{analysis.dlc_version}</div>}
+      {analysis?.status === "missing" && <MissingAnalysis hashPrefix={analysis.hash_prefix} encoding={source?.encoding ?? encoding} />}
       {analysis?.status === "invalid" && <InvalidAnalysis hashPrefix={analysis.hash_prefix} />}
       {notice && <p className="mt-2 text-[11px] leading-relaxed text-warn">{notice}</p>}
     </section>
@@ -85,12 +91,13 @@ function StatusBadge({ status }: { status: "ready" | "missing" | "invalid" }) {
   return <span className={`rounded-md border border-line bg-ink3 px-1.5 py-0.5 text-[10px] ${color}`}>{text}</span>;
 }
 
-function MissingAnalysis({ hashPrefix }: { hashPrefix: string }) {
+function MissingAnalysis({ hashPrefix, encoding }: { hashPrefix: string; encoding: StorySourceSummary["encoding"] }) {
   return (
     <div className="mt-2 rounded-md border border-warn/40 bg-warn/10 p-2 text-[11px] leading-relaxed text-warn">
       <div>缺少原文 {hashPrefix} 的离线分析。</div>
       <div className="mt-1 text-muted">请让 Codex 基于本地原文生成候选 JSON，再在项目终端运行：</div>
-      <code className="mt-1 block break-all text-[10px] text-text">python -m backend.story.import_analysis import --source &lt;小说路径&gt; --map &lt;Codex 生成的候选 JSON 路径&gt; --encoding auto</code>
+      <div className="mt-1 text-muted">将候选保存为 <code className="text-text">data/story_candidates/{hashPrefix}.json</code>，再运行：</div>
+      <pre className="mt-1 whitespace-pre-wrap break-all text-[10px] text-text">{buildMissingAnalysisCommand(hashPrefix, encoding)}</pre>
     </div>
   );
 }

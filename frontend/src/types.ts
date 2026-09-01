@@ -260,13 +260,24 @@ export interface ReplayHistoryItem {
   exact: boolean;
 }
 
-export interface BackendReplaySummary {
+export interface ReplaySummary {
   replay_id: string;
+  session_id: string;
   status: string;
+  mode: string;
   title: string;
   cycle_count: number;
-  completed_at?: string | null;
-  dlc_role?: string;
-  dlc_profile?: string;
-  adjusted?: boolean;
+  created_at: string;
+  completed_at: string | null;
+  model: string;
+  dlc_role: string;
+  dlc_profile: string;
+  adjusted: boolean;
+}
+
+export type BackendReplaySummary = ReplaySummary;
+
+export interface StoryFinishResult {
+  replay: ReplaySummary;
+  session: NovelSessionState;
 }

@@ -1,25 +1,26 @@
 import { api } from "./api";
 import { useApp } from "./store";
 import type { FullState } from "./types";
-import { StateRefreshGate, StateRevisionGate } from "./stateRefreshGate";
+import { StateSyncGate } from "./stateRefreshGate";
 
-const gate = new StateRefreshGate();
-const revisionGate = new StateRevisionGate();
+const gate = new StateSyncGate();
 
 export function invalidateStateRefresh(): void {
-  gate.invalidate();
+  gate.invalidateHttp();
 }
 
-export function applyRealtimeState(state: FullState): void {
-  if (!revisionGate.shouldApply(state.state_revision)) return;
-  gate.invalidate();
+export function beginRealtimeEpoch(): number { return gate.beginRealtimeEpoch(); }
+export function isCurrentRealtimeEpoch(epoch: number): boolean { return gate.isCurrentRealtimeEpoch(epoch); }
+
+export function applyRealtimeState(state: FullState, epoch: number): void {
+  if (!gate.shouldApplyRealtime(epoch, state.state_revision)) return;
   useApp.getState().setState(state);
 }
 
 export async function refreshAppState(): Promise<FullState | null> {
-  const requestGeneration = gate.beginRequest();
+  const requestGeneration = gate.beginHttpRequest();
   const state = await api.state();
-  if (!gate.isCurrent(requestGeneration)) return null;
+  if (!gate.shouldApplyHttp(requestGeneration, state.state_revision)) return null;
   useApp.getState().setState(state);
   return state;
 }
