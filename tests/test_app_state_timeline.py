@@ -94,7 +94,11 @@ class ProductionAppStateTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.relay = LifecycleRelay()
         self.camera = LifecycleSensor()
         self.audio = LifecycleSensor()
-        self.llm = SimpleNamespace(chat=AsyncMock(return_value=("line", [])))
+        self.llm = SimpleNamespace(
+            model="model-one",
+            chat=AsyncMock(return_value=("line", [])),
+            complete_json=AsyncMock(),
+        )
         self.logger = SimpleNamespace(
             info=lambda *_args, **_kwargs: None,
             warning=lambda *_args, **_kwargs: None,

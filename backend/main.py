@@ -9,6 +9,7 @@
 import asyncio
 import contextlib
 from copy import deepcopy
+from dataclasses import dataclass
 import io
 import json
 import os
@@ -22,7 +23,7 @@ from pathlib import Path
 
 import httpx
 import qrcode
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -47,6 +48,20 @@ from .logging_utils import setup_logging
 from .provenance import dlc_provenance, runtime_content_fingerprint
 from .relay_client import RelayClient
 from .safety import DeviceOutputError, SafetyManager
+from .story import (
+    OFFLINE_ANALYSIS_VERSION,
+    AnalysisLookup,
+    AnalysisStore,
+    ImportedStory,
+    NovelSessionController,
+    NovelSessionError,
+    NovelSessionState,
+    StoryMap,
+    StorySourceError,
+    StorySourceLoader,
+    offline_analysis_key,
+)
+from .story.planner import ChapterPlanError, ChapterPlanner
 from .timeline.models import CycleGapPolicy
 from .timeline.replay_store import ReplayStore, ReplayStoreError, ReplaySummary
 from .timeline.session import SessionController
@@ -57,6 +72,88 @@ if getattr(sys, "frozen", False):
 else:
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+_READER_SLICE_MAX_CHARS = 8192
+_WINDOWS_REPARSE_POINT = 0x400
+
+
+@dataclass(slots=True)
+class _StorySourceRecord:
+    """One server-owned source mapping; its storage path is never serialized."""
+
+    source_id: str
+    story: ImportedStory
+    encoding: str
+    storage_path: Path
+    published_lookup: AnalysisLookup | None = None
+
+
+def _path_is_redirect(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except OSError:
+        return False
+    return path.is_symlink() or bool(
+        getattr(details, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+    )
+
+
+def _story_data_directory(value: object, name: str) -> Path:
+    """Resolve one configured repository-local data directory without redirects."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a configured local directory")
+    configured = Path(value)
+    if configured.is_absolute():
+        raise ValueError(f"{name} must be repository-local")
+    root = PROJECT_ROOT.resolve()
+    candidate = (PROJECT_ROOT / configured).absolute()
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{name} must remain beneath the project root") from exc
+    relative = candidate.relative_to(PROJECT_ROOT.absolute())
+    current = PROJECT_ROOT.absolute()
+    for component in relative.parts:
+        current = current / component
+        if current.exists() and _path_is_redirect(current):
+            raise ValueError(f"{name} contains a filesystem redirect")
+    return candidate
+
+
+def _store_story_source(
+    directory: Path, story: ImportedStory, encoding: str
+) -> _StorySourceRecord:
+    """Persist one validated source beneath a generated opaque server ID."""
+
+    if any(_path_is_redirect(candidate) for candidate in (directory, *directory.parents)):
+        raise OSError("story storage directory is unsafe")
+    directory.mkdir(parents=True, exist_ok=True)
+    if any(_path_is_redirect(candidate) for candidate in (directory, *directory.parents)):
+        raise OSError("story storage directory is unsafe")
+    resolved_directory = directory.resolve(strict=True)
+    for _ in range(16):
+        source_id = secrets.token_urlsafe(18)
+        target = directory / f"{source_id}{story.extension}"
+        if target.resolve(strict=False).parent != resolved_directory:
+            raise OSError("story storage target is unsafe")
+        try:
+            with target.open("xb") as source_file:
+                source_file.write(story.original_bytes)
+                source_file.flush()
+                os.fsync(source_file.fileno())
+        except FileExistsError:
+            continue
+        except OSError:
+            with contextlib.suppress(OSError):
+                target.unlink()
+            raise
+        return _StorySourceRecord(
+            source_id=source_id,
+            story=story,
+            encoding=encoding,
+            storage_path=target,
+        )
+    raise OSError("could not allocate an opaque story source id")
 
 def _release_version() -> str:
     """Return only a safe release label suitable for public display."""
@@ -174,6 +271,171 @@ def _replay_summary_payload(summary: ReplaySummary) -> dict:
     }
 
 
+def _story_source_payload(record: _StorySourceRecord) -> dict[str, object]:
+    story = record.story
+    return {
+        "source_id": record.source_id,
+        "filename": story.filename,
+        "extension": story.extension,
+        "encoding": record.encoding,
+        "hash_prefix": story.source_sha256[:12],
+        "text_length": len(story.text),
+    }
+
+
+def _story_analysis_payload(
+    state: "AppState", record: _StorySourceRecord, status: str
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "hash_prefix": record.story.source_sha256[:12],
+        "analysis_version": OFFLINE_ANALYSIS_VERSION,
+        "dlc_version": state.story_dlc_version,
+    }
+
+
+def _story_chapters_payload(story_map: StoryMap) -> list[dict[str, object]]:
+    return [
+        {
+            "chapter_id": chapter.id,
+            "index": chapter.index,
+            "title": chapter.title,
+            "summary": chapter.summary,
+            "start_offset": chapter.start_offset,
+            "end_offset": chapter.end_offset,
+            "scene_count": len(chapter.scenes),
+        }
+        for chapter in story_map.chapters
+    ]
+
+
+def _novel_session_payload(session: NovelSessionState) -> dict[str, object]:
+    return {
+        "status": session.status.value,
+        "hash_prefix": (
+            session.source_hash[:12] if session.source_hash is not None else None
+        ),
+        "filename": session.filename,
+        "chapter_id": session.chapter_id,
+        "speed": session.speed,
+        "cursor": session.cursor,
+        "current_scene_id": session.current_scene_id,
+        "reader_start_offset": session.reader_start_offset,
+        "reader_end_offset": session.reader_end_offset,
+        "progress": session.progress,
+    }
+
+
+def _idle_novel_session_payload() -> dict[str, object]:
+    return {
+        "status": "idle",
+        "hash_prefix": None,
+        "filename": None,
+        "chapter_id": None,
+        "speed": None,
+        "cursor": 0,
+        "current_scene_id": None,
+        "reader_start_offset": None,
+        "reader_end_offset": None,
+        "progress": 0.0,
+    }
+
+
+def _story_record(state: "AppState", source_id: str) -> _StorySourceRecord | None:
+    sources = getattr(state, "story_sources", None)
+    if not isinstance(sources, dict):
+        return None
+    record = sources.get(source_id)
+    return record if isinstance(record, _StorySourceRecord) else None
+
+
+def _active_story_record(state: "AppState") -> _StorySourceRecord | None:
+    source_id = getattr(state, "active_story_source_id", None)
+    return _story_record(state, source_id) if isinstance(source_id, str) else None
+
+
+def _inspect_story_analysis(
+    state: "AppState", record: _StorySourceRecord
+) -> AnalysisLookup:
+    published = record.published_lookup
+    if published is not None:
+        return published
+    key = offline_analysis_key(record.story, state.story_dlc_version)
+    return state.story_analysis_store.inspect(key)
+
+
+def _story_full_state(state: "AppState") -> dict[str, object]:
+    record = _active_story_record(state)
+    novel = getattr(state, "novel_session", None)
+    session_payload = (
+        _novel_session_payload(novel.to_state())
+        if isinstance(novel, NovelSessionController)
+        else _idle_novel_session_payload()
+    )
+    if record is None:
+        return {
+            "selected_source": None,
+            "analysis": None,
+            "chapters": [],
+            "session": session_payload,
+        }
+    lookup = _inspect_story_analysis(state, record)
+    chapters = (
+        _story_chapters_payload(lookup.story_map)
+        if lookup.status == "ready" and lookup.story_map is not None
+        else []
+    )
+    return {
+        "selected_source": _story_source_payload(record),
+        "analysis": _story_analysis_payload(state, record, lookup.status),
+        "chapters": chapters,
+        "session": session_payload,
+    }
+
+
+def _story_not_found_response() -> JSONResponse:
+    return JSONResponse(
+        {"code": "story_not_found", "error": "story source not found"},
+        status_code=404,
+    )
+
+
+def _analysis_error_response(
+    state: "AppState", record: _StorySourceRecord, lookup: AnalysisLookup
+) -> JSONResponse:
+    code = "analysis_invalid" if lookup.status == "invalid" else "analysis_missing"
+    status_code = 422 if lookup.status == "invalid" else 409
+    return JSONResponse(
+        {
+            "code": code,
+            **_story_analysis_payload(state, record, lookup.status),
+        },
+        status_code=status_code,
+    )
+
+
+def _story_transition_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ChapterPlanError):
+        return JSONResponse(
+            {"code": "chapter_plan_failed", "error": "chapter planning failed"},
+            status_code=422,
+        )
+    if isinstance(exc, DeviceOutputError):
+        return JSONResponse(
+            {"code": "story_output_failed", "error": "device output was not confirmed"},
+            status_code=exc.status_code,
+        )
+    if isinstance(exc, (NovelSessionError, RuntimeError, TypeError, ValueError)):
+        return JSONResponse(
+            {"code": "story_transition_invalid", "error": str(exc)},
+            status_code=409,
+        )
+    return JSONResponse(
+        {"code": "story_transition_failed", "error": "story transition failed"},
+        status_code=500,
+    )
+
+
 def _timeline_error_response(exc: Exception) -> JSONResponse:
     if isinstance(exc, _ReplayNotFoundError):
         return JSONResponse({"error": "replay not found"}, status_code=404)
@@ -240,6 +502,46 @@ class AppState:
         )
         self.loop.timeline_session = self.timeline_session
         self.loop.on_ai_turn = self.broadcast_chat  # AI 主动回合推送到页面聊天区
+
+        story_cfg = cfg["story"]
+        max_source_bytes = int(float(story_cfg["max_source_mb"]) * 1024 * 1024)
+        self.story_import_directory = _story_data_directory(
+            story_cfg["import_dir"], "story import directory"
+        )
+        story_analysis_directory = _story_data_directory(
+            story_cfg["analysis_dir"], "story analysis directory"
+        )
+        self.story_source_loader = StorySourceLoader(max_bytes=max_source_bytes)
+        self.story_source_max_bytes = max_source_bytes
+        self.story_analysis_store = AnalysisStore(story_analysis_directory)
+        self.story_sources: dict[str, _StorySourceRecord] = {}
+        self.active_story_source_id: str | None = None
+        self.story_dlc_version = dlc_provenance(
+            cfg,
+            project_root=PROJECT_ROOT,
+            waveform_policy=self.timeline_session.waveform_policy,
+        )
+        self.story_seed_factory = lambda: secrets.randbits(63)
+        self.chapter_planner = ChapterPlanner(
+            self.llm,
+            waveform_registry=self.safety.presets,
+            effective_caps={
+                channel: self.safety.cap_for(channel) for channel in ("A", "B")
+            },
+            reading_speed_cpm=story_cfg["reading_speed_cpm"],
+            cycle_gap_policy=CycleGapPolicy.from_dict(timeline_cfg["cycle_gap"]),
+            safety_adapter=self.safety,
+            model_identity=str(self.llm.model),
+            prompt_version=str(story_cfg["analysis_prompt_version"]),
+            dlc_version=self.story_dlc_version,
+            strength_jitter=int(timeline_cfg["strength_jitter"]),
+        )
+        self.novel_session = NovelSessionController(
+            self.timeline_session,
+            source_encoding="auto",
+            analysis_version=OFFLINE_ANALYSIS_VERSION,
+            dlc_version=self.story_dlc_version,
+        )
 
         self.ws_clients: set[WebSocket] = set()
         self.tasks: list[asyncio.Task] = []
@@ -367,6 +669,7 @@ class AppState:
             "player_nick": str(self.cfg["character"].get("player_nick") or "小柳"),
             "version": _public_app_version(),
         }
+        state["story"] = _story_full_state(self)
         return state
 
     # ---------- 传感器开关（跟随自动运行；浏览器断开超时自动关） ----------
@@ -555,6 +858,191 @@ def make_app() -> FastAPI:
     @app.get("/api/state")
     async def api_state() -> JSONResponse:
         return JSONResponse(state.build_state())
+
+    # ---------- 离线小说来源 / 阅读器 / 会话 ----------
+    @app.post("/api/story/import")
+    async def api_story_import(
+        file: UploadFile = File(...), encoding: str = Form("auto")
+    ) -> JSONResponse:
+        try:
+            source_bytes = await file.read(state.story_source_max_bytes + 1)
+            story = state.story_source_loader.load(
+                file.filename or "", source_bytes, encoding=encoding
+            )
+        except (OSError, OverflowError, StorySourceError, TypeError, ValueError):
+            return JSONResponse(
+                {"code": "story_import_invalid", "error": "story source is invalid"},
+                status_code=400,
+            )
+        try:
+            record = _store_story_source(
+                state.story_import_directory, story, encoding
+            )
+        except OSError:
+            return JSONResponse(
+                {"code": "story_import_failed", "error": "story source could not be stored"},
+                status_code=500,
+            )
+
+        state.story_sources[record.source_id] = record
+        state.active_story_source_id = record.source_id
+        lookup = _inspect_story_analysis(state, record)
+        record.published_lookup = lookup
+        try:
+            await state.broadcast()
+        finally:
+            record.published_lookup = None
+        return JSONResponse(
+            {
+                "source": _story_source_payload(record),
+                "analysis": _story_analysis_payload(state, record, lookup.status),
+            }
+        )
+
+    @app.get("/api/story/{source_id}/analysis")
+    async def api_story_analysis(source_id: str) -> JSONResponse:
+        record = _story_record(state, source_id)
+        if record is None:
+            return _story_not_found_response()
+        lookup = _inspect_story_analysis(state, record)
+        if lookup.status != "ready":
+            return _analysis_error_response(state, record, lookup)
+        return JSONResponse(_story_analysis_payload(state, record, "ready"))
+
+    @app.get("/api/story/{source_id}/chapters")
+    async def api_story_chapters(source_id: str) -> JSONResponse:
+        record = _story_record(state, source_id)
+        if record is None:
+            return _story_not_found_response()
+        lookup = _inspect_story_analysis(state, record)
+        if lookup.status != "ready" or lookup.story_map is None:
+            return _analysis_error_response(state, record, lookup)
+        return JSONResponse(
+            {
+                "source": _story_source_payload(record),
+                "analysis": _story_analysis_payload(state, record, "ready"),
+                "chapters": _story_chapters_payload(lookup.story_map),
+            }
+        )
+
+    @app.post("/api/story/{source_id}/chapters/{chapter_id}/play")
+    async def api_story_play(
+        source_id: str, chapter_id: str, body: dict
+    ) -> JSONResponse:
+        record = _story_record(state, source_id)
+        if record is None:
+            return _story_not_found_response()
+        lookup = _inspect_story_analysis(state, record)
+        if lookup.status != "ready" or lookup.story_map is None:
+            return _analysis_error_response(state, record, lookup)
+        speed = body.get("speed", "standard")
+        try:
+            async with state.timeline_transition_lock:
+                plan = await state.chapter_planner.plan(
+                    record.story,
+                    lookup.story_map,
+                    chapter_id,
+                    speed=speed,
+                    seed=state.story_seed_factory(),
+                )
+                novel_state = await state.novel_session.start(
+                    plan,
+                    record.story,
+                    lookup.story_map,
+                    source_encoding=record.encoding,
+                )
+                state.active_story_source_id = record.source_id
+                payload = _novel_session_payload(novel_state)
+        except Exception as exc:  # The helper maps internal details to stable codes.
+            return _story_transition_error(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.get("/api/story/reader")
+    async def api_story_reader() -> JSONResponse:
+        record = _active_story_record(state)
+        if record is None:
+            return JSONResponse(
+                {"code": "story_reader_missing", "error": "no story is selected"},
+                status_code=409,
+            )
+        lookup = _inspect_story_analysis(state, record)
+        if lookup.status != "ready" or lookup.story_map is None:
+            return _analysis_error_response(state, record, lookup)
+        return JSONResponse(
+            {
+                "source": _story_source_payload(record),
+                "analysis": _story_analysis_payload(state, record, "ready"),
+                "session": _novel_session_payload(state.novel_session.to_state()),
+            }
+        )
+
+    @app.get("/api/story/reader/text")
+    async def api_story_reader_text(start: int, end: int) -> JSONResponse:
+        record = _active_story_record(state)
+        if record is None:
+            return JSONResponse(
+                {"code": "story_reader_missing", "error": "no story is selected"},
+                status_code=409,
+            )
+        lookup = _inspect_story_analysis(state, record)
+        if lookup.status != "ready" or lookup.story_map is None:
+            return _analysis_error_response(state, record, lookup)
+        text = record.story.text
+        if (
+            start < 0
+            or end < start
+            or end > len(text)
+            or end - start > _READER_SLICE_MAX_CHARS
+        ):
+            return JSONResponse(
+                {"code": "reader_range_invalid", "error": "reader range is invalid"},
+                status_code=400,
+            )
+        return JSONResponse(
+            {
+                "start": start,
+                "end": end,
+                "text_length": len(text),
+                "text": text[start:end],
+            }
+        )
+
+    @app.post("/api/story/pause")
+    async def api_story_pause() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                novel_state = await state.novel_session.pause()
+                payload = _novel_session_payload(novel_state)
+        except Exception as exc:
+            return _story_transition_error(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/story/resume")
+    async def api_story_resume(body: dict) -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                novel_state = await state.novel_session.resume(body.get("from", "current"))
+                payload = _novel_session_payload(novel_state)
+        except Exception as exc:
+            return _story_transition_error(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
+
+    @app.post("/api/story/finish")
+    async def api_story_finish() -> JSONResponse:
+        try:
+            async with state.timeline_transition_lock:
+                summary = await state.novel_session.finish()
+                payload = {
+                    "replay": _replay_summary_payload(summary),
+                    "session": _novel_session_payload(state.novel_session.to_state()),
+                }
+        except Exception as exc:
+            return _story_transition_error(exc)
+        await state.broadcast()
+        return JSONResponse(payload)
 
     # ---------- 时间线会话 / 重放 ----------
     @app.post("/api/session/start")

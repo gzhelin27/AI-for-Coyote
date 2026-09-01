@@ -98,6 +98,8 @@ class NovelSessionController:
         plan: ValidatedChapterPlan,
         story: ImportedStory,
         story_map: StoryMap,
+        *,
+        source_encoding: str | None = None,
     ) -> NovelSessionState:
         async with self._lock:
             try:
@@ -109,6 +111,15 @@ class NovelSessionController:
                 self._phase = NovelSessionStatus.PLANNING
                 try:
                     chapter = self._validate_start(plan, story, story_map)
+                    archive_encoding = (
+                        self._source_encoding
+                        if source_encoding is None
+                        else source_encoding
+                    )
+                    if archive_encoding not in _SOURCE_ENCODINGS:
+                        raise NovelSessionError(
+                            "source encoding must be auto, utf-8, or gb18030"
+                        )
                     archive = PlannedSessionArchive(
                         scenes=encode_story_map(
                             story_map, schema_version=SCHEMA_VERSION
@@ -120,7 +131,7 @@ class NovelSessionController:
                             "chapter_id": plan.chapter_id,
                             "content_type": "novel",
                             "dlc_version": self._dlc_version,
-                            "source_encoding": self._source_encoding,
+                            "source_encoding": archive_encoding,
                             "source_text_hash": story.source_sha256,
                             "speed": plan.speed,
                         },
