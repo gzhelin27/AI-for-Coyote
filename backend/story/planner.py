@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from collections.abc import Mapping
@@ -17,6 +18,7 @@ from .models import ImportedStory, StoryChapter, StoryMap, StoryScene
 
 _CHANNELS = ("A", "B")
 _SPEEDS = ("slow", "standard", "fast")
+_MAX_CANONICAL_REQUEST_BYTES = 128 * 1024 * 1024
 _SYSTEM_PROMPT = """\
 You are a faithful chapter device-intent planner. Use only the supplied selected
 chapter text and its ordered scene metadata. Return exactly one JSON object whose
@@ -111,6 +113,7 @@ class _SceneIntent:
 class _IntentCacheKey:
     source_hash: str
     chapter_id: str
+    request_fingerprint: str
     model_identity: str
     prompt_version: str
     dlc_version: str
@@ -220,14 +223,16 @@ class ChapterPlanner:
         chapter = self._select_chapter(story, story_map, chapter_id, speed, seed)
         offsets, duration_ms = self._scene_timing(chapter, story.text, speed)
         intents = await self._cached_intents(story, chapter)
+        if len(intents) != len(chapter.scenes) or len(offsets) != len(chapter.scenes):
+            raise ChapterPlanError("chapter plan internal scene count mismatch")
         resolver = TimelineResolver(
             strength_jitter=self._strength_jitter,
             session_seed=seed,
         )
         events: list[PlotEvent] = []
-        for index, (scene, intent, offset_ms) in enumerate(
-            zip(chapter.scenes, intents, offsets, strict=True)
-        ):
+        for index, scene in enumerate(chapter.scenes):
+            intent = intents[index]
+            offset_ms = offsets[index]
             actions = self._resolver_actions(intent)
             try:
                 event = resolver.resolve_plot_event(
@@ -274,9 +279,12 @@ class ChapterPlanner:
             or client_model.strip() != self._model_identity
         ):
             raise ChapterPlanError("chapter planner model identity changed")
+        request = self._request_document(chapter, story.text)
+        request_content, request_fingerprint = self._canonical_request(request)
         key = _IntentCacheKey(
             source_hash=story.source_sha256,
             chapter_id=chapter.id,
+            request_fingerprint=request_fingerprint,
             model_identity=self._model_identity,
             prompt_version=self._prompt_version,
             dlc_version=self._dlc_version,
@@ -290,7 +298,7 @@ class ChapterPlanner:
             flight = self._intent_flights.get(key)
             if flight is None:
                 flight = asyncio.create_task(
-                    self._request_and_cache_intents(key, chapter, story.text),
+                    self._request_and_cache_intents(key, chapter, request_content),
                     name=f"chapter-intent-{chapter.id}",
                 )
                 flight.add_done_callback(
@@ -305,14 +313,13 @@ class ChapterPlanner:
         self,
         key: _IntentCacheKey,
         chapter: StoryChapter,
-        story_text: str,
+        request_content: str,
     ) -> tuple[_SceneIntent, ...]:
         try:
-            request = self._request_document(chapter, story_text)
             try:
                 response = await self._client.complete_json(
                     _SYSTEM_PROMPT,
-                    json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                    request_content,
                     "chapter_plan",
                 )
             except Exception as exc:
@@ -381,10 +388,19 @@ class ChapterPlanner:
         self, chapter: StoryChapter, story_text: str
     ) -> dict[str, object]:
         return {
+            "chapter": {
+                "id": chapter.id,
+                "index": chapter.index,
+                "start_offset": chapter.start_offset,
+                "end_offset": chapter.end_offset,
+                "title": chapter.title,
+                "summary": chapter.summary,
+            },
             "chapter_text": story_text[chapter.start_offset : chapter.end_offset],
             "scenes": [
                 {
                     "scene_id": scene.id,
+                    "index": scene.index,
                     "start_offset": scene.start_offset,
                     "end_offset": scene.end_offset,
                     "summary": scene.summary,
@@ -406,6 +422,24 @@ class ChapterPlanner:
                 "waveform_source": "seeded_resolver",
             },
         }
+
+    def _canonical_request(
+        self, request: Mapping[str, object]
+    ) -> tuple[str, str]:
+        try:
+            content = json.dumps(
+                request,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            encoded = content.encode("utf-8", "strict")
+        except (TypeError, ValueError, OverflowError, UnicodeError, RecursionError) as exc:
+            raise ChapterPlanError("chapter plan request serialization failed") from exc
+        if len(encoded) > _MAX_CANONICAL_REQUEST_BYTES:
+            raise ChapterPlanError("chapter plan request exceeds the canonical size limit")
+        return content, hashlib.sha256(encoded).hexdigest()
 
     def _parse_response(
         self, response: object, chapter: StoryChapter

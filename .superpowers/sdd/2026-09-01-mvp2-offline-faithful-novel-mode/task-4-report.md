@@ -112,3 +112,46 @@ full discovery: Ran 465 tests in 37.275s, OK (skipped=5)
 ```
 
 本轮没有联网、真实模型、设备、player、chunk/fallback、push；exact replay 的跨进程稳定性仍由后续 archive 路径负责，intent cache 按裁决只在当前 AppState-owned planner 进程内有效。
+
+## Fix round 2/5（1 Important）
+
+### 修复内容
+
+1. `_IntentCacheKey` 新增 `request_fingerprint`。指纹以有界 canonical JSON（UTF-8、对象键排序、紧凑分隔、禁止 NaN）为输入，使用 SHA-256；不使用 Python process-randomized `hash()`。
+2. 被指纹覆盖且发送给模型的同一 request document 现在显式包含 chapter ID/index/bounds/title/summary、精确所选章节正文，以及每个有序 scene ID/index/bounds/summary。原有 model/prompt/DLC/waveform/caps 身份仍保留，timeline seed 与 reading speed 仍明确排除。
+3. canonical request 设置 128 MiB UTF-8 上限；该上限覆盖配置允许的 20 MiB 源文本在 JSON 控制字符最坏转义下的体积。序列化、Unicode、递归和尺寸失败全部映射为 `ChapterPlanError`，且发生在模型请求前。
+4. resolver 前显式核对 scene/intent/timing 长度，并改为验证后按 index 读取，避免 `zip(strict=True)` 将内部错配泄漏为原始 `ValueError`；失败没有 partial plan 或输出。
+
+### TDD 证据
+
+RED（生产代码修改前）：
+
+```text
+focused 3 tests:
+- request payload missing chapter metadata/index: FAIL
+- same source hash/chapter ID with changed title, chapter summary/bounds/text,
+  scene offsets/summary: 1 request instead of 2 (6 FAIL)
+- changed scene count: leaked ValueError from zip(strict=True) (ERROR)
+- injected internal intent length mismatch: leaked ValueError (ERROR)
+Ran 3 tests, FAILED (failures=7, errors=2)
+```
+
+GREEN（最小实现后）：
+
+```text
+focused payload/fingerprint/typed-length tests: Ran 3 tests, OK
+planner module: Ran 19 tests, OK
+PYTHONASYNCIODEBUG=1 + -W error planner module: Ran 19 tests, OK
+```
+
+新增 request-aware legal fake 会根据本次请求的有序 scene ID 返回完整 A/B `keep` intent，因此 scene-count 变更可以验证确实建立新 flight，而不是依赖固定响应或泄漏长度错误。原 `test_validated_intent_is_cached_across_seed_and_speed` 继续证明完全相同 request 在不同 seed/speed 下只调用一次模型。
+
+### Fix-round 验证
+
+```text
+full discovery: Ran 467 tests in 38.170s, OK (skipped=5)
+python -m compileall -q backend tests: exit 0
+git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
+```
+
+修改文件：`backend/story/planner.py`、`tests/test_story_planner.py`、本报告。未修改 whole-book analyzer/fallback、player、device、timeline randomizer 或 chat 路径；未联网、未调用真实模型/设备、未推送。

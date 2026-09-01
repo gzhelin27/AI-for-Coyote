@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -73,6 +74,28 @@ class SequencedStructuredClient(RecordingStructuredClient):
         if isinstance(outcome, Exception):
             raise outcome
         return deepcopy(outcome)
+
+
+class RequestAwareStructuredClient(RecordingStructuredClient):
+    """Return a legal response for the exact ordered scenes in each request."""
+
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> object:
+        self.calls.append((system_prompt, user_content, schema_name))
+        request = json.loads(user_content)
+        return {
+            "scenes": [
+                {
+                    "scene_id": scene["scene_id"],
+                    "channels": {
+                        "A": {"mode": "keep"},
+                        "B": {"mode": "keep"},
+                    },
+                }
+                for scene in request["scenes"]
+            ]
+        }
 
 
 class RecordingSafetyAdapter:
@@ -271,7 +294,19 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schema_name, "chapter_plan")
         self.assertIn("faithful", system_prompt.lower())
         self.assertEqual(
-            set(request), {"chapter_text", "scenes", "capabilities", "constraints"}
+            set(request),
+            {"chapter", "chapter_text", "scenes", "capabilities", "constraints"},
+        )
+        self.assertEqual(
+            request["chapter"],
+            {
+                "id": self.chapter_id,
+                "index": 1,
+                "start_offset": 11,
+                "end_offset": 19,
+                "title": "Second",
+                "summary": "选择的章节。",
+            },
         )
         self.assertEqual(request["chapter_text"], "ABCDWXYZ")
         self.assertNotIn("FIRST-ONLY", user_content)
@@ -280,12 +315,14 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
             [
                 {
                     "scene_id": self.story_map.chapters[1].scenes[0].id,
+                    "index": 0,
                     "start_offset": 11,
                     "end_offset": 15,
                     "summary": "前四字。",
                 },
                 {
                     "scene_id": self.story_map.chapters[1].scenes[1].id,
+                    "index": 1,
                     "start_offset": 15,
                     "end_offset": 19,
                     "summary": "后四字。",
@@ -387,6 +424,135 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertNotEqual(first.chapter_duration_ms, second.chapter_duration_ms)
+
+    async def test_request_fingerprint_invalidates_every_selected_chapter_input(self):
+        chapter = self.story_map.chapters[1]
+        first_chapter = self.story_map.chapters[0]
+
+        def story_map_with(selected: StoryChapter) -> StoryMap:
+            return StoryMap(
+                source_hash=self.story_map.source_hash,
+                text_length=self.story_map.text_length,
+                chapters=(first_chapter, selected),
+            )
+
+        shifted_scenes = (
+            replace(chapter.scenes[0], end_offset=14),
+            replace(chapter.scenes[1], start_offset=14),
+        )
+        three_scenes = (
+            replace(chapter.scenes[0], end_offset=13),
+            StoryScene(
+                id=StoryScene.stable_id(self.story.source_sha256, 1, 1),
+                index=1,
+                start_offset=13,
+                end_offset=16,
+                summary="中三字。",
+                pace=1.0,
+            ),
+            StoryScene(
+                id=StoryScene.stable_id(self.story.source_sha256, 1, 2),
+                index=2,
+                start_offset=16,
+                end_offset=19,
+                summary="末三字。",
+                pace=2.0,
+            ),
+        )
+        shortened_first_scene = replace(first_chapter.scenes[0], end_offset=10)
+        shifted_first = replace(
+            first_chapter, end_offset=10, scenes=(shortened_first_scene,)
+        )
+        shifted_chapter_scenes = (
+            replace(chapter.scenes[0], start_offset=10),
+            chapter.scenes[1],
+        )
+        shifted_chapter = replace(
+            chapter, start_offset=10, scenes=shifted_chapter_scenes
+        )
+        shifted_chapter_map = StoryMap(
+            source_hash=self.story_map.source_hash,
+            text_length=self.story_map.text_length,
+            chapters=(shifted_first, shifted_chapter),
+        )
+
+        variants = {
+            "chapter title": (
+                self.story,
+                story_map_with(replace(chapter, title="Second revised")),
+            ),
+            "chapter summary": (
+                self.story,
+                story_map_with(replace(chapter, summary="修订章节摘要。")),
+            ),
+            "chapter bounds": (self.story, shifted_chapter_map),
+            "exact chapter text": (
+                replace(
+                    self.story,
+                    text="FIRST-ONLY\nABCEWXYZ",
+                    original_bytes=b"FIRST-ONLY\nABCEWXYZ",
+                ),
+                self.story_map,
+            ),
+            "scene offsets": (
+                self.story,
+                story_map_with(replace(chapter, scenes=shifted_scenes)),
+            ),
+            "scene summary": (
+                self.story,
+                story_map_with(
+                    replace(
+                        chapter,
+                        scenes=(
+                            replace(chapter.scenes[0], summary="修订场景摘要。"),
+                            chapter.scenes[1],
+                        ),
+                    )
+                ),
+            ),
+            "scene count": (
+                self.story,
+                story_map_with(replace(chapter, scenes=three_scenes)),
+            ),
+        }
+
+        for label, (changed_story, changed_map) in variants.items():
+            with self.subTest(label=label):
+                client = RequestAwareStructuredClient()
+                planner = self.make_planner(client, self.safety)
+                await planner.plan(
+                    self.story,
+                    self.story_map,
+                    self.chapter_id,
+                    speed="slow",
+                    seed=1,
+                )
+                changed = await planner.plan(
+                    changed_story,
+                    changed_map,
+                    self.chapter_id,
+                    speed="fast",
+                    seed=2,
+                )
+
+                self.assertEqual(len(client.calls), 2)
+                self.assertEqual(
+                    len(changed.plot_events), len(changed_map.chapters[1].scenes)
+                )
+
+    async def test_internal_intent_length_mismatch_is_a_typed_atomic_failure(self):
+        planner = self.make_planner(RequestAwareStructuredClient(), self.safety)
+
+        with patch.object(
+            planner, "_cached_intents", AsyncMock(return_value=())
+        ), self.assertRaisesRegex(ChapterPlanError, "internal scene count"):
+            await planner.plan(
+                self.story,
+                self.story_map,
+                self.chapter_id,
+                speed="standard",
+                seed=88,
+            )
 
     async def test_concurrent_same_key_plans_share_one_request(self):
         client = BlockingStructuredClient(valid_response(self.story_map))
