@@ -13,6 +13,37 @@ class StructuredResponseError(RuntimeError):
     """One structured model request or response failed validation."""
 
 
+_MAX_STRUCTURED_CONTENT_BYTES = 256 * 1024
+
+
+def _reject_duplicate_structured_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise StructuredResponseError(
+                "structured model JSON contains a duplicate key"
+            )
+        result[key] = value
+    return result
+
+
+def _bounded_structured_content(value: object) -> str:
+    raw_content = str(value or "")
+    try:
+        encoded_content = raw_content.encode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise StructuredResponseError(
+            "structured model returned invalid UTF-8 content"
+        ) from exc
+    if len(encoded_content) > _MAX_STRUCTURED_CONTENT_BYTES:
+        raise StructuredResponseError(
+            "structured model content exceeds the size limit"
+        )
+    return raw_content.strip()
+
+
 def _preset_text(state: dict) -> str:
     """把波形库渲染成提示词文本：波形名（推荐时长s）。"""
     parts = []
@@ -479,17 +510,17 @@ class LLM:
             raise StructuredResponseError("structured model response is incomplete") from exc
         if not isinstance(message, dict):
             raise StructuredResponseError("structured model response is incomplete")
-        parsed = message.get("parsed")
-        if isinstance(parsed, dict):
-            return parsed
-        content = str(message.get("content") or "").strip()
+        content = _bounded_structured_content(message.get("content"))
         if not content:
-            content = str(message.get("reasoning_content") or "").strip()
+            content = _bounded_structured_content(message.get("reasoning_content"))
         if not content:
-            content = str(message.get("reasoning") or "").strip()
+            content = _bounded_structured_content(message.get("reasoning"))
         try:
-            parsed = json.loads(content)
-        except (TypeError, json.JSONDecodeError) as exc:
+            parsed = json.loads(
+                content,
+                object_pairs_hook=_reject_duplicate_structured_object,
+            )
+        except (TypeError, json.JSONDecodeError, RecursionError) as exc:
             raise StructuredResponseError(
                 "structured model returned invalid JSON"
             ) from exc

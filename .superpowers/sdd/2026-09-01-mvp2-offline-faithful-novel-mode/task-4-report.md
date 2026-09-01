@@ -66,3 +66,49 @@ git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
 - safety dry-validation 调用现有 `validate()`，不调用执行/记录/设备接口；运行时安全层仍为最终权威。
 - 未联网、未调用真实模型、未调用真实设备、未推送。
 - `requesting-code-review` 技能通常要求 reviewer subagent，但本 Task 明确禁止派生 subagent，因此未委派审查；改用本地 diff、聚焦回归、全量回归与 compileall 收尾。
+
+## Fix round 1/5（2 Important）
+
+### 修复内容
+
+1. `ChapterPlanner` 新增显式非空 `model_identity`、`prompt_version`、`dlc_version` 构造身份，并拒绝与实际 structured client model 不一致或运行时漂移的身份。
+2. planner 内保存 process-local validated-intent cache。key 包含 normalized source hash、chapter ID、effective model identity、planning prompt version、DLC provenance、排序后的 waveform capability set、A/B caps；明确不包含 timeline seed 或 reading speed。
+3. concurrent same-key 调用共享一个 `asyncio.Task`，caller 通过 `asyncio.shield` 等待；caller 取消不会取消共享请求。成功写入 validated intent cache，模型/schema 失败清理 flight，下一次可重试。
+4. `LLM.complete_json` 只审计有 256 KiB 原始字节上限且可严格 UTF-8 编码的 raw `content`/reasoning text；使用 `object_pairs_hook` 拒绝任意深度重复键。移除 `message.parsed` 信任路径，parsed-only provider 响应 fail closed。仍只有一次 HTTP 请求且没有 retry/fallback，chat 路径未改。
+
+### TDD 证据
+
+精确 RED（加入 constructor identity 后重新执行，排除 API 缺参噪声）：
+
+```text
+tests.test_story_planner
+FAILED (failures=9, errors=1)
+- alternating valid responses: 3 calls, expected 1
+- concurrent same-key: 2 calls, expected 1
+- cancelled waiter path: 3 calls, expected 1
+- failed flight had no cache recovery
+- duplicate scenes/channels/mode/base_strength were accepted
+- parsed-only provider response was accepted
+- oversized raw content was accepted
+```
+
+分步 GREEN：
+
+```text
+cache/single-flight/same-seed focused: Ran 5 tests, OK
+duplicate/raw/parsed-only focused: Ran 5 tests, OK
+identity mismatch RED: ValueError not raised
+identity mismatch GREEN + planner: Ran 18 tests, OK
+raw whitespace bound RED: StructuredResponseError not raised
+raw whitespace bound GREEN + planner: Ran 18 tests, OK
+```
+
+### Fix-round 验证
+
+```text
+PYTHONASYNCIODEBUG=1 + -W error concurrency/cancel/failure: Ran 3 tests, OK
+planner + timeline_randomizer + timeline_session: Ran 64 tests in 2.368s, OK
+full discovery: Ran 465 tests in 37.275s, OK (skipped=5)
+```
+
+本轮没有联网、真实模型、设备、player、chunk/fallback、push；exact replay 的跨进程稳定性仍由后续 archive 路径负责，intent cache 按裁决只在当前 AppState-owned planner 进程内有效。

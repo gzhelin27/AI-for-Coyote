@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import json
 import unittest
@@ -17,6 +18,7 @@ from backend.llm import LLM, StructuredResponseError
 
 class RecordingStructuredClient:
     def __init__(self, response: object = None, *, error: Exception | None = None):
+        self.model = "model-a"
         self.response = response
         self.error = error
         self.calls: list[tuple[str, str, str]] = []
@@ -28,6 +30,49 @@ class RecordingStructuredClient:
         if self.error is not None:
             raise self.error
         return deepcopy(self.response)
+
+
+class AlternatingStructuredClient(RecordingStructuredClient):
+    def __init__(self, responses: list[object]):
+        super().__init__()
+        self.responses = responses
+
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> object:
+        self.calls.append((system_prompt, user_content, schema_name))
+        response = self.responses[(len(self.calls) - 1) % len(self.responses)]
+        return deepcopy(response)
+
+
+class BlockingStructuredClient(RecordingStructuredClient):
+    def __init__(self, response: object):
+        super().__init__(response)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> object:
+        self.calls.append((system_prompt, user_content, schema_name))
+        self.started.set()
+        await self.release.wait()
+        return deepcopy(self.response)
+
+
+class SequencedStructuredClient(RecordingStructuredClient):
+    def __init__(self, outcomes: list[object]):
+        super().__init__()
+        self.outcomes = outcomes
+
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> object:
+        self.calls.append((system_prompt, user_content, schema_name))
+        outcome = self.outcomes[len(self.calls) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return deepcopy(outcome)
 
 
 class RecordingSafetyAdapter:
@@ -133,6 +178,36 @@ def valid_response(story_map: StoryMap) -> dict:
     }
 
 
+def alternate_valid_response(story_map: StoryMap) -> dict:
+    scenes = story_map.chapters[1].scenes
+    return {
+        "scenes": [
+            {
+                "scene_id": scenes[0].id,
+                "channels": {
+                    "A": {"mode": "stop"},
+                    "B": {"mode": "set", "base_strength": 27},
+                },
+            },
+            {
+                "scene_id": scenes[1].id,
+                "channels": {
+                    "A": {"mode": "set", "base_strength": 35},
+                    "B": {"mode": "keep"},
+                },
+            },
+        ]
+    }
+
+
+def make_recording_llm(response: httpx.Response) -> tuple[LLM, RecordingHTTPClient]:
+    cfg = deepcopy(DEFAULTS)
+    client = RecordingHTTPClient(response)
+    with patch("backend.llm.httpx.AsyncClient", return_value=client):
+        llm = LLM(cfg)
+    return llm, client
+
+
 class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.story, self.story_map, self.chapter_id = make_story()
@@ -160,7 +235,15 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.client = RecordingStructuredClient(valid_response(self.story_map))
         self.planner = self.make_planner(self.client, self.safety)
 
-    def make_planner(self, client, safety):
+    def make_planner(
+        self,
+        client,
+        safety,
+        *,
+        model_identity: str | None = None,
+        prompt_version: str = "chapter-plan-v1",
+        dlc_version: str = "dlc-provenance-a",
+    ):
         return ChapterPlanner(
             client,
             waveform_registry={"wave-a": ("frame-a",), "wave-b": ("frame-b",)},
@@ -168,6 +251,9 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
             reading_speed_cpm={"slow": 30, "standard": 60, "fast": 120},
             cycle_gap_policy=self.policy,
             safety_adapter=safety,
+            model_identity=model_identity or client.model,
+            prompt_version=prompt_version,
+            dlc_version=dlc_version,
         )
 
     async def test_selected_chapter_request_and_plan_have_exact_order_coverage_and_timing(self):
@@ -269,6 +355,135 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
             self.story, self.story_map, self.chapter_id, speed="standard", seed=88
         )
         self.assertEqual(first, second)
+
+    async def test_validated_intent_is_cached_across_seed_and_speed(self):
+        client = AlternatingStructuredClient(
+            [valid_response(self.story_map), alternate_valid_response(self.story_map)]
+        )
+        planner = self.make_planner(client, self.safety)
+
+        first = await planner.plan(
+            self.story, self.story_map, self.chapter_id, speed="slow", seed=1
+        )
+        second = await planner.plan(
+            self.story, self.story_map, self.chapter_id, speed="fast", seed=2
+        )
+        repeated = await planner.plan(
+            self.story, self.story_map, self.chapter_id, speed="slow", seed=1
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(first, repeated)
+        self.assertEqual(
+            [
+                (directive.mode, directive.base_strength)
+                for event in first.plot_events
+                for directive in event.channels.values()
+            ],
+            [
+                (directive.mode, directive.base_strength)
+                for event in second.plot_events
+                for directive in event.channels.values()
+            ],
+        )
+        self.assertNotEqual(first.chapter_duration_ms, second.chapter_duration_ms)
+
+    async def test_concurrent_same_key_plans_share_one_request(self):
+        client = BlockingStructuredClient(valid_response(self.story_map))
+        planner = self.make_planner(client, self.safety)
+
+        first = asyncio.create_task(
+            planner.plan(
+                self.story, self.story_map, self.chapter_id, speed="slow", seed=1
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        second = asyncio.create_task(
+            planner.plan(
+                self.story, self.story_map, self.chapter_id, speed="fast", seed=2
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(len(client.calls), 1)
+
+        client.release.set()
+        first_plan, second_plan = await asyncio.gather(first, second)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            [event.channels["A"].mode for event in first_plan.plot_events],
+            [event.channels["A"].mode for event in second_plan.plot_events],
+        )
+
+    async def test_cancelled_waiter_does_not_cancel_shared_intent_request(self):
+        client = BlockingStructuredClient(valid_response(self.story_map))
+        planner = self.make_planner(client, self.safety)
+
+        cancelled = asyncio.create_task(
+            planner.plan(
+                self.story, self.story_map, self.chapter_id, speed="slow", seed=1
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        survivor = asyncio.create_task(
+            planner.plan(
+                self.story, self.story_map, self.chapter_id, speed="fast", seed=2
+            )
+        )
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        self.assertFalse(client.release.is_set())
+
+        client.release.set()
+        await survivor
+        await planner.plan(
+            self.story, self.story_map, self.chapter_id, speed="standard", seed=3
+        )
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_failed_intent_flight_is_evicted_and_can_retry(self):
+        client = SequencedStructuredClient(
+            [RuntimeError("provider down"), valid_response(self.story_map)]
+        )
+        planner = self.make_planner(client, self.safety)
+
+        with self.assertRaisesRegex(ChapterPlanError, "model"):
+            await planner.plan(
+                self.story, self.story_map, self.chapter_id, speed="standard", seed=1
+            )
+        recovered = await planner.plan(
+            self.story, self.story_map, self.chapter_id, speed="standard", seed=1
+        )
+        cached = await planner.plan(
+            self.story, self.story_map, self.chapter_id, speed="standard", seed=1
+        )
+
+        self.assertEqual(recovered, cached)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_planning_cache_identity_fields_fail_fast_when_empty(self):
+        for field in ("model_identity", "prompt_version", "dlc_version"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.make_planner(
+                    self.client,
+                    self.safety,
+                    **{field: " "},
+                )
+
+    async def test_planning_cache_rejects_mismatched_or_changed_client_model(self):
+        with self.assertRaisesRegex(ValueError, "model identity"):
+            self.make_planner(self.client, self.safety, model_identity="model-b")
+
+        self.client.model = "model-b"
+        with self.assertRaisesRegex(ChapterPlanError, "model identity"):
+            await self.planner.plan(
+                self.story,
+                self.story_map,
+                self.chapter_id,
+                speed="standard",
+                seed=88,
+            )
+        self.assertEqual(self.client.calls, [])
 
     async def test_different_seeds_may_vary_only_resolved_random_fields(self):
         first = await self.planner.plan(
@@ -374,21 +589,76 @@ class StoryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(self.client.calls, [])
 
+    async def test_duplicate_raw_json_keys_fail_closed_without_retry(self):
+        compact = json.dumps(
+            valid_response(self.story_map), ensure_ascii=False, separators=(",", ":")
+        )
+        duplicate_documents = {
+            "scenes": compact.replace('"scenes":[', '"scenes":[],"scenes":[', 1),
+            "channels": compact.replace(
+                '"channels":{"A"', '"channels":{},"channels":{"A"', 1
+            ),
+            "mode": compact.replace(
+                '"mode":"set","base_strength":20',
+                '"mode":"keep","mode":"set","base_strength":20',
+                1,
+            ),
+            "base_strength": compact.replace(
+                '"base_strength":20', '"base_strength":1,"base_strength":20', 1
+            ),
+        }
+
+        for field, content in duplicate_documents.items():
+            with self.subTest(field=field):
+                llm, http_client = make_recording_llm(
+                    httpx.Response(
+                        200,
+                        json={"choices": [{"message": {"content": content}}]},
+                    )
+                )
+                with self.assertRaisesRegex(ChapterPlanError, "model"):
+                    await self.make_planner(
+                        llm, self.safety, model_identity=llm.model
+                    ).plan(
+                        self.story,
+                        self.story_map,
+                        self.chapter_id,
+                        speed="standard",
+                        seed=88,
+                    )
+                self.assertEqual(len(http_client.calls), 1)
+
+    async def test_parsed_only_provider_response_fails_closed(self):
+        llm, http_client = make_recording_llm(
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"parsed": valid_response(self.story_map)}}
+                    ]
+                },
+            )
+        )
+
+        with self.assertRaisesRegex(ChapterPlanError, "model"):
+            await self.make_planner(llm, self.safety, model_identity=llm.model).plan(
+                self.story,
+                self.story_map,
+                self.chapter_id,
+                speed="standard",
+                seed=88,
+            )
+
+        self.assertEqual(len(http_client.calls), 1)
+
 
 class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
-    def make_llm(self, response: httpx.Response) -> tuple[LLM, RecordingHTTPClient]:
-        cfg = deepcopy(DEFAULTS)
-        client = RecordingHTTPClient(response)
-        with patch("backend.llm.httpx.AsyncClient", return_value=client):
-            llm = LLM(cfg)
-        return llm, client
-
     async def test_complete_json_makes_exactly_one_structured_request(self):
         response = httpx.Response(
             200,
             json={"choices": [{"message": {"content": '{"scenes":[]}'}}]},
         )
-        llm, client = self.make_llm(response)
+        llm, client = make_recording_llm(response)
 
         result = await llm.complete_json("system", "selected chapter", "chapter_plan")
 
@@ -406,12 +676,32 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
             200,
             json={"choices": [{"message": {"content": "not json"}}]},
         )
-        llm, client = self.make_llm(response)
+        llm, client = make_recording_llm(response)
 
         with self.assertRaises(StructuredResponseError):
             await llm.complete_json("system", "selected chapter", "chapter_plan")
 
         self.assertEqual(len(client.calls), 1)
+
+    async def test_complete_json_rejects_oversized_raw_content_without_retry(self):
+        contents = (
+            '{"value":"' + "x" * 300_000 + '"}',
+            " " * 300_000 + '{"scenes":[]}',
+        )
+        for content in contents:
+            with self.subTest(prefix=content[:12]):
+                response = httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": content}}]},
+                )
+                llm, client = make_recording_llm(response)
+
+                with self.assertRaisesRegex(StructuredResponseError, "size"):
+                    await llm.complete_json(
+                        "system", "selected chapter", "chapter_plan"
+                    )
+
+                self.assertEqual(len(client.calls), 1)
 
 
 if __name__ == "__main__":

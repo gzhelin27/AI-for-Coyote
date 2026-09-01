@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import json
 import math
@@ -106,6 +107,17 @@ class _SceneIntent:
     channels: Mapping[str, _ChannelIntent]
 
 
+@dataclass(frozen=True, slots=True)
+class _IntentCacheKey:
+    source_hash: str
+    chapter_id: str
+    model_identity: str
+    prompt_version: str
+    dlc_version: str
+    waveform_capabilities: tuple[str, ...]
+    caps: tuple[tuple[str, int], ...]
+
+
 class ChapterPlanner:
     """Plan one selected chapter without creating playback or device objects."""
 
@@ -118,13 +130,16 @@ class ChapterPlanner:
         reading_speed_cpm: Mapping[str, int | float],
         cycle_gap_policy: CycleGapPolicy,
         safety_adapter: Any,
+        model_identity: str,
+        prompt_version: str,
+        dlc_version: str,
         strength_jitter: int = 4,
     ) -> None:
         if not hasattr(client, "complete_json"):
             raise TypeError("client must provide complete_json")
         if not isinstance(waveform_registry, Mapping):
             raise TypeError("waveform_registry must be a mapping")
-        waveforms = tuple(waveform_registry)
+        waveforms = tuple(sorted(waveform_registry))
         if not waveforms or not all(
             isinstance(name, str) and name.strip() for name in waveforms
         ):
@@ -156,6 +171,20 @@ class ChapterPlanner:
             raise TypeError("cycle_gap_policy must be a CycleGapPolicy")
         if not hasattr(safety_adapter, "validate"):
             raise TypeError("safety_adapter must provide validate(action)")
+        identities = {
+            "model_identity": model_identity,
+            "prompt_version": prompt_version,
+            "dlc_version": dlc_version,
+        }
+        for name, value in identities.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        client_model = getattr(client, "model", model_identity)
+        if (
+            not isinstance(client_model, str)
+            or client_model.strip() != model_identity.strip()
+        ):
+            raise ValueError("model identity does not match the structured client")
         if (
             isinstance(strength_jitter, bool)
             or not isinstance(strength_jitter, int)
@@ -169,7 +198,15 @@ class ChapterPlanner:
         self._speeds = speeds
         self._policy = cycle_gap_policy
         self._safety = safety_adapter
+        self._model_identity = model_identity.strip()
+        self._prompt_version = prompt_version.strip()
+        self._dlc_version = dlc_version.strip()
         self._strength_jitter = strength_jitter
+        self._intent_cache: dict[_IntentCacheKey, tuple[_SceneIntent, ...]] = {}
+        self._intent_flights: dict[
+            _IntentCacheKey, asyncio.Task[tuple[_SceneIntent, ...]]
+        ] = {}
+        self._intent_lock = asyncio.Lock()
 
     async def plan(
         self,
@@ -182,17 +219,7 @@ class ChapterPlanner:
     ) -> ValidatedChapterPlan:
         chapter = self._select_chapter(story, story_map, chapter_id, speed, seed)
         offsets, duration_ms = self._scene_timing(chapter, story.text, speed)
-        request = self._request_document(chapter, story.text)
-        try:
-            response = await self._client.complete_json(
-                _SYSTEM_PROMPT,
-                json.dumps(request, ensure_ascii=False, separators=(",", ":")),
-                "chapter_plan",
-            )
-        except Exception as exc:
-            raise ChapterPlanError("chapter plan model request failed") from exc
-
-        intents = self._parse_response(response, chapter)
+        intents = await self._cached_intents(story, chapter)
         resolver = TimelineResolver(
             strength_jitter=self._strength_jitter,
             session_seed=seed,
@@ -235,6 +262,69 @@ class ChapterPlanner:
             chapter_duration_ms=duration_ms,
             timeline_request=timeline_request,
         )
+
+    async def _cached_intents(
+        self,
+        story: ImportedStory,
+        chapter: StoryChapter,
+    ) -> tuple[_SceneIntent, ...]:
+        client_model = getattr(self._client, "model", self._model_identity)
+        if (
+            not isinstance(client_model, str)
+            or client_model.strip() != self._model_identity
+        ):
+            raise ChapterPlanError("chapter planner model identity changed")
+        key = _IntentCacheKey(
+            source_hash=story.source_sha256,
+            chapter_id=chapter.id,
+            model_identity=self._model_identity,
+            prompt_version=self._prompt_version,
+            dlc_version=self._dlc_version,
+            waveform_capabilities=self._waveforms,
+            caps=tuple((channel, self._caps[channel]) for channel in _CHANNELS),
+        )
+        async with self._intent_lock:
+            cached = self._intent_cache.get(key)
+            if cached is not None:
+                return cached
+            flight = self._intent_flights.get(key)
+            if flight is None:
+                flight = asyncio.create_task(
+                    self._request_and_cache_intents(key, chapter, story.text),
+                    name=f"chapter-intent-{chapter.id}",
+                )
+                flight.add_done_callback(
+                    lambda completed: (
+                        None if completed.cancelled() else completed.exception()
+                    )
+                )
+                self._intent_flights[key] = flight
+        return await asyncio.shield(flight)
+
+    async def _request_and_cache_intents(
+        self,
+        key: _IntentCacheKey,
+        chapter: StoryChapter,
+        story_text: str,
+    ) -> tuple[_SceneIntent, ...]:
+        try:
+            request = self._request_document(chapter, story_text)
+            try:
+                response = await self._client.complete_json(
+                    _SYSTEM_PROMPT,
+                    json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                    "chapter_plan",
+                )
+            except Exception as exc:
+                raise ChapterPlanError("chapter plan model request failed") from exc
+            intents = self._parse_response(response, chapter)
+            async with self._intent_lock:
+                self._intent_cache[key] = intents
+            return intents
+        finally:
+            async with self._intent_lock:
+                if self._intent_flights.get(key) is asyncio.current_task():
+                    self._intent_flights.pop(key, None)
 
     def _select_chapter(
         self,
