@@ -4,11 +4,11 @@
 
 ## 结果
 
-`AppState` 现在只构造一个进程生命周期内的 `ChapterPlanner` 和一个 `NovelSessionController`。planner 注入当前有效结构化 LLM client/model、`story.analysis_prompt_version`、DLC provenance、A/B effective caps、SafetyManager、waveform registry、reading speeds、cycle-gap policy 与固定 `±4` jitter；novel adapter 注入现有同一个 `SessionController`。没有创建第二个 player、relay、SafetyManager、GameLoop、output coordinator 或物理输出 owner。
+`AppState` 现在只持有一个当前 `ChapterPlanner` 和一个 `NovelSessionController`。planner 按动态 runtime signature 注入当前有效结构化 LLM client/model、固定 prompt identity `faithful-offline-v1`、当前 DLC provenance、A/B effective caps、SafetyManager、waveform registry、reading speeds、cycle-gap policy 与配置 jitter；signature 在安全 idle 点变化时原子替换这一个 planner。novel adapter 注入现有同一个 `SessionController`。没有创建第二个 player、relay、SafetyManager、GameLoop、output coordinator 或物理输出 owner。
 
 运行时来源导入只接受 multipart TXT/MD/DOCX 和 `auto|utf-8|gb18030`。每次导入分配不可预测、server-owned 的 opaque `source_id`，保存到配置的 repository-local story directory，并以内存映射持有已验证 `ImportedStory`、实际 encoding 选项和内部 storage path；任何 HTTP/WebSocket payload 都不序列化 path 或原文。`NovelSessionController.start(..., source_encoding=...)` 使用本次导入记录覆盖构造默认值，使 archive metadata 保留权威 encoding 选项。
 
-只有 chapter `play` 路由调用 `ChapterPlanner.plan()`，且只传选中的 chapter ID。import、analysis status、chapters、reader 和 reader text 都只调用本地 source loader / `offline_analysis_key()` / `AnalysisStore.inspect()`；`missing`、`invalid` 不进入 planner。`play/pause/resume/finish` 只在既有 `timeline_transition_lock` 下调用 novel/session public lifecycle，没有增加锁层或重复输出 ownership。
+只有 chapter `play` 路由调用 `ChapterPlanner.plan()`，且只传选中的 chapter ID。import、analysis status、chapters、reader 和 reader text 都只调用本地 source loader / `offline_analysis_key()` / `AnalysisStore.inspect()`；`missing`、`invalid` 不进入 planner。规划作为 AppState tracked task 在 `timeline_transition_lock` 外等待；完成后只在短锁内重验 source generation/selection、ready analysis identity、planner signature 和 authoritative idle，再调用 novel/session public lifecycle。没有增加输出 ownership。
 
 ## HTTP / WebSocket 契约
 
@@ -60,7 +60,7 @@ Public analysis detail：
 - reader text `200`：`{"start", "end", "text_length", "text"}`；必须满足 `0 <= start <= end <= text_length` 且单次最多 8192 字符，否则 `400 code=reader_range_invalid`。
 - pause/resume 返回 public novel session；resume body 为 `{"from":"current|chapter_start|beginning"}`；finish 返回 `{"replay": ReplaySummary, "session": idle-session}`。
 
-`AppState.build_state()` 新增完整 `story` 子树：`selected_source`、`analysis`、ordered `chapters`、`session`。所有成功 story mutation 调用既有 `broadcast()`，因此与现有前端 WebSocket refresh-generation gate 走同一 full-state 路径。命名使用 `selected_source`，继续遵守既有全状态禁止原始 `source`/seed/frame/API key 的 redaction contract。
+`AppState.build_state()` 新增完整 `story` 子树：`selected_source`、`analysis`、ordered `chapters`、`session`，并在根状态发布单调 `state_revision`。full-state snapshot 与全部 send 在同一个 broadcast lock 内串行，所有成功 mutation 在 snapshot 前递增 revision，因此慢旧发送不能晚到覆盖新状态。命名使用 `selected_source`，继续遵守既有全状态禁止原始 `source`/seed/frame/API key 的 redaction contract。
 
 ## TDD 红绿证据
 
@@ -106,19 +106,23 @@ reader missing analysis: returned 200（spec 要求只消费 validated cache）
 
 - 客户端只提交 filename/bytes/encoding，从不提交或解析本地 path；filename 先由 `StorySourceLoader` basename/extension 校验。
 - `source_id` 由 `secrets.token_urlsafe(18)` 生成，只查 server-owned dictionary；调用者字符串从不拼接到路径。
-- 磁盘 target 只使用 opaque ID + loader-validated extension，以 exclusive create 打开，flush + fsync；冲突重试，失败删除 partial regular target。
-- 配置目录必须是 project-root 下 repository-local path；初始化和每次写入都拒绝 symlink / Windows reparse ancestor，target resolved parent 必须等于已验证 storage root。测试使用无需管理员权限的 Windows junction 验证祖先重定向 fail closed。
+- 磁盘 target 只使用 opaque ID + loader-validated extension；持久化层先 identity-pin trusted directory handle，再以 handle-relative、no-follow、exclusive create 建立同目录临时文件，write/flush/fsync 后以 pinned root 原子 rename，支持时 directory fsync。失败清理使用 pinned directory/已打开 child handle，不重新解析绝对路径。
+- 配置目录必须是 project-root 下 repository-local path；root/symlink/junction 替换不能重定向写入。Windows 目录句柄拒绝 rename，POSIX 对 pinned identity/final path 变化 fail closed；fsync/rename 后异常测试均无 partial final。
 - 各 source record 独立保存 normalized text/hash/encoding/path；同名文件得到不同 ID，unknown ID 为 404，任何 payload 不含 storage path 或 source excerpt。
-- `AnalysisStore.inspect()` 是状态唯一事实来源；首次 corrupt=invalid 且隔离，后续 missing。为保证同一次 import response 与其 broadcast 看到一致的首次状态，只在该 broadcast 生命周期内复用同一个 lookup，随后恢复逐次 inspect 语义。
+- `AnalysisStore.inspect()` 是状态唯一事实来源；首次实际发现并隔离 corrupt 的调用得到 invalid，后续或并发调用得到 missing。没有跨请求共享 lookup，允许 import response 报 invalid 而紧随其后的 broadcast 已是 missing。
 - reader 只有 ready cache 才能读取 bounded slice；chapters/reader/full state 永不把原文整体推入 WebSocket。
 - lifecycle endpoint 仅使用既有 `timeline_transition_lock`；NovelSessionController/SessionController 的内部锁保持各自 ownership，没有从内部重新获取 AppState lock。
 
 ## 修改文件
 
 - 修改 `backend/main.py`
-- 修改 `backend/story/session.py`（向后兼容地允许 start-time source encoding override）
+- 修改 `backend/config.py`
+- 修改 `backend/story/planner.py`（取消当前 planner 所有 shielded model flights）
+- 修改 `backend/story/session.py`（向后兼容地允许 start-time source encoding/DLC snapshot override）
+- 新增 `backend/story/source_store.py`
 - 新增 `tests/test_story_endpoints.py`
-- 修改 `tests/test_app_state_timeline.py`（既有 LLM fake 补齐真实 structured interface）
+- 新增 `tests/test_story_source_store.py`
+- 修改 `tests/test_app_state_timeline.py`、`tests/test_session_endpoints.py`、`tests/test_story_source.py`
 - 新增本报告
 
 ## 最终验证
@@ -126,8 +130,9 @@ reader missing analysis: returned 200（spec 要求只消费 validated cache）
 最终交付前执行：
 
 ```text
-focused story endpoint gate: Ran 13 tests, OK
-full discovery: Ran 507 tests, OK (platform skips=5)
+focused story/source/planner/session gate: Ran 106 tests, OK
+developer-mode ResourceWarning gate: Ran 37 tests, OK
+full discovery: Ran 531 tests in 54.328s, OK (platform skips=5)
 python -m compileall -q backend tests: exit 0
 git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
 ```
@@ -136,12 +141,60 @@ git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
 
 ## 提交
 
-提交信息：`feat: expose offline novel runtime APIs`。最终 commit hash 在提交完成后由 `git rev-parse HEAD` 生成并在交付消息报告；commit 无法在自身内容中稳定自引用最终 hash。
+初始提交：`5cc2b51 feat: expose offline novel runtime APIs`。本轮提交信息计划为 `fix: harden offline story runtime APIs`；最终 hash 在提交完成后由 `git rev-parse HEAD` 生成并在交付消息报告。
 
 ## 风险与边界
 
 - Opaque source registry 是当前 AppState 进程内索引；原始文件保留在 server-owned import directory，但重启后不自动枚举或恢复旧 source ID。MVP2 没有批准持久 source catalog 或删除 API。
-- 单个 AppState planner 按批准裁决冻结构造时的 model/prompt/DLC/waveform/caps identity，保证 process-local intent cache identity稳定。运行时修改这些配置后，应重启 AppState 再开始新 novel planning；本任务没有悄悄替换第二个 planner。
+- 单个 AppState planner 按当前 model/client/prompt/DLC/waveform/caps identity 缓存 intent；身份热变更会取消或拒绝并发规划，并在下一个安全 idle 点重建唯一 planner。旧 cache/client 不复用。
 - 每个 source 受 `max_source_mb` 限制，reader slice 受 8192 字符限制；MVP2 未增加 source 总数/总磁盘配额或清理 UI。
 - HTTP reader 暴露的是用户已导入且 ready 的本地原文 bounded slice；WebSocket/full state 永远不包含正文。
 - 真实设备 acceptance、前端消费、跨重启 source catalog 与 operator 文档分别属于后续 Task 7/8 或显式新范围。
+
+## Review fix round 1/5（2026-09-01）
+
+### RED → GREEN
+
+规划/生命周期并发 RED：blocking planner 使 disconnect 超时、shutdown 等待 transition lock、source 改变后旧结果仍可能 start、并发 play 无稳定冲突、import 会在 planning/running 时切换 selection。实现 tracked outer plan task + planner-owned inner-flight cancellation、锁外 await、锁内 identity/idle 重验和无隐式 finish/archive 后，6 个并发用例全绿；补充 cap 与 DLC 热变更竞态后，阻塞规划均能按 200ms 测试期限收敛且无 `story-plan-*` task leak。
+
+广播/动态身份 RED：状态无 `state_revision`，阻塞首个 send 可使旧 snapshot 晚到；DLC/cap/LLM 变化仍复用旧 analysis/planner/client，默认 prompt 为 `faithful-v1`。实现单 broadcast lock、mutation-before-snapshot revision、动态 signature 与 hot-mutation reservation 后，blocked-first-send、LLM replace/close、cap、DLC cache-key 变化全部转绿。
+
+source storage RED：安全 store 模块缺失；最初 Windows rename ABI 不支持 pinned-root relative rename，失败清理还会重新打开 absolute path。实现 POSIX dirfd 与 Windows `NtCreateFile`/`NtSetInformationFile` 的 root/child-handle 相对 create、rename、delete 后，root replacement、exclusive temp、file/dir fsync failure、post-rename cleanup 和无绝对路径重开共 5 个测试全绿。
+
+analysis/error RED：import 首次 invalid 被 shared lookup 重放给 broadcast/GET；并发 corrupt GET 不满足单次 invalid；unexpected `RuntimeError|TypeError|ValueError` 会把内部 path/token 回显为 4xx。移除 published lookup，并仅枚举明确 business exceptions 后，import/concurrent quarantine 与 generic logged 500 测试全绿，所有非-play route 的 LLM spy 仍为零调用。
+
+兼容回归 RED：旧 endpoint fake 缺少新 broadcast/planning state；sync AppState 测试未关闭 pinned directory handle。补齐真实 AppState fixture contract 和显式 handle cleanup 后，65 个既有 session endpoint 测试、60 个 planner/novel/AppState timeline 测试、37 个 timeline session 测试均恢复全绿。
+
+### API schema 与状态隔离增量
+
+- Full state 根字段新增 `state_revision: int`，从 0 起、每次 mutation broadcast 前递增；initial WebSocket send 使用当前 revision 且与 broadcast 同锁。
+- Planning 期间 `story.session.status="planning"`，只公开 source hash prefix、safe filename、chapter ID 与 speed；不公开 prompt、plan、seed、原文或模型响应。
+- 稳定冲突：`story_planning_active`、`story_runtime_busy`、`story_state_changed`、`story_planning_cancelled` 均为 409；unexpected transition 固定 `500 code=story_transition_failed`，内部异常只进日志。
+- Import/source registry 保持进程内隔离；新的 source 在 novel/autopilot/replay/planning/runtime hot-change 任一活跃时不落盘、不注册、不切 selection、不归档。
+- DLC/profile/LLM/cap 变化与 planning/session 通过同一 transition lock 和 runtime reservation 协调；每次 analysis/play 都重新计算当前 DLC provenance，play 只在 exact runtime signature 下消费 ready cache。
+
+### 最终验证证据
+
+```text
+python -m unittest tests.test_story_endpoints tests.test_story_source_store \
+  tests.test_story_source tests.test_story_planner tests.test_novel_session -q
+Ran 106 tests in 8.188s, OK
+
+python -X dev -W ignore::DeprecationWarning -W error::ResourceWarning \
+  -m unittest tests.test_story_endpoints tests.test_story_source_store -q
+Ran 37 tests in 3.282s, OK
+
+python -m unittest tests.test_session_endpoints -q
+Ran 65 tests in 17.017s, OK
+
+python -m unittest discover -s tests -q
+Ran 531 tests in 54.328s, OK (skipped=5)
+```
+
+`-W error` 未直接全开，因为仓库既有 FastAPI `on_event` 会产生已知 `DeprecationWarning`；本轮以仅提升 `ResourceWarning` 为 error 的开发模式门专门验证异步 task/handle 清理。全程无网络、真实模型、真实设备或 push。
+
+### 剩余边界
+
+- Windows 安全存储使用 NT native handle-relative primitives；POSIX 分支依赖 `dir_fd + O_NOFOLLOW`，缺失这些能力的平台按裁决 fail closed。当前 CI 主机验证 Windows 分支；5 个全套平台 skip 为仓库既有/平台条件测试。
+- Pinned source handle 生命周期属于 AppState，并在 shutdown 关闭；直接构造 AppState 的测试/工具也必须显式走 shutdown 或关闭该 owner。
+- Task 7 必须以 `state_revision` 丢弃更低 revision；这不在 Task 6 前端范围。

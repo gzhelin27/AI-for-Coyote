@@ -100,6 +100,7 @@ class NovelSessionController:
         story_map: StoryMap,
         *,
         source_encoding: str | None = None,
+        dlc_version: str | None = None,
     ) -> NovelSessionState:
         async with self._lock:
             try:
@@ -120,6 +121,16 @@ class NovelSessionController:
                         raise NovelSessionError(
                             "source encoding must be auto, utf-8, or gb18030"
                         )
+                    archive_dlc_version = (
+                        self._dlc_version if dlc_version is None else dlc_version
+                    )
+                    if (
+                        not isinstance(archive_dlc_version, str)
+                        or not archive_dlc_version.strip()
+                    ):
+                        raise NovelSessionError(
+                            "DLC version must be a non-empty string"
+                        )
                     archive = PlannedSessionArchive(
                         scenes=encode_story_map(
                             story_map, schema_version=SCHEMA_VERSION
@@ -130,7 +141,7 @@ class NovelSessionController:
                             "analysis_version": self._analysis_version,
                             "chapter_id": plan.chapter_id,
                             "content_type": "novel",
-                            "dlc_version": self._dlc_version,
+                            "dlc_version": archive_dlc_version.strip(),
                             "source_encoding": archive_encoding,
                             "source_text_hash": story.source_sha256,
                             "speed": plan.speed,

@@ -81,7 +81,7 @@ DEFAULTS = {
         "analysis_dir": "data/story_analysis",
         "candidate_dir": "data/story_candidates",
         "max_source_mb": 20,
-        "analysis_prompt_version": "faithful-v1",
+        "analysis_prompt_version": "faithful-offline-v1",
         "reading_speed_cpm": {"slow": 250, "standard": 400, "fast": 600},
     },
     "ui": {

@@ -77,6 +77,13 @@ def make_endpoint_state(harness):
     state.sensors_on = False
     state.sensor_watch_task = None
     state.timeline_transition_lock = asyncio.Lock()
+    state.broadcast_lock = asyncio.Lock()
+    state.state_revision = 0
+    state.story_source_generation = 0
+    state.story_planning_task = None
+    state.story_planning_context = None
+    state.story_runtime_change_active = False
+    state.chapter_planner = SimpleNamespace(cancel_pending=lambda: ())
     state.layout = {}
     state.sensor_switches = {"camera": False, "audio": False}
     state.start_background = AsyncMock()

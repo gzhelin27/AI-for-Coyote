@@ -308,9 +308,12 @@ roles:
             self.assertNotIn(commit, main_module._app_version())
             with self._fake_external_dependencies():
                 state = main_module.AppState(self.cfg)
-            config_info = state.build_state()["config_info"]
-            self.assertEqual(config_info["version"], "development")
-            self.assertNotIn(commit, json.dumps(config_info))
+            try:
+                config_info = state.build_state()["config_info"]
+                self.assertEqual(config_info["version"], "development")
+                self.assertNotIn(commit, json.dumps(config_info))
+            finally:
+                state.story_source_store.close()
 
     async def test_live_session_fingerprint_matches_the_character_passed_to_llm(self):
         self.cfg["character"].pop("dlc_version")

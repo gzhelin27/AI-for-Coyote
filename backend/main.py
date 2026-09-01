@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import wraps
 import io
 import json
 import os
@@ -62,6 +63,7 @@ from .story import (
     offline_analysis_key,
 )
 from .story.planner import ChapterPlanError, ChapterPlanner
+from .story.source_store import PinnedStorySourceStore, StorySourceStorageError
 from .timeline.models import CycleGapPolicy
 from .timeline.replay_store import ReplayStore, ReplayStoreError, ReplaySummary
 from .timeline.session import SessionController
@@ -84,7 +86,34 @@ class _StorySourceRecord:
     story: ImportedStory
     encoding: str
     storage_path: Path
-    published_lookup: AnalysisLookup | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StoryRuntimeSignature:
+    client_identity: tuple[int, int]
+    model: str
+    prompt_version: str
+    dlc_version: str
+    waveforms: tuple[str, ...]
+    caps: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _StoryPlanningContext:
+    generation: int
+    source_id: str
+    chapter_id: str
+    speed: object
+    planner: ChapterPlanner
+    story_map: StoryMap
+    runtime_signature: _StoryRuntimeSignature
+
+
+class _StoryConflict(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def _path_is_redirect(path: Path) -> bool:
@@ -119,41 +148,6 @@ def _story_data_directory(value: object, name: str) -> Path:
             raise ValueError(f"{name} contains a filesystem redirect")
     return candidate
 
-
-def _store_story_source(
-    directory: Path, story: ImportedStory, encoding: str
-) -> _StorySourceRecord:
-    """Persist one validated source beneath a generated opaque server ID."""
-
-    if any(_path_is_redirect(candidate) for candidate in (directory, *directory.parents)):
-        raise OSError("story storage directory is unsafe")
-    directory.mkdir(parents=True, exist_ok=True)
-    if any(_path_is_redirect(candidate) for candidate in (directory, *directory.parents)):
-        raise OSError("story storage directory is unsafe")
-    resolved_directory = directory.resolve(strict=True)
-    for _ in range(16):
-        source_id = secrets.token_urlsafe(18)
-        target = directory / f"{source_id}{story.extension}"
-        if target.resolve(strict=False).parent != resolved_directory:
-            raise OSError("story storage target is unsafe")
-        try:
-            with target.open("xb") as source_file:
-                source_file.write(story.original_bytes)
-                source_file.flush()
-                os.fsync(source_file.fileno())
-        except FileExistsError:
-            continue
-        except OSError:
-            with contextlib.suppress(OSError):
-                target.unlink()
-            raise
-        return _StorySourceRecord(
-            source_id=source_id,
-            story=story,
-            encoding=encoding,
-            storage_path=target,
-        )
-    raise OSError("could not allocate an opaque story source id")
 
 def _release_version() -> str:
     """Return only a safe release label suitable for public display."""
@@ -290,7 +284,7 @@ def _story_analysis_payload(
         "status": status,
         "hash_prefix": record.story.source_sha256[:12],
         "analysis_version": OFFLINE_ANALYSIS_VERSION,
-        "dlc_version": state.story_dlc_version,
+        "dlc_version": state._current_story_dlc_version(),
     }
 
 
@@ -357,10 +351,7 @@ def _active_story_record(state: "AppState") -> _StorySourceRecord | None:
 def _inspect_story_analysis(
     state: "AppState", record: _StorySourceRecord
 ) -> AnalysisLookup:
-    published = record.published_lookup
-    if published is not None:
-        return published
-    key = offline_analysis_key(record.story, state.story_dlc_version)
+    key = offline_analysis_key(record.story, state._current_story_dlc_version())
     return state.story_analysis_store.inspect(key)
 
 
@@ -372,6 +363,21 @@ def _story_full_state(state: "AppState") -> dict[str, object]:
         if isinstance(novel, NovelSessionController)
         else _idle_novel_session_payload()
     )
+    planning = getattr(state, "story_planning_context", None)
+    if (
+        record is not None
+        and isinstance(planning, _StoryPlanningContext)
+        and getattr(state, "story_planning_task", None) is not None
+        and planning.source_id == record.source_id
+    ):
+        session_payload = {
+            **_idle_novel_session_payload(),
+            "status": "planning",
+            "hash_prefix": record.story.source_sha256[:12],
+            "filename": record.story.filename,
+            "chapter_id": planning.chapter_id,
+            "speed": planning.speed,
+        }
     if record is None:
         return {
             "selected_source": None,
@@ -414,7 +420,11 @@ def _analysis_error_response(
     )
 
 
-def _story_transition_error(exc: Exception) -> JSONResponse:
+def _story_transition_error(state: "AppState", exc: Exception) -> JSONResponse:
+    if isinstance(exc, _StoryConflict):
+        return JSONResponse(
+            {"code": exc.code, "error": exc.message}, status_code=409
+        )
     if isinstance(exc, ChapterPlanError):
         return JSONResponse(
             {"code": "chapter_plan_failed", "error": "chapter planning failed"},
@@ -425,15 +435,51 @@ def _story_transition_error(exc: Exception) -> JSONResponse:
             {"code": "story_output_failed", "error": "device output was not confirmed"},
             status_code=exc.status_code,
         )
-    if isinstance(exc, (NovelSessionError, RuntimeError, TypeError, ValueError)):
+    if isinstance(exc, NovelSessionError):
         return JSONResponse(
-            {"code": "story_transition_invalid", "error": str(exc)},
+            {
+                "code": "story_transition_invalid",
+                "error": "story transition is not available",
+            },
             status_code=409,
         )
+    state.logger.exception("unexpected story transition failure", exc_info=exc)
     return JSONResponse(
         {"code": "story_transition_failed", "error": "story transition failed"},
         status_code=500,
     )
+
+
+def _guard_story_runtime_change(state: "AppState"):
+    """Reserve the story runtime while a hot identity mutation is in flight."""
+
+    def decorate(endpoint):
+        @wraps(endpoint)
+        async def guarded(*args, **kwargs):
+            async with state.timeline_transition_lock:
+                planning = state.story_planning_task is not None
+                if state._story_runtime_is_busy():
+                    conflict = (
+                        _StoryConflict(
+                            "story_planning_active",
+                            "a story chapter is already being planned",
+                        )
+                        if planning
+                        else _StoryConflict(
+                            "story_runtime_busy", "story runtime is already active"
+                        )
+                    )
+                    return _story_transition_error(state, conflict)
+                state.story_runtime_change_active = True
+            try:
+                return await endpoint(*args, **kwargs)
+            finally:
+                async with state.timeline_transition_lock:
+                    state.story_runtime_change_active = False
+
+        return guarded
+
+    return decorate
 
 
 def _timeline_error_response(exc: Exception) -> JSONResponse:
@@ -472,6 +518,8 @@ class AppState:
         self.cfg = cfg
         self.logger = setup_logging(cfg["log_dir"], cfg["log"]["level"])
         self.timeline_transition_lock = asyncio.Lock()
+        self.broadcast_lock = asyncio.Lock()
+        self.state_revision = 0
 
         self.safety = SafetyManager(cfg)
         self.relay = RelayClient(
@@ -508,6 +556,9 @@ class AppState:
         self.story_import_directory = _story_data_directory(
             story_cfg["import_dir"], "story import directory"
         )
+        self.story_source_store = PinnedStorySourceStore(
+            self.story_import_directory, project_root=PROJECT_ROOT
+        )
         story_analysis_directory = _story_data_directory(
             story_cfg["analysis_dir"], "story analysis directory"
         )
@@ -516,25 +567,15 @@ class AppState:
         self.story_analysis_store = AnalysisStore(story_analysis_directory)
         self.story_sources: dict[str, _StorySourceRecord] = {}
         self.active_story_source_id: str | None = None
-        self.story_dlc_version = dlc_provenance(
-            cfg,
-            project_root=PROJECT_ROOT,
-            waveform_policy=self.timeline_session.waveform_policy,
-        )
+        self.story_source_generation = 0
+        self.story_planning_task: asyncio.Task | None = None
+        self.story_planning_context: _StoryPlanningContext | None = None
+        self.story_runtime_change_active = False
+        self.story_dlc_version = self._current_story_dlc_version()
         self.story_seed_factory = lambda: secrets.randbits(63)
-        self.chapter_planner = ChapterPlanner(
-            self.llm,
-            waveform_registry=self.safety.presets,
-            effective_caps={
-                channel: self.safety.cap_for(channel) for channel in ("A", "B")
-            },
-            reading_speed_cpm=story_cfg["reading_speed_cpm"],
-            cycle_gap_policy=CycleGapPolicy.from_dict(timeline_cfg["cycle_gap"]),
-            safety_adapter=self.safety,
-            model_identity=str(self.llm.model),
-            prompt_version=str(story_cfg["analysis_prompt_version"]),
-            dlc_version=self.story_dlc_version,
-            strength_jitter=int(timeline_cfg["strength_jitter"]),
+        self.story_planner_signature = self._story_runtime_signature()
+        self.chapter_planner = self._build_story_planner(
+            self.story_planner_signature
         )
         self.novel_session = NovelSessionController(
             self.timeline_session,
@@ -554,6 +595,161 @@ class AppState:
             "camera": bool(self.cfg["camera"].get("enabled", False)),
             "audio": bool(self.cfg["audio"].get("enabled", False)),
         }
+
+    def _current_story_dlc_version(self) -> str:
+        current = dlc_provenance(
+            self.cfg,
+            project_root=PROJECT_ROOT,
+            waveform_policy=self.timeline_session.waveform_policy,
+        )
+        self.story_dlc_version = current
+        return current
+
+    def _story_runtime_signature(self) -> _StoryRuntimeSignature:
+        model = str(getattr(self.llm, "model", "") or "").strip()
+        transport = getattr(self.llm, "client", self.llm)
+        return _StoryRuntimeSignature(
+            client_identity=(id(self.llm), id(transport)),
+            model=model,
+            prompt_version=OFFLINE_ANALYSIS_VERSION,
+            dlc_version=self._current_story_dlc_version(),
+            waveforms=tuple(sorted(self.safety.presets)),
+            caps=tuple(
+                (channel, self.safety.cap_for(channel))
+                for channel in ("A", "B")
+            ),
+        )
+
+    def _build_story_planner(
+        self, signature: _StoryRuntimeSignature
+    ) -> ChapterPlanner:
+        return ChapterPlanner(
+            self.llm,
+            waveform_registry=self.safety.presets,
+            effective_caps=dict(signature.caps),
+            reading_speed_cpm=self.cfg["story"]["reading_speed_cpm"],
+            cycle_gap_policy=CycleGapPolicy.from_dict(
+                self.cfg["timeline"]["cycle_gap"]
+            ),
+            safety_adapter=self.safety,
+            model_identity=signature.model,
+            prompt_version=signature.prompt_version,
+            dlc_version=signature.dlc_version,
+            strength_jitter=int(self.cfg["timeline"]["strength_jitter"]),
+        )
+
+    def _ensure_story_planner_current(self) -> _StoryRuntimeSignature:
+        signature = self._story_runtime_signature()
+        if getattr(self, "story_planner_signature", None) != signature:
+            if self.story_planning_task is not None:
+                raise _StoryConflict(
+                    "story_planning_active", "a story chapter is already being planned"
+                )
+            if self.timeline_session.to_state().status.value != "idle":
+                raise _StoryConflict(
+                    "story_runtime_busy", "story runtime is already active"
+                )
+            pending = self.chapter_planner.cancel_pending()
+            if pending:
+                raise _StoryConflict(
+                    "story_runtime_busy", "story planner is still shutting down"
+                )
+            self.chapter_planner = self._build_story_planner(signature)
+            self.story_planner_signature = signature
+        return signature
+
+    def _story_runtime_is_busy(self) -> bool:
+        planning = self.story_planning_task
+        session = self.timeline_session.to_state()
+        return (
+            self.story_runtime_change_active
+            or planning is not None
+            or session.status.value != "idle"
+            or bool(self.loop.autopilot)
+        )
+
+    def _reserve_story_planning(
+        self,
+        record: _StorySourceRecord,
+        story_map: StoryMap,
+        chapter_id: str,
+        speed: object,
+    ) -> tuple[asyncio.Task, _StoryPlanningContext]:
+        if self.story_runtime_change_active:
+            raise _StoryConflict(
+                "story_runtime_busy", "story runtime configuration is changing"
+            )
+        if self.story_planning_task is not None:
+            raise _StoryConflict(
+                "story_planning_active", "a story chapter is already being planned"
+            )
+        if self.timeline_session.to_state().status.value != "idle" or self.loop.autopilot:
+            raise _StoryConflict(
+                "story_runtime_busy", "story runtime is already active"
+            )
+        if self.active_story_source_id != record.source_id:
+            raise _StoryConflict(
+                "story_state_changed", "the selected story source changed"
+            )
+        runtime_signature = self._ensure_story_planner_current()
+        planner = self.chapter_planner
+        context = _StoryPlanningContext(
+            generation=self.story_source_generation,
+            source_id=record.source_id,
+            chapter_id=chapter_id,
+            speed=speed,
+            planner=planner,
+            story_map=story_map,
+            runtime_signature=runtime_signature,
+        )
+        task = asyncio.create_task(
+            planner.plan(
+                record.story,
+                story_map,
+                chapter_id,
+                speed=speed,
+                seed=self.story_seed_factory(),
+            ),
+            name=f"story-plan-{record.source_id}",
+        )
+        task.add_done_callback(
+            lambda completed: (
+                None if completed.cancelled() else completed.exception()
+            )
+        )
+        self.story_planning_task = task
+        self.story_planning_context = context
+        return task, context
+
+    def _release_story_planning(self, task: asyncio.Task | None) -> None:
+        if task is not None and self.story_planning_task is task:
+            self.story_planning_task = None
+            self.story_planning_context = None
+
+    def _cancel_story_planning_now(self) -> tuple[asyncio.Task, ...]:
+        task = self.story_planning_task
+        planner = (
+            self.story_planning_context.planner
+            if self.story_planning_context is not None
+            else self.chapter_planner
+        )
+        pending: list[asyncio.Task] = []
+        if task is not None and not task.done():
+            task.cancel()
+            pending.append(task)
+        cancel_pending = getattr(planner, "cancel_pending", None)
+        if callable(cancel_pending):
+            pending.extend(cancel_pending())
+        if task is not None:
+            self.story_source_generation += 1
+        self.story_planning_task = None
+        self.story_planning_context = None
+        return tuple(dict.fromkeys(pending))
+
+    @staticmethod
+    async def _settle_story_planning(tasks: tuple[asyncio.Task, ...]) -> None:
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _timeline_manifest_metadata(self) -> dict[str, str]:
         """Snapshot provenance when a new live session actually begins."""
@@ -611,6 +807,8 @@ class AppState:
             self.auto_opened = True
             asyncio.create_task(self._auto_open_and_broadcast())
         if event == "client_disconnected":
+            planning = self._cancel_story_planning_now()
+            await self._settle_story_planning(planning)
             async with self.timeline_transition_lock:
                 await self.loop.on_client_disconnected()
                 await self.set_sensors(False)
@@ -633,15 +831,21 @@ class AppState:
 
     # ---------- 广播 ----------
     async def broadcast(self) -> None:
-        state = self.build_state()
-        dead = []
-        for ws in list(self.ws_clients):
-            try:
-                await ws.send_json({"type": "state", "data": state})
-            except Exception:  # noqa: BLE001
-                dead.append(ws)
-        for ws in dead:
-            self.ws_clients.discard(ws)
+        async with self.broadcast_lock:
+            self.state_revision += 1
+            state = self.build_state()
+            dead = []
+            for ws in list(self.ws_clients):
+                try:
+                    await ws.send_json({"type": "state", "data": state})
+                except Exception:  # noqa: BLE001
+                    dead.append(ws)
+            for ws in dead:
+                self.ws_clients.discard(ws)
+
+    async def send_state(self, ws: WebSocket) -> None:
+        async with self.broadcast_lock:
+            await ws.send_json({"type": "state", "data": self.build_state()})
 
     async def broadcast_chat(self, result: dict) -> None:
         """把 AI 主动生成的台词推送到页面聊天区。"""
@@ -670,6 +874,7 @@ class AppState:
             "version": _public_app_version(),
         }
         state["story"] = _story_full_state(self)
+        state["state_revision"] = self.state_revision
         return state
 
     # ---------- 传感器开关（跟随自动运行；浏览器断开超时自动关） ----------
@@ -776,6 +981,8 @@ class AppState:
         self.loop.stop_observe_loop()
         primary_error: BaseException | None = None
         try:
+            planning = self._cancel_story_planning_now()
+            await self._settle_story_planning(planning)
             async with self.timeline_transition_lock:
                 # Process shutdown is always abnormal lifecycle termination: live
                 # work and replay playback clear output but never create an archive.
@@ -813,6 +1020,7 @@ class AppState:
             if unique_tasks:
                 await asyncio.gather(*unique_tasks, return_exceptions=True)
             self.tasks.clear()
+            self.story_source_store.close()
 
         if primary_error is not None:
             raise primary_error
@@ -874,24 +1082,36 @@ def make_app() -> FastAPI:
                 {"code": "story_import_invalid", "error": "story source is invalid"},
                 status_code=400,
             )
-        try:
-            record = _store_story_source(
-                state.story_import_directory, story, encoding
-            )
-        except OSError:
-            return JSONResponse(
-                {"code": "story_import_failed", "error": "story source could not be stored"},
-                status_code=500,
-            )
+        async with state.timeline_transition_lock:
+            if state._story_runtime_is_busy():
+                return _story_transition_error(
+                    state,
+                    _StoryConflict(
+                        "story_runtime_busy", "story runtime is already active"
+                    ),
+                )
+            try:
+                stored = state.story_source_store.store(story)
+                record = _StorySourceRecord(
+                    source_id=stored.source_id,
+                    story=story,
+                    encoding=encoding,
+                    storage_path=stored.path,
+                )
+            except StorySourceStorageError:
+                return JSONResponse(
+                    {
+                        "code": "story_import_failed",
+                        "error": "story source could not be stored",
+                    },
+                    status_code=500,
+                )
 
-        state.story_sources[record.source_id] = record
-        state.active_story_source_id = record.source_id
-        lookup = _inspect_story_analysis(state, record)
-        record.published_lookup = lookup
-        try:
-            await state.broadcast()
-        finally:
-            record.published_lookup = None
+            state.story_sources[record.source_id] = record
+            state.active_story_source_id = record.source_id
+            state.story_source_generation += 1
+            lookup = _inspect_story_analysis(state, record)
+        await state.broadcast()
         return JSONResponse(
             {
                 "source": _story_source_payload(record),
@@ -932,29 +1152,80 @@ def make_app() -> FastAPI:
         record = _story_record(state, source_id)
         if record is None:
             return _story_not_found_response()
-        lookup = _inspect_story_analysis(state, record)
-        if lookup.status != "ready" or lookup.story_map is None:
-            return _analysis_error_response(state, record, lookup)
         speed = body.get("speed", "standard")
+        planning_task: asyncio.Task | None = None
         try:
             async with state.timeline_transition_lock:
-                plan = await state.chapter_planner.plan(
-                    record.story,
-                    lookup.story_map,
-                    chapter_id,
-                    speed=speed,
-                    seed=state.story_seed_factory(),
+                current_record = _story_record(state, source_id)
+                if current_record is not record:
+                    raise _StoryConflict(
+                        "story_state_changed", "the selected story source changed"
+                    )
+                lookup = _inspect_story_analysis(state, record)
+                if lookup.status != "ready" or lookup.story_map is None:
+                    return _analysis_error_response(state, record, lookup)
+                planning_task, planning_context = state._reserve_story_planning(
+                    record, lookup.story_map, chapter_id, speed
                 )
+            await state.broadcast()
+            try:
+                plan = await asyncio.shield(planning_task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    async with state.timeline_transition_lock:
+                        pending = state._cancel_story_planning_now()
+                    await state._settle_story_planning(pending)
+                    raise
+                raise _StoryConflict(
+                    "story_planning_cancelled", "chapter planning was cancelled"
+                )
+            async with state.timeline_transition_lock:
+                if (
+                    state.story_planning_task is not planning_task
+                    or state.story_planning_context is not planning_context
+                    or state.story_source_generation != planning_context.generation
+                    or state.active_story_source_id != planning_context.source_id
+                    or state.chapter_planner is not planning_context.planner
+                ):
+                    raise _StoryConflict(
+                        "story_state_changed", "story state changed during planning"
+                    )
+                current_record = _story_record(state, source_id)
+                current_lookup = (
+                    _inspect_story_analysis(state, current_record)
+                    if current_record is record
+                    else None
+                )
+                if (
+                    current_lookup is None
+                    or current_lookup.status != "ready"
+                    or current_lookup.story_map is None
+                    or current_lookup.story_map != planning_context.story_map
+                    or state._story_runtime_signature()
+                    != planning_context.runtime_signature
+                    or state.story_planner_signature
+                    != planning_context.runtime_signature
+                    or state.timeline_session.to_state().status.value != "idle"
+                    or state.novel_session.to_state().status.value != "idle"
+                ):
+                    raise _StoryConflict(
+                        "story_state_changed", "story state changed during planning"
+                    )
                 novel_state = await state.novel_session.start(
                     plan,
                     record.story,
-                    lookup.story_map,
+                    planning_context.story_map,
                     source_encoding=record.encoding,
+                    dlc_version=planning_context.runtime_signature.dlc_version,
                 )
-                state.active_story_source_id = record.source_id
                 payload = _novel_session_payload(novel_state)
+                state._release_story_planning(planning_task)
         except Exception as exc:  # The helper maps internal details to stable codes.
-            return _story_transition_error(exc)
+            async with state.timeline_transition_lock:
+                state._release_story_planning(planning_task)
+            await state.broadcast()
+            return _story_transition_error(state, exc)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -1015,7 +1286,7 @@ def make_app() -> FastAPI:
                 novel_state = await state.novel_session.pause()
                 payload = _novel_session_payload(novel_state)
         except Exception as exc:
-            return _story_transition_error(exc)
+            return _story_transition_error(state, exc)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -1026,7 +1297,7 @@ def make_app() -> FastAPI:
                 novel_state = await state.novel_session.resume(body.get("from", "current"))
                 payload = _novel_session_payload(novel_state)
         except Exception as exc:
-            return _story_transition_error(exc)
+            return _story_transition_error(state, exc)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -1040,7 +1311,7 @@ def make_app() -> FastAPI:
                     "session": _novel_session_payload(state.novel_session.to_state()),
                 }
         except Exception as exc:
-            return _story_transition_error(exc)
+            return _story_transition_error(state, exc)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -1353,16 +1624,21 @@ def make_app() -> FastAPI:
             value = int(body.get("value", 100))
         except (TypeError, ValueError):
             return JSONResponse({"error": "value 必须是整数"}, status_code=400)
+        planning: tuple[asyncio.Task, ...] = ()
         try:
             async with state.timeline_transition_lock:
+                planning = state._cancel_story_planning_now()
                 result = await state.loop.set_runtime_cap(ch, value)
         except DeviceOutputError as exc:
+            await state._settle_story_planning(planning)
             return JSONResponse(
                 {"error": "运行时上限物理降档失败"},
                 status_code=exc.status_code,
             )
         except (RuntimeError, TypeError, ValueError) as exc:
+            await state._settle_story_planning(planning)
             return _timeline_error_response(exc)
+        await state._settle_story_planning(planning)
         if result["dropped"]:
             return JSONResponse(
                 {"error": "运行时上限物理降档失败"},
@@ -1384,6 +1660,21 @@ def make_app() -> FastAPI:
         requested_profile = str(body.get("profile") or "").strip()
         try:
             async with state.timeline_transition_lock:
+                active_session = state.timeline_session.to_state()
+                if (
+                    state.story_runtime_change_active
+                    or state.story_planning_task is not None
+                    or (
+                        active_session.mode in ("novel", "replay")
+                        and active_session.status.value != "idle"
+                    )
+                ):
+                    return _story_transition_error(
+                        state,
+                        _StoryConflict(
+                            "story_runtime_busy", "story runtime is already active"
+                        ),
+                    )
                 candidate_cfg = deepcopy(cfg)
                 reload_character(candidate_cfg)
                 roles = {
@@ -1450,6 +1741,7 @@ def make_app() -> FastAPI:
         return JSONResponse({"ok": True, "player_nick": cfg["character"]["player_nick"]})
 
     @app.post("/api/dlc/import")
+    @_guard_story_runtime_change(state)
     async def api_dlc_import(file: UploadFile = File(...)) -> JSONResponse:
         """导入 DLC：上传 .zip（解出全部 .md）或单个 .md → 拷进 content\\pack\\ 并自动接通 character.yaml。
 
@@ -1666,22 +1958,59 @@ def make_app() -> FastAPI:
         model = str(body.get("model") or "").strip()
         if not base_url or not model:
             return JSONResponse({"error": "地址与模型名不能为空"}, status_code=400)
-        cfg_path = PROJECT_ROOT / "config" / "config.yaml"
-        example = PROJECT_ROOT / "config" / "config.example.yaml"
-        if not cfg_path.exists():
-            cfg_path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
-        cfg_path.write_text(
-            _patch_llm_text(cfg_path.read_text(encoding="utf-8"), api_key, base_url, model),
-            encoding="utf-8",
-        )
-        # 同步内存并热加载（key 留空时回退环境变量 DGLAB_LLM_API_KEY）
-        llm = cfg.setdefault("llm", {})
-        llm["api_key"] = api_key or os.environ.get("DGLAB_LLM_API_KEY", "")
-        llm["base_url"] = base_url
-        llm["model"] = model
-        old = state.llm
-        state.llm = LLM(cfg)
-        state.loop.llm = state.llm
+        async with state.timeline_transition_lock:
+            if state.timeline_session.to_state().status.value != "idle":
+                return _story_transition_error(
+                    state,
+                    _StoryConflict(
+                        "story_runtime_busy", "story runtime is already active"
+                    ),
+                )
+            state.story_runtime_change_active = True
+            planning = state._cancel_story_planning_now()
+        await state._settle_story_planning(planning)
+        old = None
+        try:
+            async with state.timeline_transition_lock:
+                if state.timeline_session.to_state().status.value != "idle":
+                    raise _StoryConflict(
+                        "story_runtime_busy", "story runtime is already active"
+                    )
+                cfg_path = PROJECT_ROOT / "config" / "config.yaml"
+                example = PROJECT_ROOT / "config" / "config.example.yaml"
+                if not cfg_path.exists():
+                    cfg_path.write_text(
+                        example.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                cfg_path.write_text(
+                    _patch_llm_text(
+                        cfg_path.read_text(encoding="utf-8"),
+                        api_key,
+                        base_url,
+                        model,
+                    ),
+                    encoding="utf-8",
+                )
+                # 同步内存并热加载（key 留空时回退环境变量 DGLAB_LLM_API_KEY）
+                llm = cfg.setdefault("llm", {})
+                llm["api_key"] = api_key or os.environ.get(
+                    "DGLAB_LLM_API_KEY", ""
+                )
+                llm["base_url"] = base_url
+                llm["model"] = model
+                old = state.llm
+                state.llm = LLM(cfg)
+                state.loop.llm = state.llm
+                signature = state._story_runtime_signature()
+                state.chapter_planner = state._build_story_planner(signature)
+                state.story_planner_signature = signature
+                state.story_runtime_change_active = False
+        except _StoryConflict as exc:
+            return _story_transition_error(state, exc)
+        finally:
+            if state.story_runtime_change_active:
+                async with state.timeline_transition_lock:
+                    state.story_runtime_change_active = False
         with contextlib.suppress(Exception):
             await old.client.aclose()
         await state.broadcast()
@@ -1718,7 +2047,7 @@ def make_app() -> FastAPI:
         await ws.accept()
         state.ws_clients.add(ws)
         state._on_ws_clients_change()
-        await ws.send_json({"type": "state", "data": state.build_state()})
+        await state.send_state(ws)
         try:
             while True:
                 await ws.receive_text()  # 客户端心跳/忽略

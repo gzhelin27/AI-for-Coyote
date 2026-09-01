@@ -268,6 +268,16 @@ class ChapterPlanner:
             timeline_request=timeline_request,
         )
 
+    def cancel_pending(self) -> tuple[asyncio.Task[tuple[_SceneIntent, ...]], ...]:
+        """Cancel model flights owned by this planner without awaiting them."""
+
+        pending = tuple(
+            task for task in self._intent_flights.values() if not task.done()
+        )
+        for task in pending:
+            task.cancel()
+        return pending
+
     async def _cached_intents(
         self,
         story: ImportedStory,

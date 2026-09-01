@@ -5,9 +5,7 @@ from contextlib import suppress
 from copy import deepcopy
 import io
 import json
-import os
 from pathlib import Path
-import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -28,6 +26,7 @@ from backend.story import (
     offline_analysis_key,
 )
 from backend.story.planner import ChapterPlanner
+from backend.story.source_store import PinnedStorySourceStore
 from backend.timeline.models import CycleGapPolicy
 from tests.test_session_endpoints import CapturingWebSocket, make_endpoint_state
 from tests.test_game_loop_timeline import make_game_loop_for_test
@@ -45,19 +44,108 @@ class RaisingStructuredClient:
         self, system_prompt: str, user_content: str, schema_name: str
     ) -> dict:
         self.call_count += 1
+        return _chapter_response(user_content)
+
+
+def _chapter_response(user_content: str) -> dict:
+    request = json.loads(user_content)
+    return {
+        "scenes": [
+            {
+                "scene_id": scene["scene_id"],
+                "channels": {
+                    "A": {"mode": "keep"},
+                    "B": {"mode": "keep"},
+                },
+            }
+            for scene in request["scenes"]
+        ]
+    }
+
+
+class BlockingStructuredClient:
+    model = "model-one"
+
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> dict:
+        self.call_count += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return _chapter_response(user_content)
+
+
+class CloseAwareStructuredClient(RaisingStructuredClient):
+    def __init__(self, *, blocked: bool = False) -> None:
+        super().__init__()
+        self.client = self
+        self.closed = False
+        self.blocked = blocked
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> dict:
+        self.call_count += 1
+        if self.blocked:
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        if self.closed:
+            raise RuntimeError("closed-client-secret")
+        return _chapter_response(user_content)
+
+
+class ChangingStrengthClient(RaisingStructuredClient):
+    async def complete_json(
+        self, system_prompt: str, user_content: str, schema_name: str
+    ) -> dict:
+        self.call_count += 1
         request = json.loads(user_content)
+        strength = 80 if self.call_count == 1 else 20
         return {
             "scenes": [
                 {
                     "scene_id": scene["scene_id"],
                     "channels": {
-                        "A": {"mode": "keep"},
+                        "A": {"mode": "set", "base_strength": strength},
                         "B": {"mode": "keep"},
                     },
                 }
                 for scene in request["scenes"]
             ]
         }
+
+
+class BlockingFirstWebSocket(CapturingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+
+    async def send_json(self, message):
+        if not self.messages:
+            self.first_started.set()
+            await self.release_first.wait()
+        self.messages.append(message)
 
 
 def _docx_bytes(text: str) -> bytes:
@@ -112,14 +200,29 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.state = make_endpoint_state(self.harness)
         self.state.story_import_directory = self.root / "stories"
+        self.state.story_source_store = PinnedStorySourceStore(
+            self.state.story_import_directory, project_root=self.root
+        )
+        self.addCleanup(self.state.story_source_store.close)
         self.state.story_source_loader = StorySourceLoader(max_bytes=1024 * 1024)
         self.state.story_source_max_bytes = 1024 * 1024
         self.state.story_analysis_store = AnalysisStore(self.root / "analysis")
         self.state.story_sources = {}
         self.state.active_story_source_id = None
-        self.state.story_dlc_version = "dlc-test-v1"
+        self.state.story_source_generation = 0
+        self.state.story_planning_task = None
+        self.state.story_planning_context = None
+        self.state.story_runtime_change_active = False
+        self.state.story_dlc_version = main_module.dlc_provenance(
+            self.state.cfg,
+            project_root=main_module.PROJECT_ROOT,
+            waveform_policy=self.harness.controller.waveform_policy,
+        )
+        self.state.broadcast_lock = asyncio.Lock()
+        self.state.state_revision = 0
         self.state.story_seed_factory = lambda: 71
         self.llm = RaisingStructuredClient()
+        self.state.llm = self.llm
         self.state.chapter_planner = ChapterPlanner(
             self.llm,
             waveform_registry=self.harness.safety.presets,
@@ -186,6 +289,24 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         return story_map
 
+    def _replace_planner_client(self, client) -> None:
+        self.llm = client
+        self.state.llm = client
+        self.state.chapter_planner = ChapterPlanner(
+            client,
+            waveform_registry=self.harness.safety.presets,
+            effective_caps={
+                channel: self.harness.safety.cap_for(channel)
+                for channel in ("A", "B")
+            },
+            reading_speed_cpm={"slow": 250, "standard": 400, "fast": 600},
+            cycle_gap_policy=CycleGapPolicy(),
+            safety_adapter=self.harness.safety,
+            model_identity=client.model,
+            prompt_version="faithful-offline-v1",
+            dlc_version=self.state.story_dlc_version,
+        )
+
     async def test_import_accepts_txt_md_docx_and_records_selected_encoding(self):
         cases = (
             ("story.txt", "纯爱文本".encode("utf-8"), "utf-8", ".txt"),
@@ -208,6 +329,20 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.llm.call_count, 0)
 
+    async def test_import_commits_through_the_pinned_source_store(self):
+        real_store = self.state.story_source_store.store
+        self.state.story_source_store.store = MagicMock(wraps=real_store)
+
+        response = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.state.story_source_store.store.assert_called_once()
+        source_id = response.json()["source"]["source_id"]
+        self.assertEqual(
+            sorted(path.name for path in self.state.story_import_directory.iterdir()),
+            [f"{source_id}.txt"],
+        )
+
     async def test_import_rejects_unsupported_and_oversize_without_storing_a_source(self):
         unsupported = await self._import("secret.pdf", b"not a novel", "auto")
         self.state.story_source_loader = StorySourceLoader(max_bytes=4)
@@ -219,7 +354,7 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(oversized.status_code, 400)
         self.assertEqual(oversized.json()["code"], "story_import_invalid")
         self.assertEqual(self.state.story_sources, {})
-        self.assertFalse(self.state.story_import_directory.exists())
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
         self.assertEqual(self.llm.call_count, 0)
 
     async def test_source_ids_are_opaque_isolated_and_never_resolve_caller_paths(self):
@@ -239,46 +374,18 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item.parent == self.state.story_import_directory for item in stored))
         self.assertEqual(self.llm.call_count, 0)
 
-    async def test_import_rejects_an_ancestor_storage_redirect(self):
-        outside = self.root / "outside"
-        outside.mkdir()
-        redirected_parent = self.root / "redirected-parent"
-        try:
-            os.symlink(outside, redirected_parent, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            if os.name != "nt":
-                self.skipTest(f"directory symlinks are unavailable: {exc}")
-            command = subprocess.run(
-                [
-                    "cmd",
-                    "/d",
-                    "/c",
-                    "mklink",
-                    "/J",
-                    str(redirected_parent),
-                    str(outside),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if command.returncode:
-                self.skipTest(
-                    f"directory links are unavailable: {command.stderr or command.stdout}"
-                )
-            self.addCleanup(
-                lambda: redirected_parent.rmdir()
-                if redirected_parent.exists()
-                else None
-            )
-        self.state.story_import_directory = redirected_parent / "stories"
+    async def test_import_maps_pinned_store_failure_without_publishing_source(self):
+        self.state.story_source_store.store = MagicMock(
+            side_effect=main_module.StorySourceStorageError("private path")
+        )
 
         response = await self._import("story.txt", b"ABCD", "utf-8")
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["code"], "story_import_failed")
         self.assertEqual(self.state.story_sources, {})
-        self.assertEqual(list(outside.iterdir()), [])
+        self.assertNotIn("private", response.text.lower())
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
         self.assertEqual(self.llm.call_count, 0)
 
     async def test_missing_analysis_never_calls_llm(self):
@@ -292,7 +399,7 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["status"], "missing")
         self.assertEqual(response.json()["hash_prefix"], imported.json()["source"]["hash_prefix"])
         self.assertEqual(response.json()["analysis_version"], "faithful-offline-v1")
-        self.assertEqual(response.json()["dlc_version"], "dlc-test-v1")
+        self.assertEqual(response.json()["dlc_version"], self.state.story_dlc_version)
         self.assertEqual(self.llm.call_count, 0)
 
     async def test_corrupt_analysis_is_invalid_once_then_missing_without_llm(self):
@@ -314,6 +421,62 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 409)
         self.assertEqual(missing.json()["code"], "analysis_missing")
         self.assertEqual(self.llm.call_count, 0)
+
+    async def test_import_invalid_event_is_not_shared_with_broadcast_or_get(self):
+        source_bytes = b"ABCD"
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        cache_path = self.state.story_analysis_store.cache_path(
+            offline_analysis_key(story, self.state.story_dlc_version)
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("{broken", encoding="utf-8")
+        socket = BlockingFirstWebSocket()
+        self.state.ws_clients.add(socket)
+        self.state.broadcast = main_module.AppState.broadcast.__get__(
+            self.state, main_module.AppState
+        )
+
+        importing = asyncio.create_task(
+            self._import("story.txt", source_bytes, "utf-8")
+        )
+        await asyncio.wait_for(socket.first_started.wait(), timeout=0.2)
+        source_id = self.state.active_story_source_id
+        concurrent = await self.client.get(
+            f"/api/story/{source_id}/analysis"
+        )
+        socket.release_first.set()
+        imported = await asyncio.wait_for(importing, timeout=0.2)
+
+        self.assertEqual(imported.status_code, 200, imported.text)
+        self.assertEqual(imported.json()["analysis"]["status"], "invalid")
+        self.assertEqual(concurrent.status_code, 409)
+        self.assertEqual(concurrent.json()["code"], "analysis_missing")
+        self.assertEqual(
+            socket.messages[0]["data"]["story"]["analysis"]["status"],
+            "missing",
+        )
+
+    async def test_concurrent_corrupt_gets_publish_only_one_invalid_event(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        cache_path = self.state.story_analysis_store.cache_path(
+            offline_analysis_key(story, self.state.story_dlc_version)
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("{broken", encoding="utf-8")
+
+        first, second = await asyncio.gather(
+            self.client.get(f"/api/story/{source_id}/analysis"),
+            self.client.get(f"/api/story/{source_id}/analysis"),
+        )
+
+        self.assertEqual(sorted((first.status_code, second.status_code)), [409, 422])
+        self.assertEqual(
+            sorted((first.json()["code"], second.json()["code"])),
+            ["analysis_invalid", "analysis_missing"],
+        )
 
     async def test_ready_analysis_and_chapter_listing_are_public_and_model_free(self):
         source_bytes = b"ABCDWXYZ"
@@ -461,6 +624,518 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ABCD", json.dumps(message))
         self.assertEqual(self.llm.call_count, 0)
 
+    async def test_disconnect_cancels_blocking_planning_without_waiting_for_model(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+
+        await asyncio.wait_for(
+            main_module.AppState.on_relay_event(
+                self.state, "client_disconnected", {}
+            ),
+            timeout=0.2,
+        )
+        response = await asyncio.wait_for(play, timeout=0.2)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "story_planning_cancelled")
+        self.assertTrue(client.cancelled.is_set())
+        self.assertIsNone(self.state.story_planning_task)
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
+        self.assertFalse(
+            any(
+                not task.done() and task.get_name().startswith("chapter-intent-")
+                for task in asyncio.all_tasks()
+            )
+        )
+
+    async def test_shutdown_cancels_blocking_planning_before_transition_lock(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        self.state.shutdown = main_module.AppState.shutdown.__get__(
+            self.state, main_module.AppState
+        )
+        self.state._shutdown_cleanup = main_module.AppState._shutdown_cleanup.__get__(
+            self.state, main_module.AppState
+        )
+
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+
+        shutdown = asyncio.create_task(self.state.shutdown())
+        completed, _pending = await asyncio.wait({shutdown}, timeout=0.2)
+        if shutdown not in completed:
+            client.release.set()
+            await asyncio.wait_for(play, timeout=0.2)
+            await asyncio.wait_for(shutdown, timeout=0.2)
+        self.assertIn(shutdown, completed, "shutdown waited on the blocking planner")
+        response = await asyncio.wait_for(play, timeout=0.2)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "story_planning_cancelled")
+        self.assertTrue(client.cancelled.is_set())
+        self.assertIsNone(self.state.story_planning_task)
+        self.assertEqual(self.state.tasks, [])
+
+    async def test_planning_result_is_discarded_when_selected_source_changes(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        self.state.active_story_source_id = None
+        client.release.set()
+        response = await asyncio.wait_for(play, timeout=0.2)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "story_state_changed")
+        self.assertEqual(self.harness.controller.to_state().status.value, "idle")
+
+    async def test_concurrent_play_is_rejected_while_first_plan_is_blocked(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        endpoint = f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play"
+
+        first = asyncio.create_task(
+            self.client.post(endpoint, json={"speed": "standard"})
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        second = await asyncio.wait_for(
+            self.client.post(endpoint, json={"speed": "fast"}), timeout=0.2
+        )
+
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json()["code"], "story_planning_active")
+        self.assertEqual(client.call_count, 1)
+        client.release.set()
+        first_response = await asyncio.wait_for(first, timeout=0.2)
+        self.assertEqual(first_response.status_code, 200, first_response.text)
+
+    async def test_blocked_plan_is_published_as_story_planning_state(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        socket = CapturingWebSocket()
+        self.state.ws_clients.add(socket)
+        self.state.broadcast = main_module.AppState.broadcast.__get__(
+            self.state, main_module.AppState
+        )
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "fast"},
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+
+        planning = socket.messages[0]["data"]["story"]["session"]
+
+        self.assertEqual(planning["status"], "planning")
+        self.assertEqual(planning["chapter_id"], story_map.chapters[0].id)
+        self.assertEqual(planning["speed"], "fast")
+        self.assertEqual(planning["hash_prefix"], story.source_sha256[:12])
+        self.assertGreaterEqual(socket.messages[0]["data"]["state_revision"], 1)
+        client.release.set()
+        await asyncio.wait_for(play, timeout=0.2)
+
+    async def test_import_during_planning_is_conflict_and_preserves_selection(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        before_files = sorted(path.name for path in self.state.story_import_directory.iterdir())
+
+        conflict = await self._import("other.txt", b"WXYZ", "utf-8")
+
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["code"], "story_runtime_busy")
+        self.assertEqual(self.state.active_story_source_id, source_id)
+        self.assertEqual(
+            sorted(path.name for path in self.state.story_import_directory.iterdir()),
+            before_files,
+        )
+
+    async def test_full_state_broadcasts_are_serialized_with_monotonic_revisions(self):
+        socket = BlockingFirstWebSocket()
+        self.state.ws_clients.add(socket)
+        self.state.broadcast = main_module.AppState.broadcast.__get__(
+            self.state, main_module.AppState
+        )
+        self.state.layout = {"marker": 1}
+
+        first = asyncio.create_task(self.state.broadcast())
+        await asyncio.wait_for(socket.first_started.wait(), timeout=0.2)
+        self.state.layout = {"marker": 2}
+        second = asyncio.create_task(self.state.broadcast())
+        await asyncio.sleep(0)
+
+        self.assertFalse(second.done())
+        socket.release_first.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=0.2)
+        self.assertEqual(
+            [message["data"]["layout"]["marker"] for message in socket.messages],
+            [1, 2],
+        )
+        self.assertEqual(
+            [message["data"]["state_revision"] for message in socket.messages],
+            [1, 2],
+        )
+
+    async def test_dlc_change_makes_old_analysis_missing_and_replans_new_identity(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        chapter_id = story_map.chapters[0].id
+        first = await self.client.post(
+            f"/api/story/{source_id}/chapters/{chapter_id}/play",
+            json={"speed": "standard"},
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        await self.client.post("/api/story/finish")
+        initial_dlc = self.state.story_dlc_version
+
+        self.state.cfg["character"]["profile"] = "runtime-changed"
+        missing = await self.client.get(f"/api/story/{source_id}/analysis")
+
+        self.assertEqual(missing.status_code, 409)
+        self.assertEqual(missing.json()["code"], "analysis_missing")
+        new_dlc = missing.json()["dlc_version"]
+        self.assertNotEqual(new_dlc, initial_dlc)
+        self.state.story_analysis_store.save(
+            offline_analysis_key(story, new_dlc), story_map
+        )
+        second = await self.client.post(
+            f"/api/story/{source_id}/chapters/{chapter_id}/play",
+            json={"speed": "standard"},
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(self.llm.call_count, 2)
+        finished = await self.client.post("/api/story/finish")
+        replay = self.harness.store.load(finished.json()["replay"]["replay_id"])
+        self.assertEqual(replay.manifest.metadata["dlc_version"], new_dlc)
+
+    async def test_cap_change_rebuilds_planner_and_does_not_reuse_old_intent(self):
+        client = ChangingStrengthClient()
+        self._replace_planner_client(client)
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        endpoint = f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play"
+
+        first = await self.client.post(endpoint, json={"speed": "standard"})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(
+            self.state.novel_session.plan.plot_events[0].channels["A"].base_strength,
+            80,
+        )
+        await self.client.post("/api/story/finish")
+        cap = await self.client.post(
+            "/api/device/channels/cap", json={"channel": "A", "value": 30}
+        )
+        self.assertEqual(cap.status_code, 200, cap.text)
+        second = await self.client.post(endpoint, json={"speed": "standard"})
+
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(client.call_count, 2)
+        self.assertEqual(
+            self.state.novel_session.plan.plot_events[0].channels["A"].base_strength,
+            20,
+        )
+
+    async def test_cap_change_cancels_and_settles_blocking_planning(self):
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        endpoint = f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play"
+        play = asyncio.create_task(
+            self.client.post(endpoint, json={"speed": "standard"})
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+
+        cap = await asyncio.wait_for(
+            self.client.post(
+                "/api/device/channels/cap", json={"channel": "A", "value": 30}
+            ),
+            timeout=0.2,
+        )
+        cancelled = await asyncio.wait_for(play, timeout=0.2)
+
+        self.assertEqual(cap.status_code, 200, cap.text)
+        self.assertEqual(cancelled.status_code, 409, cancelled.text)
+        self.assertEqual(cancelled.json()["code"], "story_planning_cancelled")
+        self.assertTrue(client.cancelled.is_set())
+        self.assertIsNone(self.state.story_planning_task)
+        self.assertFalse(
+            [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and not task.done()
+                and task.get_name().startswith("story-plan-")
+            ]
+        )
+
+    async def test_dlc_import_is_conflict_during_live_novel_without_writes(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        played = await self.client.post(
+            f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+            json={"speed": "standard"},
+        )
+        self.assertEqual(played.status_code, 200, played.text)
+        runtime_root = self.root / "runtime-dlc"
+
+        with patch.object(main_module, "PROJECT_ROOT", runtime_root):
+            conflict = await self.client.post(
+                "/api/dlc/import",
+                files={"file": ("theme.md", b"# DLC", "text/markdown")},
+            )
+
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(conflict.json()["code"], "story_runtime_busy")
+        self.assertEqual(self.state.novel_session.to_state().status.value, "running")
+        self.assertFalse((runtime_root / "content").exists())
+
+    async def test_dlc_import_is_conflict_during_planning_and_does_not_cancel_it(self):
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        endpoint = f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play"
+        play = asyncio.create_task(
+            self.client.post(endpoint, json={"speed": "standard"})
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        runtime_root = self.root / "runtime-dlc"
+
+        with patch.object(main_module, "PROJECT_ROOT", runtime_root):
+            conflict = await asyncio.wait_for(
+                self.client.post(
+                    "/api/dlc/import",
+                    files={"file": ("theme.md", b"# DLC", "text/markdown")},
+                ),
+                timeout=0.2,
+            )
+
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(conflict.json()["code"], "story_planning_active")
+        self.assertFalse(client.cancelled.is_set())
+        self.assertFalse((runtime_root / "content").exists())
+        client.release.set()
+        completed = await asyncio.wait_for(play, timeout=0.2)
+        self.assertEqual(completed.status_code, 200, completed.text)
+
+    async def test_llm_replace_cancels_old_plan_before_closing_and_uses_new_client(self):
+        old = CloseAwareStructuredClient(blocked=True)
+        self._replace_planner_client(old)
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        endpoint = f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play"
+        play = asyncio.create_task(
+            self.client.post(endpoint, json={"speed": "standard"})
+        )
+        await asyncio.wait_for(old.started.wait(), timeout=0.2)
+        new = CloseAwareStructuredClient()
+        config_root = self.root / "runtime-config"
+        config_directory = config_root / "config"
+        config_directory.mkdir(parents=True)
+        config_text = (
+            "llm:\n"
+            '  api_key: ""\n'
+            "  base_url: https://old.invalid/v1\n"
+            "  model: model-one\n"
+        )
+        (config_directory / "config.example.yaml").write_text(
+            config_text, encoding="utf-8"
+        )
+
+        with (
+            patch.object(main_module, "PROJECT_ROOT", config_root),
+            patch.object(main_module, "LLM", return_value=new),
+        ):
+            replaced = await self.client.post(
+                "/api/settings/llm",
+                json={
+                    "api_key": "replacement-key",
+                    "base_url": "https://new.invalid/v1",
+                    "model": "model-one",
+                },
+            )
+        completed, _pending = await asyncio.wait({play}, timeout=0.2)
+        if play not in completed:
+            old.release.set()
+            await asyncio.wait_for(play, timeout=0.2)
+
+        self.assertEqual(replaced.status_code, 200, replaced.text)
+        self.assertIn(play, completed, "LLM replacement left old planning active")
+        self.assertEqual(play.result().status_code, 409)
+        self.assertEqual(play.result().json()["code"], "story_planning_cancelled")
+        self.assertTrue(old.cancelled.is_set())
+        self.assertTrue(old.closed)
+        replayed = await self.client.post(endpoint, json={"speed": "standard"})
+        self.assertEqual(replayed.status_code, 200, replayed.text)
+        self.assertEqual(old.call_count, 1)
+        self.assertEqual(new.call_count, 1)
+
+    async def test_unexpected_story_exceptions_are_logged_generic_500_without_text(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        self.state.logger.exception = MagicMock()
+        original_start = self.state.novel_session.start
+        original_pause = self.state.novel_session.pause
+        original_resume = self.state.novel_session.resume
+        try:
+            self.state.novel_session.start = AsyncMock(
+                side_effect=ValueError("C:\\private\\story-secret.txt")
+            )
+            play = await self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+            self.state.novel_session.pause = AsyncMock(
+                side_effect=RuntimeError("runtime-secret-token")
+            )
+            paused = await self.client.post("/api/story/pause")
+            self.state.novel_session.resume = AsyncMock(
+                side_effect=TypeError("type-secret-token")
+            )
+            resumed = await self.client.post(
+                "/api/story/resume", json={"from": "current"}
+            )
+        finally:
+            self.state.novel_session.start = original_start
+            self.state.novel_session.pause = original_pause
+            self.state.novel_session.resume = original_resume
+
+        for response in (play, paused, resumed):
+            self.assertEqual(response.status_code, 500, response.text)
+            self.assertEqual(response.json()["code"], "story_transition_failed")
+            self.assertNotIn("secret", response.text.lower())
+            self.assertNotIn("private", response.text.lower())
+        self.assertEqual(self.state.logger.exception.call_count, 3)
+
+    async def test_import_during_running_novel_does_not_finish_or_archive(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        played = await self.client.post(
+            f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+            json={"speed": "standard"},
+        )
+        self.assertEqual(played.status_code, 200, played.text)
+        before_files = sorted(path.name for path in self.state.story_import_directory.iterdir())
+
+        conflict = await self._import("other.txt", b"WXYZ", "utf-8")
+
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["code"], "story_runtime_busy")
+        self.assertEqual(self.state.active_story_source_id, source_id)
+        self.assertEqual(self.harness.controller.to_state().status.value, "running")
+        self.assertEqual(self.harness.store.list(), [])
+        self.assertEqual(
+            sorted(path.name for path in self.state.story_import_directory.iterdir()),
+            before_files,
+        )
+
+    async def test_profile_hot_change_is_rejected_during_running_novel(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        played = await self.client.post(
+            f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+            json={"speed": "standard"},
+        )
+        self.assertEqual(played.status_code, 200, played.text)
+        original_role = self.state.cfg["character"]["role"]
+        original_profile = self.state.cfg["character"]["profile"]
+
+        changed = await self.client.post(
+            "/api/character/profile",
+            json={"role": "装置", "profile": "调教"},
+        )
+
+        self.assertEqual(changed.status_code, 409)
+        self.assertEqual(changed.json()["code"], "story_runtime_busy")
+        self.assertEqual(self.state.cfg["character"]["role"], original_role)
+        self.assertEqual(self.state.cfg["character"]["profile"], original_profile)
+        self.assertEqual(self.harness.controller.to_state().status.value, "running")
+        self.assertEqual(self.harness.store.list(), [])
+
 
 class StoryAppStateWiringTests(unittest.TestCase):
     def test_app_state_constructs_one_planner_and_one_novel_adapter_over_session_owner(self):
@@ -495,6 +1170,8 @@ class StoryAppStateWiringTests(unittest.TestCase):
             ) as novel_type,
         ):
             state = main_module.AppState(cfg)
+
+        self.addCleanup(state.story_source_store.close)
 
         self.assertIs(state.chapter_planner, planner)
         self.assertIs(state.novel_session, novel)
