@@ -126,3 +126,25 @@ Implemented and committed as `feat: import Codex story analysis offline`.
 
 - No post-open verification relies on resolving the configured root pathname: POSIX reads the basename through the pinned directory descriptor; Windows keeps the root handle open without delete sharing, then opens the basename while that root cannot be replaced. Platforms without required safe directory primitives return the typed offline-import failure.
 - The replace-race tests skip on this Windows host because the platform blocks the attempted replacement while the verified handle is open; they run on replace-capable platforms. No external model, network, device action, push, or tag was invoked.
+
+## Fix round 4/5
+
+### RED evidence
+
+- The new cross-platform regression that simulates the POSIX `os.open("candidate.json", dir_fd=pinned_root_fd)` call shape failed against the old absolute-path-only controlled-swap predicate with `AssertionError: False is not true`.
+
+### GREEN evidence
+
+- The exact controlled-swap regression passes and proves that the basename is accepted only with a directory descriptor whose `(st_dev, st_ino)` matches the pinned candidate root; the same basename under a different directory descriptor and an unrelated basename are rejected.
+- Focused source/store/importer/CLI/AppState-provenance suite: 97 passed, 5 skipped only for unavailable Windows symlink privilege or Windows' non-replaceable opened-file/directory semantics.
+- Full `unittest discover -s tests -p "test_*.py"` suite: 448 passed, 5 skipped, in 34.428s.
+
+### Fixes and modified files
+
+- `tests/test_story_offline_analysis.py`: make the controlled race hook recognize both the Windows absolute candidate open and the POSIX basename plus verified pinned-root `dir_fd`, without matching another basename or directory; assert typed `OfflineAnalysisError` and confirm the swap occurred for both moved-file and unlink-to-symlink races.
+- No production implementation was weakened or changed; the existing opened-handle containment checks remain the behavior under test.
+
+### Self-review and residual risk
+
+- This Windows host has no installed WSL runtime and denies replacement of the opened candidate with `WinError 32`, so both true filesystem races retain explicit platform skips. The new non-skipped regression uses real directory handles to cover the exact POSIX `dir_fd` hook shape locally; replace-capable POSIX hosts execute the full swap and typed fail-closed assertions.
+- No external model, network, device action, push, or tag was invoked.

@@ -19,6 +19,28 @@ from backend.story.offline_analysis import (
 from backend.story.source import StorySourceLoader
 
 
+def _matches_controlled_candidate_open(
+    path: object,
+    *,
+    candidate_path: Path,
+    candidate_root_identity: tuple[int, int],
+    dir_fd: int | None,
+) -> bool:
+    """Identify only the candidate open that the controlled race should swap."""
+    if dir_fd is None:
+        try:
+            return Path(path) == candidate_path
+        except TypeError:
+            return False
+    try:
+        if os.fspath(path) != candidate_path.name:
+            return False
+        root_details = os.fstat(dir_fd)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (root_details.st_dev, root_details.st_ino) == candidate_root_identity
+
+
 class CountingAnalysisStore(AnalysisStore):
     def __init__(self, directory: Path) -> None:
         super().__init__(directory)
@@ -152,14 +174,60 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 self.source_path, linked, encoding="utf-8", dlc_version="dlc1-v1"
             )
 
+    def test_controlled_swap_hook_matches_only_posix_basename_in_pinned_root(self):
+        other_directory = self.root / "other-candidates"
+        other_directory.mkdir()
+        candidate_root = offline_analysis._open_directory_without_redirect(
+            self.candidate_directory
+        )
+        other_root = offline_analysis._open_directory_without_redirect(other_directory)
+        self.addCleanup(candidate_root.close)
+        self.addCleanup(other_root.close)
+        candidate_root_details = os.fstat(candidate_root.fileno())
+        candidate_root_identity = (
+            candidate_root_details.st_dev,
+            candidate_root_details.st_ino,
+        )
+
+        self.assertTrue(
+            _matches_controlled_candidate_open(
+                self.candidate_path.name,
+                candidate_path=self.candidate_path,
+                candidate_root_identity=candidate_root_identity,
+                dir_fd=candidate_root.fileno(),
+            )
+        )
+        self.assertFalse(
+            _matches_controlled_candidate_open(
+                self.candidate_path.name,
+                candidate_path=self.candidate_path,
+                candidate_root_identity=candidate_root_identity,
+                dir_fd=other_root.fileno(),
+            )
+        )
+        self.assertFalse(
+            _matches_controlled_candidate_open(
+                "unrelated.json",
+                candidate_path=self.candidate_path,
+                candidate_root_identity=candidate_root_identity,
+                dir_fd=candidate_root.fileno(),
+            )
+        )
+
     def test_validation_fails_closed_when_a_race_moves_opened_candidate_outside_root(self):
         attacker = self._valid_candidate()
         attacker["chapters"][0]["scenes"][0]["summary"] = "目录外候选内容。"
         outside = self.root / "outside.json"
         outside.write_text(json.dumps(attacker, ensure_ascii=False), encoding="utf-8")
         held = self.root / "held-candidate.json"
-        original_read_bytes = Path.read_bytes
         original_open = offline_analysis.os.open
+        candidate_root_details = os.stat(
+            self.candidate_directory, follow_symlinks=False
+        )
+        candidate_root_identity = (
+            candidate_root_details.st_dev,
+            candidate_root_details.st_ino,
+        )
         swapped = False
 
         def replace_candidate() -> None:
@@ -169,14 +237,14 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 outside.replace(self.candidate_path)
                 swapped = True
 
-        def read_bytes_with_race(path: Path) -> bytes:
-            if path == self.candidate_path:
-                replace_candidate()
-            return original_read_bytes(path)
-
         def open_with_race(path, flags, *args, **kwargs):
             descriptor = original_open(path, flags, *args, **kwargs)
-            if Path(path) == self.candidate_path:
+            if _matches_controlled_candidate_open(
+                path,
+                candidate_path=self.candidate_path,
+                candidate_root_identity=candidate_root_identity,
+                dir_fd=kwargs.get("dir_fd"),
+            ):
                 try:
                     replace_candidate()
                 except PermissionError as exc:
@@ -184,9 +252,7 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                     self.skipTest(f"opened files cannot be replaced on this platform: {exc}")
             return descriptor
 
-        with patch.object(Path, "read_bytes", read_bytes_with_race), patch.object(
-            offline_analysis.os, "open", open_with_race
-        ):
+        with patch.object(offline_analysis.os, "open", open_with_race):
             with self.assertRaises(OfflineAnalysisError):
                 self.importer.validate(
                     self.source_path,
@@ -197,13 +263,19 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
 
         self.assertTrue(swapped)
 
-    def test_validation_reads_the_opened_candidate_when_a_race_swaps_to_symlink(self):
+    def test_validation_fails_closed_when_a_race_swaps_to_symlink(self):
         outside = self.root / "outside.json"
         attacker = self._valid_candidate()
         attacker["chapters"][0]["scenes"][0]["summary"] = "目录外符号链接内容。"
         outside.write_text(json.dumps(attacker, ensure_ascii=False), encoding="utf-8")
-        original_read_bytes = Path.read_bytes
         original_open = offline_analysis.os.open
+        candidate_root_details = os.stat(
+            self.candidate_directory, follow_symlinks=False
+        )
+        candidate_root_identity = (
+            candidate_root_details.st_dev,
+            candidate_root_details.st_ino,
+        )
         swapped = False
 
         def replace_candidate() -> None:
@@ -216,14 +288,14 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                     self.skipTest(f"symlinks are unavailable: {exc}")
                 swapped = True
 
-        def read_bytes_with_race(path: Path) -> bytes:
-            if path == self.candidate_path:
-                replace_candidate()
-            return original_read_bytes(path)
-
         def open_with_race(path, flags, *args, **kwargs):
             descriptor = original_open(path, flags, *args, **kwargs)
-            if Path(path) == self.candidate_path:
+            if _matches_controlled_candidate_open(
+                path,
+                candidate_path=self.candidate_path,
+                candidate_root_identity=candidate_root_identity,
+                dir_fd=kwargs.get("dir_fd"),
+            ):
                 try:
                     replace_candidate()
                 except PermissionError as exc:
@@ -231,20 +303,16 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                     self.skipTest(f"opened files cannot be replaced on this platform: {exc}")
             return descriptor
 
-        with patch.object(Path, "read_bytes", read_bytes_with_race), patch.object(
-            offline_analysis.os, "open", open_with_race
-        ):
-            result = self.importer.validate(
-                self.source_path,
-                self.candidate_path,
-                encoding="utf-8",
-                dlc_version="dlc1-v1",
-            )
+        with patch.object(offline_analysis.os, "open", open_with_race):
+            with self.assertRaises(OfflineAnalysisError):
+                self.importer.validate(
+                    self.source_path,
+                    self.candidate_path,
+                    encoding="utf-8",
+                    dlc_version="dlc1-v1",
+                )
 
         self.assertTrue(swapped)
-        self.assertEqual(
-            result.story_map.chapters[0].scenes[0].summary, "章节标题出现。"
-        )
 
     def test_validation_rejects_junction_candidate_directory(self):
         if os.name != "nt":
