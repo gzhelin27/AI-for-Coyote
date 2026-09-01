@@ -121,14 +121,32 @@ def _verified_context_error(
         else ""
     )
     bounded_identities: list[str] = []
+    identity_present = False
+    untrusted_identity = False
     for field in ("code", "type"):
-        value = error.get(field)
-        if isinstance(value, str) and len(value) <= _MAX_ERROR_FIELD_CHARS:
-            identity = _normalized_error_identity(value)
-            if identity:
-                bounded_identities.append(identity)
-    if bounded_identities:
-        return all(identity in _CONTEXT_ERROR_CODES for identity in bounded_identities)
+        if field not in error:
+            continue
+        value = error[field]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        identity_present = True
+        if not isinstance(value, str) or len(value) > _MAX_ERROR_FIELD_CHARS:
+            untrusted_identity = True
+            continue
+        identity = _normalized_error_identity(value)
+        if not identity:
+            untrusted_identity = True
+            continue
+        bounded_identities.append(identity)
+    if identity_present:
+        return (
+            not untrusted_identity
+            and bool(bounded_identities)
+            and all(
+                identity in _CONTEXT_ERROR_CODES
+                for identity in bounded_identities
+            )
+        )
     if _explicit_context_overage(bounded_message):
         return True
 
@@ -141,12 +159,12 @@ def _verified_context_error(
         provider_document = json.loads(raw)
     except (ValueError, RecursionError):
         provider_document = None
-    if isinstance(provider_document, dict) and _verified_context_error(
-        status_code,
-        provider_document,
-        inspect_provider_raw=False,
-    ):
-        return True
+    if isinstance(provider_document, dict):
+        return _verified_context_error(
+            status_code,
+            provider_document,
+            inspect_provider_raw=False,
+        )
     lowered_raw = raw.lower()
     return _explicit_context_overage(lowered_raw)
 
