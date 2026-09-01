@@ -108,6 +108,25 @@ class _StoryRuntimeOwner:
 
 
 @dataclass(frozen=True, slots=True)
+class _StoryImportInspection:
+    dlc_version: str
+    lookup: AnalysisLookup
+
+
+@dataclass(slots=True)
+class _StoryImportTransaction:
+    owner: _StoryRuntimeOwner
+    request_task: asyncio.Task
+    source_generation: int
+    previous_active_source_id: str | None
+    store_task: asyncio.Task
+    stored: StoredStorySource | None = None
+    record: _StorySourceRecord | None = None
+    inspect_task: asyncio.Task | None = None
+    committed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _StoryPlanningContext:
     generation: int
     source_id: str
@@ -288,13 +307,21 @@ def _story_source_payload(record: _StorySourceRecord) -> dict[str, object]:
 
 
 def _story_analysis_payload(
-    state: "AppState", record: _StorySourceRecord, status: str
+    state: "AppState",
+    record: _StorySourceRecord,
+    status: str,
+    *,
+    dlc_version: str | None = None,
 ) -> dict[str, object]:
     return {
         "status": status,
         "hash_prefix": record.story.source_sha256[:12],
         "analysis_version": OFFLINE_ANALYSIS_VERSION,
-        "dlc_version": state._current_story_dlc_version(),
+        "dlc_version": (
+            dlc_version
+            if dlc_version is not None
+            else state._current_story_dlc_version()
+        ),
     }
 
 
@@ -363,6 +390,26 @@ def _inspect_story_analysis(
 ) -> AnalysisLookup:
     key = offline_analysis_key(record.story, state._current_story_dlc_version())
     return state.story_analysis_store.inspect(key)
+
+
+def _inspect_import_story_analysis(
+    cfg_snapshot: dict[str, object],
+    *,
+    project_root: Path,
+    waveform_policy: str,
+    analysis_store: AnalysisStore,
+    story: ImportedStory,
+) -> _StoryImportInspection:
+    dlc_version = dlc_provenance(
+        cfg_snapshot,
+        project_root=project_root,
+        waveform_policy=waveform_policy,
+    )
+    key = offline_analysis_key(story, dlc_version)
+    return _StoryImportInspection(
+        dlc_version=dlc_version,
+        lookup=analysis_store.inspect(key),
+    )
 
 
 def _story_full_state(state: "AppState") -> dict[str, object]:
@@ -485,8 +532,8 @@ def _guard_story_runtime_change(state: "AppState"):
             try:
                 return await endpoint(*args, **kwargs)
             finally:
-                async with state.timeline_transition_lock:
-                    state._release_story_runtime_owner(owner)
+                release_task = state._schedule_story_owner_release(owner)
+                await asyncio.shield(release_task)
 
         return guarded
 
@@ -583,6 +630,8 @@ class AppState:
         self.story_planning_context: _StoryPlanningContext | None = None
         self.story_runtime_owner: _StoryRuntimeOwner | None = None
         self.story_source_store_task: asyncio.Task | None = None
+        self.story_source_io_tasks: set[asyncio.Task] = set()
+        self.story_cleanup_tasks: set[asyncio.Task] = set()
         self.story_import_requests: set[asyncio.Task] = set()
         self.story_shutting_down = False
         self.story_dlc_version = self._current_story_dlc_version()
@@ -701,6 +750,129 @@ class AppState:
             raise RuntimeError("story runtime owner requires the transition lock")
         if owner is not None and self.story_runtime_owner is owner:
             self.story_runtime_owner = None
+
+    def _track_story_task(
+        self,
+        awaitable,
+        *,
+        collection: set[asyncio.Task],
+        name: str,
+    ) -> asyncio.Task:
+        task = asyncio.create_task(awaitable, name=name)
+        collection.add(task)
+
+        def forget(completed: asyncio.Task) -> None:
+            collection.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(forget)
+        return task
+
+    def _track_story_io(self, awaitable, *, name: str) -> asyncio.Task:
+        return self._track_story_task(
+            awaitable, collection=self.story_source_io_tasks, name=name
+        )
+
+    def _track_story_cleanup(self, awaitable, *, name: str) -> asyncio.Task:
+        return self._track_story_task(
+            awaitable, collection=self.story_cleanup_tasks, name=name
+        )
+
+    def _schedule_story_owner_release(
+        self, owner: _StoryRuntimeOwner | None
+    ) -> asyncio.Task:
+        async def release() -> None:
+            async with self.timeline_transition_lock:
+                self._release_story_runtime_owner(owner)
+
+        kind = owner.kind if owner is not None else "none"
+        return self._track_story_cleanup(
+            release(), name=f"story-owner-release-{kind}"
+        )
+
+    def _schedule_story_planning_cleanup(
+        self, planning_task: asyncio.Task | None
+    ) -> asyncio.Task:
+        async def cleanup() -> None:
+            pending: tuple[asyncio.Task, ...] = ()
+            async with self.timeline_transition_lock:
+                if (
+                    planning_task is not None
+                    and self.story_planning_task is planning_task
+                ):
+                    pending = self._cancel_story_planning_now()
+            await self._settle_story_planning(pending)
+
+        return self._track_story_cleanup(
+            cleanup(), name="story-planning-cleanup"
+        )
+
+    def _schedule_story_import_cleanup(
+        self, transaction: _StoryImportTransaction
+    ) -> asyncio.Task:
+        async def cleanup() -> None:
+            delete_task: asyncio.Task | None = None
+            try:
+                if transaction.stored is None:
+                    try:
+                        stored_result = await asyncio.shield(
+                            transaction.store_task
+                        )
+                        if isinstance(stored_result, StoredStorySource):
+                            transaction.stored = stored_result
+                    except Exception:
+                        pass
+                if transaction.inspect_task is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(transaction.inspect_task)
+                if not transaction.committed and transaction.record is not None:
+                    async with self.timeline_transition_lock:
+                        record = transaction.record
+                        if self.story_sources.get(record.source_id) is record:
+                            self.story_sources.pop(record.source_id, None)
+                            if self.active_story_source_id == record.source_id:
+                                self.active_story_source_id = (
+                                    transaction.previous_active_source_id
+                                )
+                            if (
+                                self.story_source_generation
+                                == transaction.source_generation + 1
+                            ):
+                                self.story_source_generation = (
+                                    transaction.source_generation
+                                )
+                if transaction.stored is not None and not transaction.committed:
+                    stored = transaction.stored
+                    delete_task = self._track_story_io(
+                        asyncio.to_thread(self.story_source_store.delete, stored),
+                        name=f"story-source-store-delete-{stored.source_id}",
+                    )
+                    try:
+                        await asyncio.shield(delete_task)
+                    except Exception:
+                        self.logger.exception(
+                            "failed to remove unregistered story source"
+                        )
+            finally:
+                async with self.timeline_transition_lock:
+                    if self.story_source_store_task in (
+                        transaction.store_task,
+                        transaction.inspect_task,
+                        delete_task,
+                    ):
+                        self.story_source_store_task = None
+                    self.story_import_requests.discard(transaction.request_task)
+                    self._release_story_runtime_owner(transaction.owner)
+
+        source_id = (
+            transaction.stored.source_id
+            if transaction.stored is not None
+            else "pending"
+        )
+        return self._track_story_cleanup(
+            cleanup(), name=f"story-import-cleanup-{source_id}"
+        )
 
     def _reserve_story_planning(
         self,
@@ -1082,6 +1254,18 @@ class AppState:
             remaining_store = self.story_source_store_task
             if remaining_store is not None and not remaining_store.done():
                 await asyncio.gather(remaining_store, return_exceptions=True)
+            while True:
+                story_tasks = tuple(
+                    task
+                    for task in (
+                        *self.story_cleanup_tasks,
+                        *self.story_source_io_tasks,
+                    )
+                    if task is not asyncio.current_task() and not task.done()
+                )
+                if not story_tasks:
+                    break
+                await asyncio.gather(*story_tasks, return_exceptions=True)
             background = list(self.tasks)
             if self.sensor_watch_task is not None:
                 background.append(self.sensor_watch_task)
@@ -1157,14 +1341,11 @@ def make_app() -> FastAPI:
                 {"code": "story_import_invalid", "error": "story source is invalid"},
                 status_code=400,
             )
-        owner: _StoryRuntimeOwner | None = None
-        store_task: asyncio.Task | None = None
-        cleanup_task: asyncio.Task | None = None
-        stored: StoredStorySource | None = None
+        transaction: _StoryImportTransaction | None = None
         record: _StorySourceRecord | None = None
         lookup: AnalysisLookup | None = None
+        analysis_dlc_version: str | None = None
         response: JSONResponse | None = None
-        registered = False
         caller_cancelled = False
         request_task = asyncio.current_task()
         if request_task is None:
@@ -1180,25 +1361,47 @@ def make_app() -> FastAPI:
                         "story_runtime_busy", "story runtime is already active"
                     ),
                 )
+            cfg_snapshot = deepcopy(state.cfg)
+            project_root = PROJECT_ROOT
+            waveform_policy = state.timeline_session.waveform_policy
             owner = state._acquire_story_runtime_owner("import")
             source_generation = state.story_source_generation
-            store_task = asyncio.create_task(
-                asyncio.to_thread(state.story_source_store.store, story),
-                name=f"story-source-store-{story.source_sha256[:12]}",
+            previous_active_source_id = state.active_story_source_id
+            try:
+                store_task = state._track_story_io(
+                    asyncio.to_thread(state.story_source_store.store, story),
+                    name=f"story-source-store-{story.source_sha256[:12]}",
+                )
+            except Exception:
+                state._release_story_runtime_owner(owner)
+                state.logger.exception("unexpected story source store failure")
+                return JSONResponse(
+                    {
+                        "code": "story_import_failed",
+                        "error": "story source could not be stored",
+                    },
+                    status_code=500,
+                )
+            transaction = _StoryImportTransaction(
+                owner=owner,
+                request_task=request_task,
+                source_generation=source_generation,
+                previous_active_source_id=previous_active_source_id,
+                store_task=store_task,
             )
             state.story_source_store_task = store_task
             state.story_import_requests.add(request_task)
         try:
             try:
                 stored_result, was_cancelled = await state._await_story_io_task(
-                    store_task
+                    transaction.store_task
                 )
                 caller_cancelled = caller_cancelled or was_cancelled
                 if not isinstance(stored_result, StoredStorySource):
                     raise StorySourceStorageError(
                         "story source store returned an invalid result"
                     )
-                stored = stored_result
+                transaction.stored = stored_result
             except StorySourceStorageError:
                 response = JSONResponse(
                     {
@@ -1216,7 +1419,60 @@ def make_app() -> FastAPI:
                     },
                     status_code=500,
                 )
-            if stored is not None and not caller_cancelled:
+            if (
+                transaction.stored is not None
+                and response is None
+                and not caller_cancelled
+            ):
+                stored = transaction.stored
+                record = _StorySourceRecord(
+                    source_id=stored.source_id,
+                    story=story,
+                    encoding=encoding,
+                    storage_path=stored.path,
+                )
+                transaction.record = record
+                transaction.inspect_task = state._track_story_io(
+                    asyncio.to_thread(
+                        _inspect_import_story_analysis,
+                        cfg_snapshot,
+                        project_root=project_root,
+                        waveform_policy=waveform_policy,
+                        analysis_store=state.story_analysis_store,
+                        story=story,
+                    ),
+                    name=f"story-analysis-inspect-{stored.source_id}",
+                )
+                state.story_source_store_task = transaction.inspect_task
+                try:
+                    inspected_result, was_cancelled = await state._await_story_io_task(
+                        transaction.inspect_task
+                    )
+                    caller_cancelled = caller_cancelled or was_cancelled
+                    if not isinstance(inspected_result, _StoryImportInspection):
+                        raise RuntimeError(
+                            "story analysis inspection returned an invalid result"
+                        )
+                    analysis_dlc_version = inspected_result.dlc_version
+                    lookup = inspected_result.lookup
+                except Exception:
+                    state.logger.exception(
+                        "unexpected story analysis inspection failure"
+                    )
+                    response = JSONResponse(
+                        {
+                            "code": "story_import_failed",
+                            "error": "story source could not be inspected",
+                        },
+                        status_code=500,
+                    )
+            if (
+                record is not None
+                and lookup is not None
+                and analysis_dlc_version is not None
+                and response is None
+                and not caller_cancelled
+            ):
                 async with state.timeline_transition_lock:
                     runtime_changed = (
                         state.story_runtime_owner is not owner
@@ -1235,42 +1491,33 @@ def make_app() -> FastAPI:
                             ),
                         )
                     else:
-                        record = _StorySourceRecord(
-                            source_id=stored.source_id,
-                            story=story,
-                            encoding=encoding,
-                            storage_path=stored.path,
-                        )
-                        state.story_sources[record.source_id] = record
-                        state.active_story_source_id = record.source_id
-                        state.story_source_generation += 1
-                        lookup = _inspect_story_analysis(state, record)
-                        registered = True
+                        try:
+                            state.story_sources[record.source_id] = record
+                            state.active_story_source_id = record.source_id
+                            state.story_source_generation = source_generation + 1
+                            state.story_dlc_version = analysis_dlc_version
+                            transaction.committed = True
+                        except Exception:
+                            state.logger.exception(
+                                "unexpected story source commit failure"
+                            )
+                            response = JSONResponse(
+                                {
+                                    "code": "story_import_failed",
+                                    "error": "story source could not be committed",
+                                },
+                                status_code=500,
+                            )
+        except Exception:
+            state.logger.exception("unexpected story import failure")
+            response = JSONResponse(
+                {"code": "story_import_failed", "error": "story import failed"},
+                status_code=500,
+            )
         finally:
-            try:
-                if stored is not None and not registered:
-                    cleanup_task = asyncio.create_task(
-                        asyncio.to_thread(state.story_source_store.delete, stored),
-                        name=f"story-source-store-delete-{stored.source_id}",
-                    )
-                    async with state.timeline_transition_lock:
-                        if state.story_source_store_task is store_task:
-                            state.story_source_store_task = cleanup_task
-                    try:
-                        _, cleanup_cancelled = await state._await_story_io_task(
-                            cleanup_task
-                        )
-                        caller_cancelled = caller_cancelled or cleanup_cancelled
-                    except Exception:
-                        state.logger.exception(
-                            "failed to remove unregistered story source"
-                        )
-            finally:
-                async with state.timeline_transition_lock:
-                    if state.story_source_store_task in (store_task, cleanup_task):
-                        state.story_source_store_task = None
-                    state.story_import_requests.discard(request_task)
-                    state._release_story_runtime_owner(owner)
+            cleanup_task = state._schedule_story_import_cleanup(transaction)
+            if not caller_cancelled and not request_task.cancelling():
+                await asyncio.shield(cleanup_task)
         if caller_cancelled:
             raise asyncio.CancelledError
         if response is not None:
@@ -1281,11 +1528,23 @@ def make_app() -> FastAPI:
                 {"code": "story_import_failed", "error": "story import failed"},
                 status_code=500,
             )
-        await state.broadcast()
+        try:
+            await state.broadcast()
+        except Exception:
+            state.logger.exception("unexpected story import broadcast failure")
+            return JSONResponse(
+                {"code": "story_import_failed", "error": "story import failed"},
+                status_code=500,
+            )
         return JSONResponse(
             {
                 "source": _story_source_payload(record),
-                "analysis": _story_analysis_payload(state, record, lookup.status),
+                "analysis": _story_analysis_payload(
+                    state,
+                    record,
+                    lookup.status,
+                    dlc_version=analysis_dlc_version,
+                ),
             }
         )
 
@@ -1324,6 +1583,7 @@ def make_app() -> FastAPI:
             return _story_not_found_response()
         speed = body.get("speed", "standard")
         planning_task: asyncio.Task | None = None
+        planning_cleanup_task: asyncio.Task | None = None
         try:
             async with state.timeline_transition_lock:
                 current_record = _story_record(state, source_id)
@@ -1343,9 +1603,10 @@ def make_app() -> FastAPI:
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
-                    async with state.timeline_transition_lock:
-                        pending = state._cancel_story_planning_now()
-                    await state._settle_story_planning(pending)
+                    planning_cleanup_task = (
+                        state._schedule_story_planning_cleanup(planning_task)
+                    )
+                    await asyncio.shield(planning_cleanup_task)
                     raise
                 raise _StoryConflict(
                     "story_planning_cancelled", "chapter planning was cancelled"
@@ -1394,10 +1655,24 @@ def make_app() -> FastAPI:
                 payload = _novel_session_payload(novel_state)
                 state._release_story_planning(planning_task)
         except Exception as exc:  # The helper maps internal details to stable codes.
-            async with state.timeline_transition_lock:
-                state._release_story_planning(planning_task)
+            planning_cleanup_task = state._schedule_story_planning_cleanup(
+                planning_task
+            )
+            await asyncio.shield(planning_cleanup_task)
             await state.broadcast()
             return _story_transition_error(state, exc)
+        finally:
+            current = asyncio.current_task()
+            if (
+                planning_task is not None
+                and planning_cleanup_task is None
+                and state.story_planning_task is planning_task
+            ):
+                planning_cleanup_task = state._schedule_story_planning_cleanup(
+                    planning_task
+                )
+                if current is None or not current.cancelling():
+                    await asyncio.shield(planning_cleanup_task)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -1827,8 +2102,8 @@ def make_app() -> FastAPI:
         except (RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         finally:
-            async with state.timeline_transition_lock:
-                state._release_story_runtime_owner(owner)
+            release_task = state._schedule_story_owner_release(owner)
+            await asyncio.shield(release_task)
         if result["dropped"]:
             return JSONResponse(
                 {"error": "运行时上限物理降档失败"},
@@ -1920,8 +2195,8 @@ def make_app() -> FastAPI:
         except (ReplayStoreError, RuntimeError, TypeError, ValueError) as exc:
             return _timeline_error_response(exc)
         finally:
-            async with state.timeline_transition_lock:
-                state._release_story_runtime_owner(owner)
+            release_task = state._schedule_story_owner_release(owner)
+            await asyncio.shield(release_task)
         await state.broadcast()
         return JSONResponse(payload)
 
@@ -2218,8 +2493,8 @@ def make_app() -> FastAPI:
         except _StoryConflict as exc:
             return _story_transition_error(state, exc)
         finally:
-            async with state.timeline_transition_lock:
-                state._release_story_runtime_owner(owner)
+            release_task = state._schedule_story_owner_release(owner)
+            await asyncio.shield(release_task)
         with contextlib.suppress(Exception):
             await old.client.aclose()
         await state.broadcast()

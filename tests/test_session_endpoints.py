@@ -84,6 +84,8 @@ def make_endpoint_state(harness):
     state.story_planning_context = None
     state.story_runtime_owner = None
     state.story_source_store_task = None
+    state.story_source_io_tasks = set()
+    state.story_cleanup_tasks = set()
     state.story_import_requests = set()
     state.story_shutting_down = False
     state.chapter_planner = SimpleNamespace(cancel_pending=lambda: ())

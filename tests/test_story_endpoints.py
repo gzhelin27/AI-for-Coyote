@@ -180,6 +180,55 @@ class StalledStorySourceStore:
         self.delegate.close()
 
 
+class StalledDeleteStorySourceStore:
+    def __init__(self, delegate, *, fallback_timeout: float = 0.75) -> None:
+        self.delegate = delegate
+        self.fallback_timeout = fallback_timeout
+        self.store_started = threading.Event()
+        self.store_release = threading.Event()
+        self.delete_started = threading.Event()
+        self.delete_release = threading.Event()
+        self.delete_finished = threading.Event()
+        self.closed = threading.Event()
+        self.closed_before_delete_finished = False
+
+    def store(self, story):
+        self.store_started.set()
+        self.store_release.wait(self.fallback_timeout)
+        return self.delegate.store(story)
+
+    def delete(self, stored) -> None:
+        self.delete_started.set()
+        self.delete_release.wait(self.fallback_timeout)
+        try:
+            self.delegate.delete(stored)
+        finally:
+            self.delete_finished.set()
+
+    def close(self) -> None:
+        if not self.delete_finished.is_set():
+            self.closed_before_delete_finished = True
+        self.closed.set()
+        self.delegate.close()
+
+
+class StalledAnalysisStore:
+    def __init__(self, delegate, *, fallback_timeout: float = 0.75) -> None:
+        self.delegate = delegate
+        self.fallback_timeout = fallback_timeout
+        self.inspect_started = threading.Event()
+        self.inspect_release = threading.Event()
+        self.inspect_finished = threading.Event()
+
+    def inspect(self, key):
+        self.inspect_started.set()
+        self.inspect_release.wait(self.fallback_timeout)
+        try:
+            return self.delegate.inspect(key)
+        finally:
+            self.inspect_finished.set()
+
+
 def _docx_bytes(text: str) -> bytes:
     document = Document()
     document.add_paragraph(text)
@@ -246,6 +295,8 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.state.story_planning_context = None
         self.state.story_runtime_owner = None
         self.state.story_source_store_task = None
+        self.state.story_source_io_tasks = set()
+        self.state.story_cleanup_tasks = set()
         self.state.story_import_requests = set()
         self.state.story_shutting_down = False
         self.state.story_dlc_version = main_module.dlc_provenance(
@@ -317,6 +368,13 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         while not event.is_set():
             if asyncio.get_running_loop().time() >= deadline:
                 self.fail("background story store did not start")
+            await asyncio.sleep(0.001)
+
+    async def _wait_for_condition(self, predicate, message: str) -> None:
+        deadline = asyncio.get_running_loop().time() + 0.75
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail(message)
             await asyncio.sleep(0.001)
 
     def _stall_story_store(self) -> StalledStorySourceStore:
@@ -416,6 +474,141 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(import_was_pending)
         self.assertEqual(imported.status_code, 200, imported.text)
 
+    async def test_repeated_cancel_while_final_release_waits_on_lock_eventually_clears_owner(self):
+        mutation_started = asyncio.Event()
+        release_mutation = asyncio.Event()
+        holder_acquired = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def controlled_cap(_channel: str, _value: int):
+            mutation_started.set()
+            await release_mutation.wait()
+            return {"dropped": False}
+
+        async def hold_transition_lock():
+            async with self.state.timeline_transition_lock:
+                holder_acquired.set()
+                await release_holder.wait()
+
+        self.state.loop.set_runtime_cap = controlled_cap
+        changing = asyncio.create_task(
+            self.client.post(
+                "/api/device/channels/cap", json={"channel": "A", "value": 30}
+            )
+        )
+        await asyncio.wait_for(mutation_started.wait(), timeout=0.2)
+        holder = asyncio.create_task(hold_transition_lock())
+        release_mutation.set()
+        await asyncio.wait_for(holder_acquired.wait(), timeout=0.2)
+
+        changing.cancel()
+        changing.cancel()
+        changing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await changing
+        self.assertIsNotNone(self.state.story_runtime_owner)
+
+        release_holder.set()
+        await asyncio.wait_for(holder, timeout=0.2)
+        await self._wait_for_condition(
+            lambda: (
+                self.state.story_runtime_owner is None
+                and not self.state.story_cleanup_tasks
+            ),
+            "cancelled endpoint permanently leaked its runtime owner",
+        )
+        self.assertEqual(self.state.story_cleanup_tasks, set())
+
+    async def test_cancelled_play_cleanup_cannot_be_interrupted_waiting_for_lock(self):
+        client = BlockingStructuredClient()
+        self._replace_planner_client(client)
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        play = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.2)
+        await self.state.timeline_transition_lock.acquire()
+        try:
+            play.cancel()
+            await asyncio.sleep(0)
+            play.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await play
+        finally:
+            self.state.timeline_transition_lock.release()
+
+        await asyncio.sleep(0.05)
+        cleanup_settled = (
+            self.state.story_runtime_owner is None
+            and self.state.story_planning_task is None
+            and not self.state.story_cleanup_tasks
+        )
+        client.release.set()
+        async with self.state.timeline_transition_lock:
+            pending = self.state._cancel_story_planning_now()
+        await self.state._settle_story_planning(pending)
+
+        self.assertTrue(
+            cleanup_settled,
+            "cancelled play leaked its planning task/runtime owner",
+        )
+        self.assertTrue(client.cancelled.is_set())
+
+    async def test_shutdown_waits_for_cancel_cleanup_delete_before_closing_store(self):
+        stalled = StalledDeleteStorySourceStore(self.state.story_source_store)
+        self.state.story_source_store = stalled
+        self.state.shutdown = main_module.AppState.shutdown.__get__(
+            self.state, main_module.AppState
+        )
+        self.state._shutdown_cleanup = main_module.AppState._shutdown_cleanup.__get__(
+            self.state, main_module.AppState
+        )
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+        await self._wait_for_thread_event(stalled.store_started)
+        await self.state.timeline_transition_lock.acquire()
+        shutdown = None
+        try:
+            importing.cancel()
+            stalled.store_release.set()
+            await self._wait_for_thread_event(stalled.delete_started)
+            importing.cancel()
+            await asyncio.sleep(0)
+            importing.cancel()
+            await asyncio.sleep(0)
+            if not importing.done():
+                importing.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await importing
+
+            shutdown = asyncio.create_task(self.state.shutdown())
+            self.state.timeline_transition_lock.release()
+            await asyncio.sleep(0.05)
+            shutdown_was_pending = not shutdown.done()
+            closed_early = stalled.closed.is_set()
+        finally:
+            if self.state.timeline_transition_lock.locked():
+                self.state.timeline_transition_lock.release()
+            stalled.delete_release.set()
+            if shutdown is not None:
+                await asyncio.wait_for(shutdown, timeout=0.75)
+
+        self.assertTrue(shutdown_was_pending)
+        self.assertFalse(closed_early)
+        self.assertFalse(stalled.closed_before_delete_finished)
+        self.assertTrue(stalled.delete_finished.is_set())
+        self.assertTrue(stalled.closed.is_set())
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertIsNone(self.state.story_runtime_owner)
+        self.assertEqual(self.state.story_cleanup_tasks, set())
+        self.assertEqual(self.state.story_source_io_tasks, set())
+
     async def test_cancelled_stalled_import_deletes_committed_orphan_and_clears_tasks(self):
         stalled = self._stall_story_store()
         importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
@@ -429,6 +622,14 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         except asyncio.CancelledError:
             was_cancelled = True
 
+        await self._wait_for_condition(
+            lambda: (
+                self.state.story_runtime_owner is None
+                and not self.state.story_cleanup_tasks
+                and not self.state.story_source_io_tasks
+            ),
+            "cancelled store cleanup did not settle",
+        )
         self.assertTrue(was_cancelled)
         self.assertEqual(self.state.story_sources, {})
         self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
@@ -459,6 +660,14 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await asyncio.wait_for(importing, timeout=0.75)
 
+        await self._wait_for_condition(
+            lambda: (
+                self.state.story_runtime_owner is None
+                and not self.state.story_cleanup_tasks
+                and not self.state.story_source_io_tasks
+            ),
+            "failing delete cleanup did not settle",
+        )
         self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
         self.assertIsNone(self.state.story_runtime_owner)
         self.assertIsNone(self.state.story_source_store_task)
@@ -485,6 +694,168 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.state.logger.exception.assert_called_once_with(
             "unexpected story source store failure"
         )
+
+    async def test_inspect_exception_never_publishes_ghost_source(self):
+        self.state.story_analysis_store.inspect = MagicMock(
+            side_effect=RuntimeError("C:\\private\\analysis-secret.json")
+        )
+        self.state.logger.exception = MagicMock()
+
+        response = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["code"], "story_import_failed")
+        self.assertNotIn("private", response.text.lower())
+        self.assertEqual(self.state.story_sources, {})
+        self.assertIsNone(self.state.active_story_source_id)
+        self.assertEqual(self.state.story_source_generation, 0)
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertIsNone(self.state.story_runtime_owner)
+
+    async def test_provenance_exception_never_publishes_ghost_source(self):
+        self.state.logger.exception = MagicMock()
+
+        with patch.object(
+            main_module,
+            "dlc_provenance",
+            side_effect=RuntimeError("C:\\private\\provenance-secret"),
+        ):
+            response = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["code"], "story_import_failed")
+        self.assertNotIn("private", response.text.lower())
+        self.assertEqual(self.state.story_sources, {})
+        self.assertIsNone(self.state.active_story_source_id)
+        self.assertEqual(self.state.story_source_generation, 0)
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertIsNone(self.state.story_runtime_owner)
+
+    async def test_cancel_during_analysis_inspect_never_publishes_source(self):
+        stalled = StalledAnalysisStore(self.state.story_analysis_store)
+        self.state.story_analysis_store = stalled
+        loop = asyncio.get_running_loop()
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+
+        def cancel_during_inspect() -> None:
+            if stalled.inspect_started.wait(0.75):
+                loop.call_soon_threadsafe(importing.cancel)
+            stalled.inspect_release.set()
+
+        coordinator = threading.Thread(target=cancel_during_inspect)
+        coordinator.start()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(importing, timeout=1.5)
+        finally:
+            stalled.inspect_release.set()
+            coordinator.join(timeout=0.75)
+
+        await self._wait_for_condition(
+            lambda: (
+                self.state.story_runtime_owner is None
+                and not self.state.story_cleanup_tasks
+                and not self.state.story_source_io_tasks
+            ),
+            "analysis cancellation cleanup did not settle",
+        )
+        self.assertEqual(self.state.story_sources, {})
+        self.assertIsNone(self.state.active_story_source_id)
+        self.assertEqual(self.state.story_source_generation, 0)
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+
+    async def test_cancel_waiting_to_commit_never_publishes_source(self):
+        stalled = StalledAnalysisStore(self.state.story_analysis_store)
+        self.state.story_analysis_store = stalled
+        loop = asyncio.get_running_loop()
+        release_holder = asyncio.Event()
+        holder_acquired = threading.Event()
+        holder_tasks: list[asyncio.Task] = []
+        importing = asyncio.create_task(self._import("story.txt", b"ABCD", "utf-8"))
+
+        async def hold_transition_lock() -> None:
+            async with self.state.timeline_transition_lock:
+                holder_acquired.set()
+                await release_holder.wait()
+
+        def create_holder() -> None:
+            holder_tasks.append(asyncio.create_task(hold_transition_lock()))
+
+        def cancel_after_inspect() -> None:
+            if not stalled.inspect_started.wait(0.75):
+                stalled.inspect_release.set()
+                return
+            loop.call_soon_threadsafe(create_holder)
+            holder_acquired.wait(0.2)
+            stalled.inspect_release.set()
+            stalled.inspect_finished.wait(0.75)
+            loop.call_soon_threadsafe(importing.cancel)
+
+        coordinator = threading.Thread(target=cancel_after_inspect)
+        coordinator.start()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(importing, timeout=1.5)
+        finally:
+            stalled.inspect_release.set()
+            release_holder.set()
+            coordinator.join(timeout=0.75)
+            if holder_tasks:
+                await asyncio.gather(*holder_tasks, return_exceptions=True)
+
+        await self._wait_for_condition(
+            lambda: (
+                self.state.story_runtime_owner is None
+                and not self.state.story_cleanup_tasks
+                and not self.state.story_source_io_tasks
+            ),
+            "commit cancellation cleanup did not settle",
+        )
+        self.assertEqual(self.state.story_sources, {})
+        self.assertIsNone(self.state.active_story_source_id)
+        self.assertEqual(self.state.story_source_generation, 0)
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+
+    async def test_partial_commit_exception_rolls_back_memory_and_file(self):
+        class InsertThenRaise(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                raise RuntimeError("C:\\private\\commit-secret")
+
+        self.state.story_sources = InsertThenRaise()
+        self.state.logger.exception = MagicMock()
+
+        response = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["code"], "story_import_failed")
+        self.assertNotIn("private", response.text.lower())
+        self.assertEqual(self.state.story_sources, {})
+        self.assertIsNone(self.state.active_story_source_id)
+        self.assertEqual(self.state.story_source_generation, 0)
+        self.assertEqual(list(self.state.story_import_directory.iterdir()), [])
+        self.assertIsNone(self.state.story_runtime_owner)
+
+    async def test_broadcast_exception_keeps_committed_source_consistent(self):
+        self.state.broadcast = AsyncMock(
+            side_effect=RuntimeError("C:\\private\\broadcast-secret")
+        )
+        self.state.logger.exception = MagicMock()
+
+        response = await self._import("story.txt", b"ABCD", "utf-8")
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.json()["code"], "story_import_failed")
+        self.assertNotIn("private", response.text.lower())
+        self.assertEqual(len(self.state.story_sources), 1)
+        source_id = self.state.active_story_source_id
+        self.assertIn(source_id, self.state.story_sources)
+        self.assertEqual(self.state.story_source_generation, 1)
+        self.assertEqual(
+            sorted(path.name for path in self.state.story_import_directory.iterdir()),
+            [f"{source_id}.txt"],
+        )
+        self.assertIsNone(self.state.story_runtime_owner)
 
     async def test_shutdown_runs_safety_before_settling_stalled_store_then_cleans_orphan(self):
         stalled = self._stall_story_store()

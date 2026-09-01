@@ -242,3 +242,51 @@ git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
 - 当前开发主机直接执行 Windows no-replace/delete 分支；POSIX hard-link no-replace 分支由 capability/mock 单测覆盖。缺失安全 `dir_fd`/`follow_symlinks` 能力的平台继续 fail closed。
 - 文件系统操作不能被 Python 强制中断；取消和 shutdown 会先完成当前 bounded source store/delete，再释放 owner 并关闭 pinned handle。这是 ledger 明确接受的等待边界，安全 cleanup 与 event loop 不在该线程等待期间被 transition lock 阻塞。
 - 进程崩溃时可能留下同目录 dot-temp（final 仍不被覆盖）；MVP2 没有批准 startup scavenger。正常异常、取消与 shutdown 路径均清理 temp/final，并由测试验证。
+
+## Review fix round 3/5（2026-09-01）
+
+### RED → GREEN
+
+取消安全 cleanup RED：请求在 `finally` 内等待 transition lock 时再被取消，runtime owner 会泄漏；play 取消可留下 planning owner/task；import delete worker 未被追踪，shutdown 会先关 pinned handle，随后 worker 使用已关句柄报错。实现同步创建并立即纳入 AppState set 的独立 owner/planning/import cleanup task；请求只可 `shield` 等它，重复取消不会取消 cleanup 本身。cleanup 在必要时先 settle store/inspect/delete，再持短锁以 token identity 清 owner/set/rollback；shutdown 循环 gather cleanup 与 IO sets 后才关 pinned handle。持锁取消、多次取消、取消 play cleanup、挂起 delete 时 shutdown 的 4 个核心回归全绿，最终 owner/registry/task sets 均收敛且无 early close。
+
+导入事务 RED：旧顺序在 analysis inspect/provenance 之前就发布 registry/active/generation，因此 inspect/provenance 抛异常会留 ghost source，inspect 或等待 commit lock 时取消也会污染内存状态。改为「锁内预留 + snapshot → 锁外 tracked store → 锁外 tracked inspect → 短锁 runtime revalidate → 一次 commit registry/selection/generation/DLC snapshot」。store/inspect worker 仅接收 immutable/snapshotted 输入，不读写 AppState 异步状态。inspect/provenance 异常和 store/inspect/commit-wait 取消现在都在发布前清理 final file，并返回稳定 generic 500 或传播 cancellation。
+
+提交边界经测试锁定：只有完成内存事务的 source 才设 `committed`；发布前的 partial commit 由 identity-checked cleanup rollback 并删文件。一旦 commit 完成，后续 broadcast 异常返回稳定 generic 500，但保留 registry/active/file 的一致已提交状态，不伪装回滚或生成 ghost。
+
+POSIX no-replace 测试增强为显式验证真实 ABI shape：`os.link(temp, final, src_dir_fd=pinned_fd, dst_dir_fd=pinned_fd, follow_symlinks=False)`，并确认不调 `os.replace`。重复 opaque token collision 测试继续证明第一份 bytes 不被覆盖，第二份获得新 ID，temp/异常路径无泄漏。
+
+### API schema、安全与状态隔离增量
+
+- HTTP 和 WebSocket 公开 schema 无变更；仍使用现有 `story_import_failed` generic 500、`story_runtime_busy` 409 与 monotonic `state_revision`。
+- Import 的 durable file 在 inspect 成功前只属于未发布 transaction；请求取消、inspect/provenance 异常、runtime revalidation 失败均不可让它进入 source registry。
+- Cleanup 和 file IO 是两个明确 AppState-owned task set；请求生命周期结束不会转移 ownership，shutdown 也不会关闭仍有 worker 使用的 pinned directory handle。
+- Owner 仍只在 `timeline_transition_lock` 下 acquire/release，cleanup 仅在 exact token 匹配时清理，多次取消和并发 hot mutation 不能偷清其他 owner。
+- Analysis inspect 被移到 `asyncio.to_thread` 且纳入追踪，避免大 cache/quarantine IO 占用 event loop；零非-play 模型调用约束未改变。
+
+### 最终验证证据
+
+```text
+python -X dev -W ignore::DeprecationWarning -W error::ResourceWarning \
+  -m unittest tests.test_story_endpoints tests.test_story_source_store -q
+Ran 55 tests in 5.779s, OK
+
+round-3 cancellation/transaction race selection:
+Ran 9 tests in 0.727s, OK
+
+partial-commit rollback verification:
+Ran 1 test in 0.074s, OK
+
+python -m unittest discover -s tests -q
+Ran 549 tests in 50.691s, OK (skipped=5)
+
+python -m compileall -q backend tests: exit 0
+git diff --check: exit 0（仅 Git 的 LF/CRLF 工作树提示）
+```
+
+全程未运行 `tests/probe_llm.py`，未联网、未调用真实模型、未连接真实设备、未 push/tag。本轮提交信息计划为 `fix: make story cleanup cancellation safe`；最终 hash 由交付消息报告。
+
+### 剩余边界
+
+- Python 不能强制中断已在系统调用中的 store/inspect/delete thread；取消请求可立即传播，但独立 cleanup 与 shutdown 会等这些 bounded IO 收敛后再清 owner/关 handle。
+- Commit 成功但 broadcast 失败时，客户端可能收到 500 而 source 已存在；这是明确的 commit boundary，下一次 `/api/state` 或 WebSocket snapshot 可恢复服务端权威状态，比不安全的 durable-file 伪回滚更可控。
+- POSIX 分支在本 Windows 主机通过 capability/mock 验证精确参数与 collision 语义；真实 POSIX 系统调用仍由跨平台 CI 验证。

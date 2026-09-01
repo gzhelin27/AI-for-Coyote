@@ -79,11 +79,11 @@ class PinnedStorySourceStoreTests(unittest.TestCase):
             patch(
                 "backend.story.source_store.os.link",
                 side_effect=FileExistsError("occupied"),
-            ),
+            ) as link,
             patch(
                 "backend.story.source_store.os.replace",
                 return_value=None,
-            ),
+            ) as replace,
         ):
             with (
                 patch(
@@ -94,9 +94,18 @@ class PinnedStorySourceStoreTests(unittest.TestCase):
                     "backend.story.source_store.os.supports_follow_symlinks",
                     {os.link},
                 ),
-            ):
-                with self.assertRaises(FileExistsError):
-                    self.store._replace_relative(123, ".temporary", "opaque.txt")
+                ):
+                    with self.assertRaises(FileExistsError):
+                        self.store._replace_relative(123, ".temporary", "opaque.txt")
+        directory_descriptor = self.store._root.handle.fileno()
+        link.assert_called_once_with(
+            ".temporary",
+            "opaque.txt",
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        replace.assert_not_called()
 
     def test_root_replacement_cannot_redirect_a_write(self):
         moved = self.root / "moved-stories"
