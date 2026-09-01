@@ -22,6 +22,7 @@ class ContextLimitError(StoryAnalysisError):
 _MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 _MAX_ERROR_FIELD_CHARS = 1_000
 _MAX_PROVIDER_ERROR_CHARS = 4_096
+_MAX_PROVIDER_ERROR_DEPTH = 2
 _CONTEXT_ERROR_CODES = frozenset(
     {
         "context_length_exceeded",
@@ -101,72 +102,114 @@ def _bounded_response_json(response: httpx.Response) -> dict | None:
     return document if isinstance(document, dict) else None
 
 
+def _provider_error_object(document: dict) -> dict | None:
+    nested = document.get("error")
+    if isinstance(nested, dict):
+        return nested
+    if "error" in document:
+        return None
+    if any(field in document for field in ("message", "code", "type", "metadata")):
+        return document
+    return None
+
+
+def _collect_context_error_envelope(
+    document: dict,
+) -> tuple[list[str], list[str], bool, bool] | None:
+    """Collect bounded identities/messages before making one classification decision."""
+
+    top_error = document.get("error")
+    if not isinstance(top_error, dict):
+        return None
+
+    identities: list[str] = []
+    messages: list[str] = []
+    identity_present = False
+    vetoed = False
+    pending = [(top_error, 0)]
+
+    while pending:
+        error, provider_depth = pending.pop()
+        message = error.get("message")
+        if isinstance(message, str) and len(message) <= _MAX_ERROR_FIELD_CHARS:
+            messages.append(message.lower())
+
+        for field in ("code", "type"):
+            if field not in error:
+                continue
+            value = error[field]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            identity_present = True
+            if not isinstance(value, str) or len(value) > _MAX_ERROR_FIELD_CHARS:
+                vetoed = True
+                continue
+            identity = _normalized_error_identity(value)
+            if not identity:
+                vetoed = True
+                continue
+            identities.append(identity)
+
+        if "metadata" not in error or error["metadata"] is None:
+            continue
+        metadata = error["metadata"]
+        if not isinstance(metadata, dict):
+            vetoed = True
+            continue
+        if "raw" not in metadata:
+            continue
+        raw = metadata["raw"]
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        if not isinstance(raw, str) or len(raw) > _MAX_PROVIDER_ERROR_CHARS:
+            vetoed = True
+            continue
+        stripped_raw = raw.strip()
+        try:
+            provider_document = json.loads(stripped_raw)
+        except (ValueError, RecursionError):
+            if stripped_raw.startswith(("{", "[")):
+                vetoed = True
+            else:
+                messages.append(stripped_raw.lower())
+            continue
+        if not isinstance(provider_document, dict):
+            vetoed = True
+            continue
+        provider_error = _provider_error_object(provider_document)
+        if provider_error is None or provider_depth >= _MAX_PROVIDER_ERROR_DEPTH:
+            vetoed = True
+            continue
+        pending.append((provider_error, provider_depth + 1))
+
+    return identities, messages, identity_present, vetoed
+
+
 def _verified_context_error(
     status_code: int,
     document: dict | None,
-    *,
-    inspect_provider_raw: bool = True,
 ) -> bool:
     """Recognize context failures only from the provider's documented error object."""
 
     if status_code not in _CONTEXT_HTTP_STATUSES:
         return False
-    if not isinstance(document, dict) or not isinstance(document.get("error"), dict):
+    if not isinstance(document, dict):
         return False
-    error = document["error"]
-    message = error.get("message")
-    bounded_message = (
-        message.lower()
-        if isinstance(message, str) and len(message) <= _MAX_ERROR_FIELD_CHARS
-        else ""
-    )
-    bounded_identities: list[str] = []
-    identity_present = False
-    untrusted_identity = False
-    for field in ("code", "type"):
-        if field not in error:
-            continue
-        value = error[field]
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
-        identity_present = True
-        if not isinstance(value, str) or len(value) > _MAX_ERROR_FIELD_CHARS:
-            untrusted_identity = True
-            continue
-        identity = _normalized_error_identity(value)
-        if not identity:
-            untrusted_identity = True
-            continue
-        bounded_identities.append(identity)
+    envelope = _collect_context_error_envelope(document)
+    if envelope is None:
+        return False
+    identities, messages, identity_present, vetoed = envelope
+    if vetoed:
+        return False
     if identity_present:
         return (
-            not untrusted_identity
-            and bool(bounded_identities)
+            bool(identities)
             and all(
                 identity in _CONTEXT_ERROR_CODES
-                for identity in bounded_identities
+                for identity in identities
             )
         )
-    if _explicit_context_overage(bounded_message):
-        return True
-
-    if not inspect_provider_raw or not isinstance(error.get("metadata"), dict):
-        return False
-    raw = error["metadata"].get("raw")
-    if not isinstance(raw, str) or len(raw) > _MAX_PROVIDER_ERROR_CHARS:
-        return False
-    try:
-        provider_document = json.loads(raw)
-    except (ValueError, RecursionError):
-        provider_document = None
-    if isinstance(provider_document, dict):
-        return _verified_context_error(
-            status_code,
-            provider_document,
-            inspect_provider_raw=False,
-        )
-    lowered_raw = raw.lower()
-    return _explicit_context_overage(lowered_raw)
+    return any(_explicit_context_overage(message) for message in messages)
 
 
 def _preset_text(state: dict) -> str:

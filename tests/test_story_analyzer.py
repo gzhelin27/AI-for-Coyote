@@ -1346,6 +1346,122 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContextLimitError):
             await llm.complete_json("system", "private novel", "story_map")
 
+    async def test_provider_raw_identity_vetoes_strict_outer_message_inference(self):
+        # Catches deciding from the wrapper message before collecting nested identities.
+        explicit_overage = (
+            "This request contains 140000 tokens, exceeding the model context "
+            "limit of 128000 tokens."
+        )
+        cases = (
+            ("numeric-code", {"code": 400}),
+            ("boolean-type", {"type": True}),
+            ("array-code", {"code": ["context_length_exceeded"]}),
+            ("non-context-code", {"code": "forbidden"}),
+            (
+                "trusted-code-untrusted-type",
+                {"code": "context_length_exceeded", "type": 1},
+            ),
+        )
+        for name, identity in cases:
+            with self.subTest(name=name):
+                llm = self.llm_with_response(
+                    400,
+                    {
+                        "error": {
+                            "message": explicit_overage,
+                            "metadata": {
+                                "raw": json.dumps(
+                                    {
+                                        "error": {
+                                            "message": "Provider rejected request.",
+                                            **identity,
+                                        }
+                                    }
+                                )
+                            },
+                        }
+                    },
+                )
+
+                with self.assertRaises(StoryAnalysisError) as raised:
+                    await llm.complete_json("system", "private novel", "story_map")
+
+                self.assertNotIsInstance(raised.exception, ContextLimitError)
+                self.assertEqual(llm.request_count, 1)
+
+    async def test_all_provider_identities_must_be_bounded_allowlisted_strings(self):
+        # Catches a valid provider context identity being lost after envelope collection.
+        llm = self.llm_with_response(
+            400,
+            {
+                "error": {
+                    "message": "Provider rejected the structured request.",
+                    "code": "context_window_exceeded",
+                    "metadata": {
+                        "raw": json.dumps(
+                            {
+                                "error": {
+                                    "message": "Request rejected.",
+                                    "type": "maximum_context_length_exceeded",
+                                }
+                            }
+                        )
+                    },
+                }
+            },
+        )
+
+        with self.assertRaises(ContextLimitError):
+            await llm.complete_json("system", "private novel", "story_map")
+
+    async def test_uninspectable_provider_raw_vetoes_outer_message_inference(self):
+        # Catches overlong or structured-malformed raw data bypassing bounded inspection.
+        explicit_overage = (
+            "This request contains 140000 tokens, exceeding the model context "
+            "limit of 128000 tokens."
+        )
+        cases = (
+            ("overlong", "x" * 4_097),
+            ("malformed-json", '{"error":{"code":"context_length_exceeded"'),
+            ("non-string", {"error": {"code": "context_length_exceeded"}}),
+        )
+        for name, raw in cases:
+            with self.subTest(name=name):
+                llm = self.llm_with_response(
+                    400,
+                    {
+                        "error": {
+                            "message": explicit_overage,
+                            "metadata": {"raw": raw},
+                        }
+                    },
+                )
+
+                with self.assertRaises(StoryAnalysisError) as raised:
+                    await llm.complete_json("system", "private novel", "story_map")
+
+                self.assertNotIsInstance(raised.exception, ContextLimitError)
+                self.assertEqual(llm.request_count, 1)
+
+    async def test_bounded_plain_provider_message_allows_message_only_inference(self):
+        # Catches fail-closed raw handling removing bounded identity-free provider wording.
+        explicit_overage = (
+            "This request contains 140000 tokens, exceeding the model context "
+            "limit of 128000 tokens."
+        )
+        llm = self.llm_with_response(
+            400,
+            {
+                "error": {
+                    "message": "Provider returned error",
+                    "metadata": {"raw": explicit_overage},
+                }
+            },
+        )
+
+        with self.assertRaises(ContextLimitError):
+            await llm.complete_json("system", "private novel", "story_map")
+
     async def test_untrusted_provider_raw_identity_suppresses_raw_message_inference(self):
         # Catches parsed provider identities being ignored by a second raw-text scan.
         explicit_overage = (
