@@ -30,14 +30,45 @@ _CONTEXT_ERROR_CODES = frozenset(
         "maximum_context_length_exceeded",
     }
 )
-_CONTEXT_MESSAGE_MARKERS = (
-    "maximum context length",
-    "max context length",
+_CONTEXT_HTTP_STATUSES = frozenset((400, 413, 422))
+_NON_CONTEXT_POLICY_MARKERS = (
+    "privacy",
+    "data policy",
+    "data-policy",
+    "capacity description",
+)
+_CONTEXT_OVERAGE_MARKERS = (
+    "maximum context length was exceeded",
+    "max context length was exceeded",
     "context length exceeded",
     "context window exceeded",
     "exceeds the context window",
     "exceeded the context window",
+    "exceeds the maximum context length",
+    "exceeded the maximum context length",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
 )
+
+
+def _explicit_context_overage(text: str) -> bool:
+    if any(marker in text for marker in _NON_CONTEXT_POLICY_MARKERS):
+        return False
+    if any(marker in text for marker in _CONTEXT_OVERAGE_MARKERS):
+        return True
+    has_subject = any(
+        subject in text for subject in ("request", "requested", "prompt", "input")
+    )
+    has_overage = any(word in text for word in ("exceed", "too long", "over limit"))
+    has_context_measure = "context" in text or "token" in text
+    if has_subject and has_overage and has_context_measure:
+        return True
+    return (
+        "requested" in text
+        and "maximum context length" in text
+        and "token" in text
+    )
 
 
 def _bounded_response_json(response: httpx.Response) -> dict | None:
@@ -48,7 +79,7 @@ def _bounded_response_json(response: httpx.Response) -> dict | None:
         return None
     try:
         document = json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except ValueError:
         return None
     return document if isinstance(document, dict) else None
 
@@ -61,22 +92,26 @@ def _verified_context_error(
 ) -> bool:
     """Recognize context failures only from the provider's documented error object."""
 
+    if status_code not in _CONTEXT_HTTP_STATUSES:
+        return False
     if not isinstance(document, dict) or not isinstance(document.get("error"), dict):
         return False
     error = document["error"]
+    message = error.get("message")
+    bounded_message = (
+        message.lower()
+        if isinstance(message, str) and len(message) <= _MAX_ERROR_FIELD_CHARS
+        else ""
+    )
+    if any(marker in bounded_message for marker in _NON_CONTEXT_POLICY_MARKERS):
+        return False
     for field in ("code", "type"):
         value = error.get(field)
         if isinstance(value, str) and len(value) <= _MAX_ERROR_FIELD_CHARS:
             normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
             if normalized in _CONTEXT_ERROR_CODES:
                 return True
-    message = error.get("message")
-    if status_code not in (400, 413, 422) or not isinstance(message, str):
-        return False
-    if len(message) > _MAX_ERROR_FIELD_CHARS:
-        return False
-    lowered = message.lower()
-    if any(marker in lowered for marker in _CONTEXT_MESSAGE_MARKERS):
+    if _explicit_context_overage(bounded_message):
         return True
 
     if not inspect_provider_raw or not isinstance(error.get("metadata"), dict):
@@ -86,7 +121,7 @@ def _verified_context_error(
         return False
     try:
         provider_document = json.loads(raw)
-    except json.JSONDecodeError:
+    except ValueError:
         provider_document = None
     if isinstance(provider_document, dict) and _verified_context_error(
         status_code,
@@ -95,7 +130,7 @@ def _verified_context_error(
     ):
         return True
     lowered_raw = raw.lower()
-    return any(marker in lowered_raw for marker in _CONTEXT_MESSAGE_MARKERS)
+    return _explicit_context_overage(lowered_raw)
 
 
 def _preset_text(state: dict) -> str:
@@ -543,7 +578,7 @@ class LLM:
         logger.debug("调用结构化模型 %s（schema=%s）", self.model, schema_name)
         try:
             response = await self.client.post(self.url, headers=headers, json=payload)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:
             raise StoryAnalysisError("structured model request failed") from exc
 
         error_document = _bounded_response_json(response)
@@ -555,7 +590,7 @@ class LLM:
             )
         try:
             document = response.json()
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except ValueError as exc:
             raise StoryAnalysisError("structured model returned invalid JSON") from exc
         if not isinstance(document, dict):
             raise StoryAnalysisError("structured model returned invalid JSON")
@@ -577,7 +612,7 @@ class LLM:
             content = str(message.get("reasoning") or "").strip()
         try:
             parsed = json.loads(content)
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, ValueError) as exc:
             raise StoryAnalysisError("structured model returned invalid JSON") from exc
         if not isinstance(parsed, dict):
             raise StoryAnalysisError("structured model response must be a JSON object")
