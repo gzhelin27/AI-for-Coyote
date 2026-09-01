@@ -988,11 +988,28 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.harness.loop.patterns["A"])
         self.assertNotIn("A", self.harness.loop.loop_tasks)
 
-    async def test_cancelled_primary_settles_delivered_helper_before_reraising(self):
+    async def test_cancelled_primary_retires_queued_helper_without_blocking_estop(self):
         self.harness.safety.dry_run = False
+        self.harness.cfg["playback"]["loop_batch_s"] = 2.0
+        self.harness.cfg["playback"]["loop_overlap_s"] = 0.3
         helper_delivered = asyncio.Event()
+        resend_queued = asyncio.Event()
+        primary_cancelled = asyncio.Event()
         original_send = self.harness.relay.send_frame
+        original_run_locked = (
+            self.harness.loop.output_coordinator._run_channel_locked
+        )
         helper_task = None
+        resend_task = None
+        run_count = 0
+
+        async def observe_run_locked(*args, **kwargs):
+            nonlocal resend_task, run_count
+            run_count += 1
+            if run_count == 2:
+                resend_task = asyncio.current_task()
+                resend_queued.set()
+            return await original_run_locked(*args, **kwargs)
 
         async def cancel_primary(frame):
             nonlocal helper_task
@@ -1005,21 +1022,45 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             if inner.get("m") == "device.op" and data.get("t") == 3:
                 await helper_delivered.wait()
                 helper_task = self.harness.loop.loop_tasks.get("A")
+                await resend_queued.wait()
+                primary_cancelled.set()
                 raise asyncio.CancelledError
             return await original_send(frame)
 
+        request = None
+        stopping = None
         try:
-            with patch.object(
-                self.harness.relay, "send_frame", side_effect=cancel_primary
+            with (
+                patch.object(
+                    self.harness.loop.output_coordinator,
+                    "_run_channel_locked",
+                    side_effect=observe_run_locked,
+                ),
+                patch.object(
+                    self.harness.relay, "send_frame", side_effect=cancel_primary
+                ),
             ):
-                result = await asyncio.gather(
+                request = asyncio.create_task(
                     self.harness.loop.execute_manual_action(
                         {"op": "hold_strength", "channel": "A", "value": 5}
-                    ),
-                    return_exceptions=True,
+                    )
+                )
+                await helper_delivered.wait()
+                await resend_queued.wait()
+                await primary_cancelled.wait()
+                stopping = asyncio.create_task(self.harness.loop.estop())
+                done, _pending = await asyncio.wait(
+                    {request, stopping}, timeout=0.5
                 )
 
+            self.assertIn(request, done)
+            self.assertIn(stopping, done)
+            result = await asyncio.gather(
+                request, stopping, return_exceptions=True
+            )
             self.assertIsInstance(result[0], asyncio.CancelledError)
+            self.assertFalse(isinstance(result[1], BaseException))
+            self.assertTrue(result[1]["estop"])
             self.assertIsNotNone(helper_task)
             self.assertTrue(helper_task.done())
             self.assertNotIn("A", self.harness.loop.loop_tasks)
@@ -1031,13 +1072,28 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(
                 self.harness.loop.output_coordinator.pending("A").clear_required
             )
+            helper_frames = len(
+                [
+                    frame
+                    for frame in self.harness.relay.sent_frames
+                    if frame.get("data", {}).get("data", {}).get("t") == 0
+                ]
+            )
             frame_count = len(self.harness.relay.sent_frames)
             await asyncio.sleep(0)
             self.assertEqual(len(self.harness.relay.sent_frames), frame_count)
+            self.assertEqual(helper_frames, 1)
         finally:
+            if resend_task is not None and not resend_task.done():
+                resend_task.cancel()
             self.harness.loop._cancel_loops(None)
-            if helper_task is not None:
-                await asyncio.gather(helper_task, return_exceptions=True)
+            for task in (request, stopping, helper_task, resend_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (request, stopping, helper_task, resend_task) if task),
+                return_exceptions=True,
+            )
 
     async def test_failed_helper_cleanup_is_confirmed_and_blocks_later_output(self):
         self.harness.safety.dry_run = False
@@ -1166,6 +1222,53 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.status_code, 200)
         self.assertTrue(blocked.json()["dropped"])
         self.assertEqual(len(self.harness.relay.sent_frames), frame_count)
+
+    async def test_cancelled_helper_clear_fails_closed_before_reraising(self):
+        self.harness.safety.dry_run = False
+        self.harness.relay.fail_next_strength_delta("A")
+        helper_generation = (
+            self.harness.loop.output_coordinator.helper_generation("A")
+        )
+        original_send = self.harness.relay.send_frame
+        helper_task = None
+
+        async def cancel_clear(frame):
+            nonlocal helper_task
+            inner = frame.get("data", {}) if isinstance(frame, dict) else {}
+            data = inner.get("data", {}) if isinstance(inner, dict) else {}
+            if inner.get("m") == "device.op" and data.get("t") == 3:
+                helper_task = self.harness.loop.loop_tasks.get("A")
+            if inner.get("m") == "device.op.clear":
+                raise asyncio.CancelledError
+            return await original_send(frame)
+
+        with patch.object(
+            self.harness.relay, "send_frame", side_effect=cancel_clear
+        ):
+            result = await asyncio.gather(
+                self.harness.loop.execute_manual_action(
+                    {"op": "hold_strength", "channel": "A", "value": 5}
+                ),
+                return_exceptions=True,
+            )
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertIsNotNone(helper_task)
+        self.assertTrue(helper_task.done())
+        self.assertNotIn("A", self.harness.loop.loop_tasks)
+        self.assertNotIn("A", self.harness.loop.loop_events)
+        self.assertEqual(
+            self.harness.loop.output_coordinator.helper_generation("A"),
+            helper_generation + 1,
+        )
+        confirmed = self.harness.loop.output_coordinator.confirmed("A")
+        self.assertEqual(confirmed.strength, 0)
+        self.assertEqual(confirmed.waveform, "呼吸")
+        self.assertEqual(confirmed.waveform_mode, "finite")
+        self.assertTrue(
+            self.harness.loop.output_coordinator.pending("A").clear_required
+        )
+        self.assertTrue(self.harness.safety.pulse_active()["A"])
 
     async def test_cancelled_failed_temp_revert_still_requires_clear(self):
         self.harness.safety.dry_run = False

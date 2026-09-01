@@ -207,6 +207,43 @@ async def wait_for_condition(predicate, *, timeout=1):
 
 
 class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retire_helper_advances_only_helper_ownership(self):
+        coordinator = make_game_loop_for_test().output_coordinator
+        coordinator.seed_confirmed(
+            "A",
+            strength=12,
+            waveform="呼吸",
+            waveform_mode="loop",
+            enabled=True,
+        )
+        coordinator.mark_reduction("A", 8)
+        slot = coordinator._slots["A"]
+        before = {
+            "confirmed": coordinator.confirmed("A"),
+            "pending": coordinator.pending("A"),
+            "revision": coordinator.revision("A"),
+            "generation": coordinator.generation("A"),
+            "normal_epoch": coordinator.normal_policy_epoch("A"),
+            "helper_generation": coordinator.helper_generation("A"),
+            "priority": slot.minimum_priority,
+        }
+
+        retired = coordinator.retire_helper("A")
+
+        self.assertEqual(retired, before["helper_generation"])
+        self.assertEqual(
+            coordinator.helper_generation("A"),
+            before["helper_generation"] + 1,
+        )
+        self.assertEqual(coordinator.confirmed("A"), before["confirmed"])
+        self.assertEqual(coordinator.pending("A"), before["pending"])
+        self.assertEqual(coordinator.revision("A"), before["revision"])
+        self.assertEqual(coordinator.generation("A"), before["generation"])
+        self.assertEqual(
+            coordinator.normal_policy_epoch("A"), before["normal_epoch"]
+        )
+        self.assertEqual(slot.minimum_priority, before["priority"])
+
     async def test_add_strength_keeps_coordinator_truth_through_next_action_seed(self):
         relay = GatedPhysicalRelay()
         loop = make_game_loop_for_test(pattern="呼吸", frames=["a"], relay=relay)
@@ -1682,6 +1719,12 @@ class GameLoopCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(confirmed.waveform_mode, "loop")
         self.assertEqual(loop.patterns["A"], "潮汐")
         self.assertTrue(loop.safety.pulse_active()["A"])
+
+        await loop._reap_retired_helper("A", first_worker, first_event)
+
+        self.assertIs(loop.loop_tasks["A"], replacement_worker)
+        self.assertIs(loop.loop_events["A"], replacement_event)
+        self.assertFalse(replacement_worker.done())
 
     async def test_disable_serializes_against_inflight_channel_floor_start(self):
         relay = GatedPhysicalRelay()

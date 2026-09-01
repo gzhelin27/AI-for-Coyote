@@ -147,6 +147,13 @@ class DeviceOutputCoordinator:
         """Return the owner generation for legacy unbounded resend helpers."""
         return self._slot(channel).helper_generation
 
+    def retire_helper(self, channel: str) -> int:
+        """Retire one helper owner without changing any output transaction state."""
+        slot = self._slot(channel)
+        retired = slot.helper_generation
+        slot.helper_generation += 1
+        return retired
+
     def normal_policy_epoch(self, channel: str) -> int:
         """Return the safety-policy epoch observed by normal output work."""
         return self._slot(channel).normal_epoch

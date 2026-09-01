@@ -1786,6 +1786,9 @@ class GameLoop:
             "helper_cmd": None,
             "helper_expiry": None,
             "helper_task": None,
+            "helper_event": None,
+            "retired_helper_task": None,
+            "retired_helper_event": None,
             "cancelled": False,
         }
 
@@ -1836,6 +1839,7 @@ class GameLoop:
                     helper_sent = expiry is not None
                     state["helper_expiry"] = expiry
                     state["helper_task"] = self.loop_tasks.get(channel)
+                    state["helper_event"] = self.loop_events.get(channel)
                 if not helper_sent:
                     state["error"] = "默认波形发送失败"
                     return TransportOutcome(sent=False, error=state["error"])
@@ -1950,6 +1954,13 @@ class GameLoop:
             outcome = await coordinator.run(channel, intent, transport)
         finally:
             self._publish_coordinator_confirmed(channel)
+            retired_task = state.get("retired_helper_task")
+            if isinstance(retired_task, asyncio.Task):
+                await self._reap_retired_helper(
+                    channel,
+                    retired_task,
+                    state.get("retired_helper_event"),
+                )
         if not outcome.sent and state["error"] is None:
             state["error"] = outcome.error or "设备发送失败"
         if state["cancelled"]:
@@ -1961,9 +1972,22 @@ class GameLoop:
     ) -> TransportOutcome:
         """Clean a sent helper before reporting its parent action as dropped."""
         helper_task = state.get("helper_task")
-        self._cancel_loops(channel, reset_pulse=True)
-        if isinstance(helper_task, asyncio.Task) and helper_task is not asyncio.current_task():
-            await asyncio.gather(helper_task, return_exceptions=True)
+        helper_event = state.get("helper_event")
+        self.output_coordinator.retire_helper(channel)
+        if (
+            isinstance(helper_task, asyncio.Task)
+            and helper_task is not asyncio.current_task()
+            and self.loop_tasks.get(channel) is helper_task
+        ):
+            if (
+                isinstance(helper_event, asyncio.Event)
+                and self.loop_events.get(channel) is helper_event
+            ):
+                helper_event.set()
+            self._loop_reset_requests.add(helper_task)
+            helper_task.cancel()
+            state["retired_helper_task"] = helper_task
+            state["retired_helper_event"] = helper_event
         frames = self._channel_clear_frames(
             channel,
             self.relay.first_client_id(),
@@ -2006,6 +2030,28 @@ class GameLoop:
             },
             error=state["error"],
         )
+
+    async def _reap_retired_helper(
+        self,
+        channel: str,
+        task: asyncio.Task,
+        stop_event: asyncio.Event | None,
+    ) -> None:
+        """Retrieve one retired worker after its coordinator lock is released."""
+        result = await asyncio.gather(task, return_exceptions=True)
+        error = result[0]
+        if isinstance(error, BaseException) and not isinstance(
+            error, asyncio.CancelledError
+        ):
+            logger.error(
+                "%s channel retired helper failed during cleanup",
+                channel,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        if self.loop_tasks.get(channel) is task:
+            self.loop_tasks.pop(channel, None)
+        if self.loop_events.get(channel) is stop_event:
+            self.loop_events.pop(channel, None)
 
     async def _run_clear_transaction(
         self,
@@ -2617,7 +2663,7 @@ class GameLoop:
                         ):
                             return TransportOutcome(
                                 sent=False,
-                                error="stale output generation",
+                                error="stale helper lease",
                             )
                         sent, error = await self._send_frames_complete(
                             [next_frame()]
