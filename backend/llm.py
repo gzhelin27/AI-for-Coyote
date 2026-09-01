@@ -9,6 +9,10 @@ import httpx
 logger = logging.getLogger("ai-for-coyote.llm")
 
 
+class StructuredResponseError(RuntimeError):
+    """One structured model request or response failed validation."""
+
+
 def _preset_text(state: dict) -> str:
     """把波形库渲染成提示词文本：波形名（推荐时长s）。"""
     parts = []
@@ -410,6 +414,90 @@ class LLM:
             if self.json_mode:
                 line = "（模型这次没有说话，只动了设备。再说一句吧？）"
         return line, actions
+
+    async def complete_json(
+        self,
+        system_prompt: str,
+        user_content: str,
+        schema_name: str,
+    ) -> dict:
+        """Make one generic structured request without retries or content logging."""
+
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise StructuredResponseError("structured system prompt is invalid")
+        if not isinstance(user_content, str) or not user_content:
+            raise StructuredResponseError("structured user content is invalid")
+        if (
+            not isinstance(schema_name, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", schema_name)
+        ):
+            raise StructuredResponseError("structured response schema name is invalid")
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.reasoning_effort:
+            payload["reasoning"] = {
+                "effort": self.reasoning_effort,
+                "exclude": True,
+            }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            try:
+                _require_ascii_key(self.api_key)
+            except RuntimeError as exc:
+                raise StructuredResponseError(
+                    "structured model credentials are invalid"
+                ) from exc
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        logger.debug("调用结构化模型 %s（schema=%s）", self.model, schema_name)
+        try:
+            response = await self.client.post(self.url, headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            raise StructuredResponseError("structured model request failed") from exc
+        if response.status_code >= 400:
+            raise StructuredResponseError(
+                f"structured model request failed (HTTP {response.status_code})"
+            )
+        try:
+            document = response.json()
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StructuredResponseError("structured model returned invalid JSON") from exc
+        if not isinstance(document, dict) or isinstance(document.get("error"), dict):
+            raise StructuredResponseError("structured model returned an invalid response")
+        try:
+            message = document["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise StructuredResponseError("structured model response is incomplete") from exc
+        if not isinstance(message, dict):
+            raise StructuredResponseError("structured model response is incomplete")
+        parsed = message.get("parsed")
+        if isinstance(parsed, dict):
+            return parsed
+        content = str(message.get("content") or "").strip()
+        if not content:
+            content = str(message.get("reasoning_content") or "").strip()
+        if not content:
+            content = str(message.get("reasoning") or "").strip()
+        try:
+            parsed = json.loads(content)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StructuredResponseError(
+                "structured model returned invalid JSON"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise StructuredResponseError(
+                "structured model response must be a JSON object"
+            )
+        return parsed
 
     async def describe_image(
         self,
