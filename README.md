@@ -192,6 +192,29 @@ python -m backend.main                 REM 窗口 2：主程序（端口 8000）
 4. 在自动运行和重放中分别尝试手动控制；确认系统总是先暂停/停止并清除，清除失败时不发送新的手动输出。
 5. 触发急停，确认 A/B 清零、波形停止、自动运行暂停；仅在确认环境安全后解除急停并按界面流程恢复。
 
+### 忠实小说模式（个人本地工作流）
+
+小说模式只接受本机的 `.txt`、`.md` 与 `.docx`。文本文件可选 `utf-8` 或 `gb18030`；`auto` 会严格判断编码，DOCX 只能用 `auto`。单个源文件上限由 `story.max_source_mb` 控制，默认是 20 MB。原始文件、候选分析、缓存和回放都在本地 `data/` 下，均已被 Git 忽略。
+
+它是**忠实模式**：按原文和已验证的章节/场景顺序生成 A/B 的 `keep`、`set` 或 `stop` 意图；聊天、摄像头和麦克风不会改写小说主线。选中章节时，运行时只向已配置的 OpenRouter 兼容模型发送一次该章节的结构化规划请求；波形选择、`±4` 强度扰动与周期间隔仍由本地、带种子的随机器解析。不会在程序中在线分析整本小说。
+
+先让 Codex 将本地候选写为 `data/story_candidates/<prefix>.json`（`<prefix>` 可用书名或来源哈希前缀）。候选必须包含原文规范化后的 `source_hash`、`text_length`、完整且连续的章节/场景偏移与稳定 ID。先验证，确认无误后才导入缓存：
+
+```powershell
+$source = Read-Host '本地 TXT/MD/DOCX 完整路径'
+$map = Read-Host 'data/story_candidates 下的候选 JSON 完整路径'
+& .venv\Scripts\python.exe -m backend.story.import_analysis validate --source $source --map $map --encoding auto
+& .venv\Scripts\python.exe -m backend.story.import_analysis import --source $source --map $map --encoding auto
+```
+
+候选 JSON 必须是 `data/story_candidates/` 的直接子文件；对于已确认的 GB18030 文本，把两条命令末尾的 `--encoding auto` 改为 `--encoding gb18030`。`validate` 不写缓存，`import` 才原子写入 `data/story_analysis/`。导入后在阅读器选择该书、速度（慢 250／标准 400／快 600 字符/分钟）和章节；只有章节完整规划、解析和本地安全预检全部通过后才会自动开始。
+
+缓存身份由规范化原文哈希、离线候选生产者/版本以及当前 DLC 身份共同决定。改变原文内容或解码结果，或改变角色、档位、DLC 标识、提示词（含提示词文件）、示例或波形策略后，旧缓存会显示 `missing`，应重新生成候选并执行上述验证/导入。`ready` 表示当前身份下有完整可信的缓存；`missing` 表示尚未导入或身份已失效；`invalid` 表示发现损坏缓存，系统已隔离它，需重新导入。状态查询和章节列表不发送模型请求。
+
+播放时「暂停」会立即清除 A/B 输出并保留安全事件游标；「继续」可从当前事件、章节开头或整段开头恢复。完成后会在 `data/replays/*.coyote-replay` 保存 ZIP 归档，内含 `manifest.json`、完整已解析时间线、`scenes.json` 及原始 `source.<txt|md|docx>`。精确重放只使用归档时间线，不重新请求模型或抽取随机数；当前安全上限或来源指纹不同时会标记为已调整。
+
+个人内容不会提交：`data/story_candidates/`、`data/story_analysis/`、`data/stories/` 和 `data/replays/` 都受 `data/` 忽略规则覆盖。要删除导入的书、候选、缓存或回放，请先在应用中结束活动会话，再删除对应的本地 `data/` 子目录文件；如需保留，先将整个 `.coyote-replay` 文件和原始书籍复制到加密或受控的个人备份位置。不要把小说、候选 JSON、API Key 或个人配置加入 Git。
+
 ## 安全设计（任何来源命令的唯一出口是 `backend/safety.py`）
 
 1. 每通道独立强度上限（配置，默认 100），AI/手动超不过；
