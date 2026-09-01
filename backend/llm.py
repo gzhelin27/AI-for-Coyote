@@ -9,6 +9,95 @@ import httpx
 logger = logging.getLogger("ai-for-coyote.llm")
 
 
+class StoryAnalysisError(RuntimeError):
+    """A story-analysis request failed and may be retried by the caller."""
+
+    retryable = True
+
+
+class ContextLimitError(StoryAnalysisError):
+    """A verified provider response reports that the request exceeded context."""
+
+
+_MAX_ERROR_RESPONSE_BYTES = 64 * 1024
+_MAX_ERROR_FIELD_CHARS = 1_000
+_MAX_PROVIDER_ERROR_CHARS = 4_096
+_CONTEXT_ERROR_CODES = frozenset(
+    {
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "max_context_length_exceeded",
+        "maximum_context_length_exceeded",
+    }
+)
+_CONTEXT_MESSAGE_MARKERS = (
+    "maximum context length",
+    "max context length",
+    "context length exceeded",
+    "context window exceeded",
+    "exceeds the context window",
+    "exceeded the context window",
+)
+
+
+def _bounded_response_json(response: httpx.Response) -> dict | None:
+    """Decode only a bounded JSON object returned by the provider."""
+
+    content = response.content
+    if len(content) > _MAX_ERROR_RESPONSE_BYTES:
+        return None
+    try:
+        document = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _verified_context_error(
+    status_code: int,
+    document: dict | None,
+    *,
+    inspect_provider_raw: bool = True,
+) -> bool:
+    """Recognize context failures only from the provider's documented error object."""
+
+    if not isinstance(document, dict) or not isinstance(document.get("error"), dict):
+        return False
+    error = document["error"]
+    for field in ("code", "type"):
+        value = error.get(field)
+        if isinstance(value, str) and len(value) <= _MAX_ERROR_FIELD_CHARS:
+            normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized in _CONTEXT_ERROR_CODES:
+                return True
+    message = error.get("message")
+    if status_code not in (400, 413, 422) or not isinstance(message, str):
+        return False
+    if len(message) > _MAX_ERROR_FIELD_CHARS:
+        return False
+    lowered = message.lower()
+    if any(marker in lowered for marker in _CONTEXT_MESSAGE_MARKERS):
+        return True
+
+    if not inspect_provider_raw or not isinstance(error.get("metadata"), dict):
+        return False
+    raw = error["metadata"].get("raw")
+    if not isinstance(raw, str) or len(raw) > _MAX_PROVIDER_ERROR_CHARS:
+        return False
+    try:
+        provider_document = json.loads(raw)
+    except json.JSONDecodeError:
+        provider_document = None
+    if isinstance(provider_document, dict) and _verified_context_error(
+        status_code,
+        provider_document,
+        inspect_provider_raw=False,
+    ):
+        return True
+    lowered_raw = raw.lower()
+    return any(marker in lowered_raw for marker in _CONTEXT_MESSAGE_MARKERS)
+
+
 def _preset_text(state: dict) -> str:
     """把波形库渲染成提示词文本：波形名（推荐时长s）。"""
     parts = []
@@ -410,6 +499,89 @@ class LLM:
             if self.json_mode:
                 line = "（模型这次没有说话，只动了设备。再说一句吧？）"
         return line, actions
+
+    async def complete_json(
+        self,
+        system_prompt: str,
+        user_content: str,
+        schema_name: str,
+    ) -> dict:
+        """Return one JSON object for an injected structured-analysis caller.
+
+        This method intentionally makes one request and never logs prompt or source
+        content. Callers own schema validation and any context-limit fallback.
+        """
+
+        if (
+            not isinstance(schema_name, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", schema_name)
+        ):
+            raise StoryAnalysisError("structured response schema name is invalid")
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.reasoning_effort:
+            payload["reasoning"] = {
+                "effort": self.reasoning_effort,
+                "exclude": True,
+            }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            try:
+                _require_ascii_key(self.api_key)
+            except RuntimeError as exc:
+                raise StoryAnalysisError("structured model credentials are invalid") from exc
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        logger.debug("调用结构化模型 %s（schema=%s）", self.model, schema_name)
+        try:
+            response = await self.client.post(self.url, headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            raise StoryAnalysisError("structured model request failed") from exc
+
+        error_document = _bounded_response_json(response)
+        if _verified_context_error(response.status_code, error_document):
+            raise ContextLimitError("structured model context limit exceeded")
+        if response.status_code >= 400:
+            raise StoryAnalysisError(
+                f"structured model request failed (HTTP {response.status_code})"
+            )
+        try:
+            document = response.json()
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StoryAnalysisError("structured model returned invalid JSON") from exc
+        if not isinstance(document, dict):
+            raise StoryAnalysisError("structured model returned invalid JSON")
+        if isinstance(document.get("error"), dict):
+            raise StoryAnalysisError("structured model returned an error")
+        try:
+            message = document["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise StoryAnalysisError("structured model response is incomplete") from exc
+        parsed = message.get("parsed") if isinstance(message, dict) else None
+        if isinstance(parsed, dict):
+            return parsed
+        if not isinstance(message, dict):
+            raise StoryAnalysisError("structured model response is incomplete")
+        content = str(message.get("content") or "").strip()
+        if not content:
+            content = str(message.get("reasoning_content") or "").strip()
+        if not content:
+            content = str(message.get("reasoning") or "").strip()
+        try:
+            parsed = json.loads(content)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StoryAnalysisError("structured model returned invalid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise StoryAnalysisError("structured model response must be a JSON object")
+        return parsed
 
     async def describe_image(
         self,
