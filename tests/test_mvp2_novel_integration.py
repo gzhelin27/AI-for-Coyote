@@ -29,7 +29,12 @@ from backend.story.import_analysis import main as import_analysis_main
 from backend.story.planner import ChapterPlanner
 from backend.story.source_store import PinnedStorySourceStore
 from backend.story.story_map_codec import encode_story_map
-from backend.timeline.models import CycleGapPolicy, SCHEMA_VERSION, SessionStatus
+from backend.timeline.models import (
+    CycleGapPolicy,
+    DirectiveMode,
+    SCHEMA_VERSION,
+    SessionStatus,
+)
 from tests.test_game_loop_timeline import make_game_loop_for_test
 from tests.test_session_endpoints import make_endpoint_state
 
@@ -162,7 +167,9 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         source_path.write_bytes(source_bytes)
         story = self.state.story_source_loader.load("fixture.docx", source_bytes)
         candidate_path = self._write_candidate(story)
-        logical_actions, logical_clears = self._record_game_loop_boundaries()
+        logical_actions, logical_executions, logical_clears = (
+            self._record_game_loop_boundaries()
+        )
 
         self._run_candidate_cli("validate", source_path, candidate_path)
         self._run_candidate_cli("import", source_path, candidate_path)
@@ -234,15 +241,93 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
+
+        physical_session = self.state.novel_session.session_controller
+        physical_before_pause = physical_session.to_state()
+        expected_resume_actions = self._effective_resume_actions(
+            self.state.novel_session.plan, before_pause.cursor
+        )
+        self.assertEqual(
+            {channel for channel, _, _ in expected_resume_actions}, {"A", "B"}
+        )
+
+        # A status-only resume mutation can preserve the API-visible cursor and
+        # event, but it must not satisfy this gate without scheduler execution.
+        mutation_action_start = len(logical_actions)
+        mutation_completed_cycles = self._completed_cycles()
+
+        async def status_only_resume_planned(cursor):
+            self.assertEqual(cursor, before_pause.cursor)
+            physical_session._event_cursor = cursor
+            physical_session._current_event_id = physical_before_pause.current_event_id
+            physical_session._set_status(SessionStatus.RUNNING)
+            return physical_session.to_state()
+
+        with patch.object(
+            physical_session,
+            "resume_planned",
+            side_effect=status_only_resume_planned,
+        ):
+            mutated_resume = await self.client.post(
+                "/api/story/resume", json={"from": "current"}
+            )
+        self.assertEqual(mutated_resume.status_code, 200, mutated_resume.text)
+        self.assertEqual(mutated_resume.json()["status"], "running")
+        self.assertEqual(mutated_resume.json()["cursor"], before_pause.cursor)
+        self.assertEqual(
+            mutated_resume.json()["current_scene_id"], before_pause.current_scene_id
+        )
+        with self.assertRaisesRegex(AssertionError, "resume must execute"):
+            self._assert_resume_execution(
+                logical_actions,
+                mutation_action_start,
+                mutation_completed_cycles,
+                expected_resume_actions,
+            )
+
+        # Restore the real paused boundary before exercising the production resume.
+        re_paused = await self.client.post("/api/story/pause")
+        self.assertEqual(re_paused.status_code, 200, re_paused.text)
+        self.assertEqual(re_paused.json()["status"], "paused")
+        self.assertEqual(re_paused.json()["cursor"], before_pause.cursor)
+        self.assertEqual(
+            re_paused.json()["current_scene_id"], before_pause.current_scene_id
+        )
+        resume_action_start = len(logical_actions)
+        resume_completed_cycles = self._completed_cycles()
         resumed = await self.client.post("/api/story/resume", json={"from": "current"})
+        self.assertEqual(resumed.status_code, 200, resumed.text)
         self.assertEqual(resumed.json()["status"], "running")
         await self._advance_until(
-            lambda: (
-                self.state.novel_session.to_state().cursor == before_pause.cursor
-                and self.state.novel_session.to_state().current_scene_id
-                == before_pause.current_scene_id
+            lambda: self._resume_execution_observed(
+                logical_actions,
+                resume_action_start,
+                resume_completed_cycles,
+                expected_resume_actions,
             ),
-            "resume current should restart the paused safe event",
+            "resume current must execute the paused event's active A/B directives",
+        )
+        self._assert_resume_execution(
+            logical_actions,
+            resume_action_start,
+            resume_completed_cycles,
+            expected_resume_actions,
+        )
+        self._assert_resume_execution_effects(
+            logical_executions,
+            resume_action_start,
+            expected_resume_actions,
+        )
+        self.assertEqual(
+            self.state.novel_session.to_state().cursor, before_pause.cursor
+        )
+        self.assertEqual(
+            self.state.novel_session.to_state().current_scene_id,
+            before_pause.current_scene_id,
+        )
+        self.assertEqual(
+            physical_session.to_state().current_event_id,
+            physical_before_pause.current_event_id,
         )
         self.assertEqual(self.harness.relay.sent_frames, [])
 
@@ -414,13 +499,19 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     def _record_game_loop_boundaries(self):
         logical_actions: list[tuple[dict[str, object], ...]] = []
+        logical_executions: list[
+            tuple[tuple[dict[str, object], ...], tuple[list, list]]
+        ] = []
         logical_clears: list[tuple[str | None, tuple[list, list]]] = []
         original_timeline_actions = self.harness.loop.execute_timeline_actions
         original_clear_output = self.harness.loop.clear_output
 
         async def record_timeline_actions(actions, owner_generations):
-            logical_actions.append(tuple(deepcopy(actions)))
-            return await original_timeline_actions(actions, owner_generations)
+            action_group = tuple(deepcopy(actions))
+            result = await original_timeline_actions(actions, owner_generations)
+            logical_actions.append(action_group)
+            logical_executions.append((action_group, result))
+            return result
 
         async def record_clear_output(channel=None):
             result = await original_clear_output(channel)
@@ -438,17 +529,128 @@ class MVP2OfflineNovelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(
             setattr, self.harness.loop, "clear_output", original_clear_output
         )
-        return logical_actions, logical_clears
+        return logical_actions, logical_executions, logical_clears
+
+    def _completed_cycles(self):
+        return tuple(
+            cycle
+            for cycle in self.harness.controller.recorded_cycles
+            if cycle.completed
+        )
+
+    @staticmethod
+    def _effective_resume_actions(plan, cursor: int):
+        if plan is None:
+            raise AssertionError("resume must retain the selected chapter plan")
+        active = {"A": None, "B": None}
+        for event in plan.plot_events[: cursor + 1]:
+            for channel in ("A", "B"):
+                directive = event.channels[channel]
+                if directive.mode is DirectiveMode.SET:
+                    active[channel] = directive
+                elif directive.mode is DirectiveMode.STOP:
+                    active[channel] = None
+                # KEEP intentionally leaves the effective prefix directive intact.
+        return tuple(
+            (channel, directive.pattern, directive.resolved_strength)
+            for channel, directive in active.items()
+            if directive is not None
+        )
+
+    def _assert_resume_execution(
+        self,
+        logical_actions,
+        action_start: int,
+        completed_before,
+        expected_actions,
+    ) -> None:
+        resumed_actions = logical_actions[action_start:]
+        completed_after = self._completed_cycles()
+        self.assertTrue(
+            resumed_actions or len(completed_after) > len(completed_before),
+            "resume must execute planned actions or complete a new cycle",
+        )
+        self.assertEqual(completed_after[: len(completed_before)], completed_before)
+        action_identities = self._activation_action_identities(resumed_actions)
+        self.assertGreaterEqual(
+            len(action_identities),
+            len(expected_actions),
+            "resume must execute the paused event's active A/B directives",
+        )
+        self.assertEqual(
+            action_identities[: len(expected_actions)],
+            list(expected_actions),
+        )
+
+    def _assert_resume_execution_effects(
+        self, logical_executions, action_start: int, expected_actions
+    ) -> None:
+        activations = []
+        for actions, result in logical_executions[action_start:]:
+            try:
+                identity = self._cycle_action_identity(actions)
+            except AssertionError:
+                continue
+            activations.append((identity, actions, result))
+        self.assertEqual(
+            [identity for identity, _, _ in activations[: len(expected_actions)]],
+            list(expected_actions),
+        )
+        for (_, _, strength), actions, (executed, dropped) in activations[
+            : len(expected_actions)
+        ]:
+            self.assertEqual(dropped, [])
+            self.assertEqual([item["action"] for item in executed], list(actions))
+            self.assertEqual(executed[0]["effective"]["effective_strength"], strength)
+
+    def _resume_execution_observed(
+        self,
+        logical_actions,
+        action_start: int,
+        completed_before,
+        expected_actions,
+    ) -> bool:
+        has_real_resume_effect = (
+            bool(logical_actions[action_start:])
+            or len(self._completed_cycles()) > len(completed_before)
+        )
+        return has_real_resume_effect and self._resume_actions_match(
+            logical_actions, action_start, expected_actions
+        )
+
+    def _resume_actions_match(
+        self, logical_actions, action_start: int, expected_actions
+    ) -> bool:
+        resumed_actions = logical_actions[action_start:]
+        action_identities = self._activation_action_identities(resumed_actions)
+        if len(action_identities) < len(expected_actions):
+            return False
+        return action_identities[: len(expected_actions)] == list(expected_actions)
+
+    def _activation_action_identities(self, actions):
+        identities = []
+        for action_group in actions:
+            try:
+                identities.append(self._cycle_action_identity(action_group))
+            except AssertionError:
+                # A runner may complete a rapid cycle and emit a pulse-only
+                # continuation before its peer's activation is scheduled.
+                continue
+        return identities
 
     @staticmethod
     def _cycle_action_identity(actions):
         if len(actions) != 2:
-            raise AssertionError("replay must execute a strength and one cycle action")
+            raise AssertionError(
+                "activation must execute a strength and one cycle action"
+            )
         strength, cycle = actions
         if strength.get("op") != "hold_strength" or cycle.get("op") != "pulse_cycle":
-            raise AssertionError("replay did not execute the recorded cycle actions")
+            raise AssertionError(
+                "activation did not execute the expected cycle actions"
+            )
         if strength.get("channel") != cycle.get("channel"):
-            raise AssertionError("replay cycle actions used different channels")
+            raise AssertionError("activation cycle actions used different channels")
         return strength["channel"], cycle.get("pattern"), strength.get("value")
 
     def _run_candidate_cli(self, action: str, source_path: Path, candidate_path: Path) -> None:
