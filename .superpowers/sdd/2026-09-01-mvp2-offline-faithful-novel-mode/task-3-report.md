@@ -103,3 +103,26 @@ Implemented and committed as `feat: import Codex story analysis offline`.
 
 - The importer no longer relies on a check/read/check identity comparison. On this Windows host the C runtime denies replacement of an already-opened file, so the two true replacement-race tests skip after documenting that OS behavior; on replace-capable platforms they exercise the verified-handle read path. The existing Windows junction regression passes and static symlink coverage remains privilege-gated.
 - No external model, network, device action, push, or tag was invoked.
+
+## Fix round 3/5
+
+### RED evidence
+
+- `D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest tests.test_story_offline_analysis.OfflineAnalysisImporterTests.test_validation_rejects_nested_candidate_path tests.test_story_offline_analysis.OfflineAnalysisImporterTests.test_validation_rejects_candidate_path_traversal tests.test_story_offline_analysis.OfflineAnalysisImporterTests.test_validation_fails_closed_when_pinned_candidate_root_is_replaced -v` failed before this implementation: all three inputs were accepted.
+
+### GREEN evidence
+
+- Focused importer/CLI suite: 20 passed, 4 skipped only for unavailable Windows symlink privilege or Windows' non-replaceable opened-file/directory semantics.
+- Source/store/importer/CLI/AppState-provenance regression suite: 96 passed, 5 platform skips.
+- Full command `D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest discover -s tests -q`: 447 passed, 5 skipped, in 43.517s.
+- `D:\AI-for-Coyote\.venv\Scripts\python.exe -m compileall -q backend tests` and `git diff --check` exited 0.
+
+### Fixes and modified files
+
+- `backend/story/offline_analysis.py`: restrict candidates to direct basename children; pin the candidate-root directory as an opened kernel handle (identity and final path); use POSIX `openat`/`O_NOFOLLOW`, and Windows `CreateFileW` directory handles without delete sharing before opening the basename. Candidate and root handles are re-verified before and after the bounded read.
+- `tests/test_story_offline_analysis.py`: added nested-path, traversal, root-replacement, and corrected moved-open-file fail-closed regressions.
+
+### Self-review and residual risk
+
+- No post-open verification relies on resolving the configured root pathname: POSIX reads the basename through the pinned directory descriptor; Windows keeps the root handle open without delete sharing, then opens the basename while that root cannot be replaced. Platforms without required safe directory primitives return the typed offline-import failure.
+- The replace-race tests skip on this Windows host because the platform blocks the attempted replacement while the verified handle is open; they run on replace-capable platforms. No external model, network, device action, push, or tag was invoked.

@@ -152,7 +152,7 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 self.source_path, linked, encoding="utf-8", dlc_version="dlc1-v1"
             )
 
-    def test_validation_reads_the_opened_candidate_when_a_race_replaces_its_path(self):
+    def test_validation_fails_closed_when_a_race_moves_opened_candidate_outside_root(self):
         attacker = self._valid_candidate()
         attacker["chapters"][0]["scenes"][0]["summary"] = "目录外候选内容。"
         outside = self.root / "outside.json"
@@ -187,17 +187,15 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
         with patch.object(Path, "read_bytes", read_bytes_with_race), patch.object(
             offline_analysis.os, "open", open_with_race
         ):
-            result = self.importer.validate(
-                self.source_path,
-                self.candidate_path,
-                encoding="utf-8",
-                dlc_version="dlc1-v1",
-            )
+            with self.assertRaises(OfflineAnalysisError):
+                self.importer.validate(
+                    self.source_path,
+                    self.candidate_path,
+                    encoding="utf-8",
+                    dlc_version="dlc1-v1",
+                )
 
         self.assertTrue(swapped)
-        self.assertEqual(
-            result.story_map.chapters[0].scenes[0].summary, "章节标题出现。"
-        )
 
     def test_validation_reads_the_opened_candidate_when_a_race_swaps_to_symlink(self):
         outside = self.root / "outside.json"
@@ -276,6 +274,83 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
             importer.validate(
                 self.source_path, candidate, encoding="utf-8", dlc_version="dlc1-v1"
             )
+
+    def test_validation_rejects_nested_candidate_path(self):
+        nested = self.candidate_directory / "nested"
+        nested.mkdir()
+        nested_candidate = nested / "candidate.json"
+        nested_candidate.write_text(
+            json.dumps(self._valid_candidate(), ensure_ascii=False), encoding="utf-8"
+        )
+
+        with self.assertRaises(OfflineAnalysisError):
+            self.importer.validate(
+                self.source_path,
+                nested_candidate,
+                encoding="utf-8",
+                dlc_version="dlc1-v1",
+            )
+
+    def test_validation_rejects_candidate_path_traversal(self):
+        traversal = self.candidate_directory / ".." / "story_candidates" / "candidate.json"
+
+        with self.assertRaises(OfflineAnalysisError):
+            self.importer.validate(
+                self.source_path,
+                traversal,
+                encoding="utf-8",
+                dlc_version="dlc1-v1",
+            )
+
+    def test_validation_fails_closed_when_pinned_candidate_root_is_replaced(self):
+        outside_root = self.root / "outside-candidates"
+        outside_root.mkdir()
+        outside_candidate = outside_root / "candidate.json"
+        attacker = self._valid_candidate()
+        attacker["chapters"][0]["scenes"][0]["summary"] = "替换根目录中的候选内容。"
+        outside_candidate.write_text(
+            json.dumps(attacker, ensure_ascii=False), encoding="utf-8"
+        )
+        held_root = self.root / "held-candidates"
+        original_open = offline_analysis.os.open
+        swapped = False
+
+        def open_with_root_swap(path, flags, *args, **kwargs):
+            nonlocal swapped
+            swap_after_open = os.name != "nt" and Path(path) == self.candidate_directory
+            swap_before_open = os.name == "nt" and Path(path) == self.candidate_path
+            if swap_before_open and not swapped:
+                try:
+                    self.candidate_directory.replace(held_root)
+                    outside_root.replace(self.candidate_directory)
+                    swapped = True
+                except PermissionError as exc:
+                    self.skipTest(
+                        f"opened directories cannot be replaced on this platform: {exc}"
+                    )
+            descriptor = original_open(path, flags, *args, **kwargs)
+            if swap_after_open and not swapped:
+                try:
+                    self.candidate_directory.replace(held_root)
+                    outside_root.replace(self.candidate_directory)
+                    swapped = True
+                except PermissionError as exc:
+                    os.close(descriptor)
+                    self.skipTest(
+                        f"opened directories cannot be replaced on this platform: {exc}"
+                    )
+            return descriptor
+
+        with patch.object(offline_analysis.os, "open", open_with_root_swap):
+            with self.assertRaises(OfflineAnalysisError):
+                self.importer.validate(
+                    self.source_path,
+                    self.candidate_path,
+                    encoding="utf-8",
+                    dlc_version="dlc1-v1",
+                )
+
+        self.assertTrue(swapped)
 
     def test_validation_rejects_escaped_surrogate_and_huge_pace_as_typed_errors(self):
         cases = {

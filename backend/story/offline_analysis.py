@@ -39,6 +39,24 @@ class ValidatedOfflineAnalysis:
     scene_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _DirectoryHandle:
+    descriptor: int
+
+    def fileno(self) -> int:
+        return self.descriptor
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedCandidateRoot:
+    handle: _DirectoryHandle
+    identity: tuple[int, int]
+    final_path: Path
+
+
 def offline_analysis_key(story: ImportedStory, dlc_version: str) -> AnalysisKey:
     if not isinstance(story, ImportedStory):
         raise TypeError("story must be an ImportedStory")
@@ -115,14 +133,26 @@ class OfflineAnalysisImporter:
             raise OfflineAnalysisError("story source could not be loaded") from exc
 
     def _read_candidate(self, candidate_path: Path) -> dict[str, object]:
-        candidate_path = self._candidate_path(candidate_path)
-        candidate_file = self._open_verified_candidate(candidate_path)
+        candidate_name = self._candidate_name(candidate_path)
+        root: _PinnedCandidateRoot | None = None
+        candidate_file: BinaryIO | None = None
         try:
+            root = self._open_pinned_candidate_root()
+            candidate_file = self._open_candidate_from_root(root, candidate_name)
+            self._verify_pinned_root(root)
+            self._verify_candidate_handle(candidate_file, root)
             payload = _read_bounded(candidate_file, _MAX_CANDIDATE_BYTES)
-        except (OSError, UnicodeError, RecursionError, OverflowError) as exc:
+            self._verify_pinned_root(root)
+            self._verify_candidate_handle(candidate_file, root)
+        except OfflineAnalysisError:
+            raise
+        except (OSError, UnicodeError, RecursionError, OverflowError, ValueError) as exc:
             raise OfflineAnalysisError("candidate file could not be read") from exc
         finally:
-            candidate_file.close()
+            if candidate_file is not None:
+                candidate_file.close()
+            if root is not None:
+                root.handle.close()
         try:
             decoded = json.loads(
                 payload.decode("utf-8"),
@@ -137,58 +167,67 @@ class OfflineAnalysisImporter:
             raise OfflineAnalysisError("candidate JSON is invalid") from exc
         return _exact_object(decoded, _MAP_KEYS, "candidate")
 
-    def _candidate_path(self, candidate_path: Path) -> Path:
+    def _candidate_name(self, candidate_path: Path) -> str:
+        if ".." in candidate_path.parts:
+            raise OfflineAnalysisError("candidate path traversal is not permitted")
         if not candidate_path.is_absolute():
             candidate_path = self._project_root / candidate_path
         candidate_path = _absolute_lexical_path(candidate_path)
         try:
-            candidate_path.relative_to(self._candidate_directory)
+            relative = candidate_path.relative_to(self._candidate_directory)
         except ValueError as exc:
             raise OfflineAnalysisError("candidate file is outside the configured directory") from exc
+        if len(relative.parts) != 1 or relative.name in ("", ".", ".."):
+            raise OfflineAnalysisError("candidate file must be a direct child of the configured directory")
         if _contains_redirect(candidate_path):
             raise OfflineAnalysisError("candidate path contains a filesystem redirect")
-        return candidate_path
+        return relative.name
 
-    def _trusted_candidate_root(self) -> Path:
+    def _open_pinned_candidate_root(self) -> _PinnedCandidateRoot:
         if _contains_redirect(self._project_root) or _contains_redirect(
             self._candidate_directory
         ):
             raise OfflineAnalysisError("candidate path contains a filesystem redirect")
+        root_handle: _DirectoryHandle | None = None
         try:
             project_root = self._project_root.resolve(strict=True)
-            candidate_root = self._candidate_directory.resolve(strict=True)
-            candidate_root.relative_to(project_root)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise OfflineAnalysisError("candidate file is outside the configured directory") from exc
-        try:
-            if not candidate_root.is_dir():
+            root_handle = _open_directory_without_redirect(self._candidate_directory)
+            details = os.fstat(root_handle.fileno())
+            if not stat.S_ISDIR(details.st_mode):
                 raise OfflineAnalysisError("candidate directory is not a directory")
-        except OSError as exc:
-            raise OfflineAnalysisError("candidate directory could not be read") from exc
-        return candidate_root
+            final_path = _opened_final_path(root_handle)
+            final_path.relative_to(project_root)
+            if _contains_redirect(self._candidate_directory):
+                raise OfflineAnalysisError("candidate path contains a filesystem redirect")
+            return _PinnedCandidateRoot(
+                handle=root_handle,
+                identity=(details.st_dev, details.st_ino),
+                final_path=final_path,
+            )
+        except OfflineAnalysisError:
+            if root_handle is not None:
+                root_handle.close()
+            raise
+        except (OSError, RuntimeError, UnicodeError, RecursionError, ValueError) as exc:
+            if root_handle is not None:
+                root_handle.close()
+            raise OfflineAnalysisError("candidate directory could not be safely opened") from exc
 
-    def _open_verified_candidate(self, candidate_path: Path) -> BinaryIO:
-        trusted_root = self._trusted_candidate_root()
+    def _open_candidate_from_root(
+        self, root: _PinnedCandidateRoot, candidate_name: str
+    ) -> BinaryIO:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         candidate_file: BinaryIO | None = None
         descriptor: int | None = None
         try:
-            descriptor = os.open(candidate_path, flags)
+            if os.name == "nt":
+                descriptor = os.open(self._candidate_directory / candidate_name, flags)
+            else:
+                if os.open not in os.supports_dir_fd or not getattr(os, "O_NOFOLLOW", 0):
+                    raise OSError("safe relative candidate opening is unavailable")
+                descriptor = os.open(candidate_name, flags, dir_fd=root.handle.fileno())
             candidate_file = os.fdopen(descriptor, "rb")
             descriptor = None
-            opened = os.fstat(candidate_file.fileno())
-            if not stat.S_ISREG(opened.st_mode):
-                raise OfflineAnalysisError("candidate file is not a regular file")
-            opened_path = _opened_final_path(candidate_file)
-            opened_path.relative_to(trusted_root)
-            if _path_key(self._trusted_candidate_root()) != _path_key(trusted_root):
-                raise OfflineAnalysisError("candidate directory changed while opening")
-        except OfflineAnalysisError:
-            if candidate_file is not None:
-                candidate_file.close()
-            elif descriptor is not None:
-                os.close(descriptor)
-            raise
         except (OSError, RuntimeError, UnicodeError, RecursionError, ValueError) as exc:
             if candidate_file is not None:
                 candidate_file.close()
@@ -196,6 +235,39 @@ class OfflineAnalysisImporter:
                 os.close(descriptor)
             raise OfflineAnalysisError("candidate file could not be safely opened") from exc
         return candidate_file
+
+    @staticmethod
+    def _verify_pinned_root(root: _PinnedCandidateRoot) -> None:
+        try:
+            details = os.fstat(root.handle.fileno())
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or (details.st_dev, details.st_ino) != root.identity
+                or _path_key(_opened_final_path(root.handle)) != _path_key(root.final_path)
+            ):
+                raise OfflineAnalysisError("candidate directory changed while reading")
+        except OfflineAnalysisError:
+            raise
+        except (OSError, RuntimeError, UnicodeError, RecursionError, ValueError) as exc:
+            raise OfflineAnalysisError("candidate directory could not be verified") from exc
+
+    @staticmethod
+    def _verify_candidate_handle(
+        candidate_file: BinaryIO, root: _PinnedCandidateRoot
+    ) -> None:
+        try:
+            details = os.fstat(candidate_file.fileno())
+            if not stat.S_ISREG(details.st_mode):
+                raise OfflineAnalysisError("candidate file is not a regular file")
+            opened_path = _opened_final_path(candidate_file)
+            if _path_key(opened_path.parent) != _path_key(root.final_path):
+                raise OfflineAnalysisError("candidate file is outside the configured directory")
+            if details.st_size > _MAX_CANDIDATE_BYTES:
+                raise OfflineAnalysisError("candidate file exceeds the size limit")
+        except OfflineAnalysisError:
+            raise
+        except (OSError, RuntimeError, UnicodeError, RecursionError, ValueError) as exc:
+            raise OfflineAnalysisError("candidate file could not be safely verified") from exc
 
     @staticmethod
     def _decode_candidate(candidate: dict[str, object], story: ImportedStory) -> StoryMap:
@@ -349,6 +421,53 @@ def _absolute_lexical_path(path: Path) -> Path:
 
 def _path_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _open_directory_without_redirect(path: Path) -> _DirectoryHandle:
+    if os.name == "nt":
+        return _open_windows_directory_without_redirect(path)
+    if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
+        raise OSError("safe directory opening is unavailable")
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    return _DirectoryHandle(descriptor)
+
+
+def _open_windows_directory_without_redirect(path: Path) -> _DirectoryHandle:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.fspath(path),
+        generic_read,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    return _DirectoryHandle(descriptor)
 
 
 def _read_bounded(candidate_file: BinaryIO, maximum_size: int) -> bytes:
