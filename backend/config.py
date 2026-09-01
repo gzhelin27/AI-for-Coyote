@@ -8,6 +8,7 @@
 """
 import copy
 import logging
+import math
 import os
 import re
 import shutil
@@ -151,6 +152,7 @@ def load_config(path: Path | None = None) -> Config:
         logger.warning("未找到 %s，使用示例配置 %s（请复制为 config.yaml 并填入密钥）", path, fallback)
         path = fallback
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    _validate_story_override_shape(raw)
     cfg = Config(_deep_merge(DEFAULTS, raw))
 
     # Timeline replay is deliberately governed by one validated project-wide policy.
@@ -164,6 +166,7 @@ def load_config(path: Path | None = None) -> Config:
     if timeline["strength_jitter"] != 4:
         raise ValueError("timeline strength_jitter must remain 4")
     timeline["cycle_gap"] = CycleGapPolicy.from_dict(timeline.get("cycle_gap")).to_dict()
+    _validate_story_config(cfg)
 
     # dry_run 可用环境变量覆盖（联调用）：DGLAB_DRY_RUN=false
     env_dry = os.environ.get("DGLAB_DRY_RUN", "").strip().lower()
@@ -216,6 +219,64 @@ def load_config(path: Path | None = None) -> Config:
     cfg["log_dir"] = str(log_dir)
 
     return cfg
+
+
+def _validate_story_config(cfg: Config) -> None:
+    story = cfg.get("story")
+    if not isinstance(story, dict):
+        raise ValueError("story must be an object")
+    story["import_dir"] = _safe_local_story_path(story.get("import_dir"), "story import_dir")
+    story["analysis_dir"] = _safe_local_story_path(story.get("analysis_dir"), "story analysis_dir")
+    story["max_source_mb"] = _positive_story_number(story.get("max_source_mb"), "story max_source_mb")
+    prompt_version = story.get("analysis_prompt_version")
+    if not isinstance(prompt_version, str) or not (prompt_version := prompt_version.strip()):
+        raise ValueError("story analysis_prompt_version must be a non-empty string")
+    story["analysis_prompt_version"] = prompt_version
+
+    speeds = story.get("reading_speed_cpm")
+    _validate_story_speed_mapping(speeds)
+    story["reading_speed_cpm"] = {
+        name: _positive_story_number(speeds[name], f"story reading_speed_cpm {name}")
+        for name in ("slow", "standard", "fast")
+    }
+
+
+def _validate_story_override_shape(raw: object) -> None:
+    if not isinstance(raw, dict):
+        return
+    story = raw.get("story")
+    if isinstance(story, dict) and "reading_speed_cpm" in story:
+        _validate_story_speed_mapping(story["reading_speed_cpm"])
+
+
+def _validate_story_speed_mapping(speeds: object) -> None:
+    required_speeds = {"slow", "standard", "fast"}
+    if not isinstance(speeds, dict) or set(speeds) != required_speeds:
+        raise ValueError("story reading_speed_cpm must define slow, standard, and fast")
+
+
+def _safe_local_story_path(value: object, name: str) -> str:
+    if not isinstance(value, str) or not (path := value.strip()) or "\x00" in path:
+        raise ValueError(f"{name} must be a non-empty local path")
+    normalized = path.replace("\\", "/")
+    if (
+        normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+        or any(part in ("", ".", "..") for part in normalized.split("/"))
+    ):
+        raise ValueError(f"{name} must be a safe local path")
+    return normalized
+
+
+def _positive_story_number(value: object, name: str) -> int | float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a positive finite number")
+    return int(value) if isinstance(value, float) and value.is_integer() else value
 
 
 DEVICE_CHANNELS_FILE = CONFIG_DIR / "device_channels.yaml"

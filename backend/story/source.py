@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 from pathlib import Path
+from pathlib import PurePosixPath
+import re
+import unicodedata
+import zipfile
 
 from docx import Document
 
@@ -12,6 +16,11 @@ from .models import ImportedStory
 
 
 _ALLOWED_EXTENSIONS = frozenset((".txt", ".md", ".docx"))
+_DOCX_REQUIRED_MEMBERS = frozenset(("[Content_Types].xml", "_rels/.rels", "word/document.xml"))
+_DOCX_MAX_ENTRIES = 256
+_DOCX_MAX_EXPANSION_RATIO = 100
+_DOCX_MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+_DOCX_UNCOMPRESSED_MULTIPLIER = 20
 
 
 class StorySourceError(ValueError):
@@ -58,22 +67,128 @@ class StorySourceLoader:
         if len(original_bytes) > self._max_bytes:
             raise StorySourceError("story source exceeds the size limit")
 
-    @staticmethod
-    def _extract_text(extension: str, original_bytes: bytes) -> str:
+    def _extract_text(self, extension: str, original_bytes: bytes) -> str:
         if extension == ".docx":
+            self._inspect_docx(original_bytes)
             try:
                 document = Document(io.BytesIO(original_bytes))
             except Exception as exc:  # python-docx exposes several parser exceptions.
                 raise StorySourceError("story DOCX could not be read") from exc
             return "\n".join(paragraph.text for paragraph in document.paragraphs)
+        return _decode_plain_text(original_bytes)
+
+    def _inspect_docx(self, original_bytes: bytes) -> None:
         try:
-            return original_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                return original_bytes.decode("gb18030")
-            except UnicodeDecodeError as exc:
-                raise StorySourceError("story text encoding is not supported") from exc
+            with zipfile.ZipFile(io.BytesIO(original_bytes)) as archive:
+                members = archive.infolist()
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise StorySourceError("story DOCX archive is malformed") from exc
+        if len(members) > _DOCX_MAX_ENTRIES:
+            raise StorySourceError("story DOCX has too many entries")
+        names = {member.filename for member in members}
+        if not _DOCX_REQUIRED_MEMBERS.issubset(names):
+            raise StorySourceError("story DOCX is missing required OOXML members")
+
+        uncompressed_limit = min(
+            self._max_bytes * _DOCX_UNCOMPRESSED_MULTIPLIER,
+            _DOCX_MAX_UNCOMPRESSED_BYTES,
+        )
+        total_uncompressed = 0
+        total_compressed = 0
+        for member in members:
+            if member.flag_bits & 0x1:
+                raise StorySourceError("story DOCX archive is encrypted")
+            if _unsafe_docx_member_name(member.filename):
+                raise StorySourceError("story DOCX contains an unsafe member name")
+            if member.file_size > uncompressed_limit:
+                raise StorySourceError("story DOCX entry exceeds the expansion limit")
+            if member.file_size and (
+                not member.compress_size
+                or member.file_size > member.compress_size * _DOCX_MAX_EXPANSION_RATIO
+            ):
+                raise StorySourceError("story DOCX entry exceeds the compression ratio limit")
+            total_uncompressed += member.file_size
+            total_compressed += member.compress_size
+            if total_uncompressed > uncompressed_limit:
+                raise StorySourceError("story DOCX exceeds the expansion limit")
+        if total_uncompressed and (
+            not total_compressed
+            or total_uncompressed > total_compressed * _DOCX_MAX_EXPANSION_RATIO
+        ):
+            raise StorySourceError("story DOCX exceeds the compression ratio limit")
 
 
 def _normalize_text(text: str) -> str:
     return text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _decode_plain_text(original_bytes: bytes) -> str:
+    if original_bytes.startswith(b"\xef\xbb\xbf"):
+        try:
+            return original_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise StorySourceError("story UTF-8 BOM text could not be decoded") from exc
+
+    candidates: dict[str, str] = {}
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            candidates[encoding] = original_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    if not candidates:
+        raise StorySourceError("story text encoding is not supported")
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+    utf8 = candidates["utf-8"]
+    gb18030 = candidates["gb18030"]
+    if utf8 == gb18030:
+        return utf8
+    return _resolve_ambiguous_chinese_text(utf8, gb18030)
+
+
+def _resolve_ambiguous_chinese_text(utf8: str, gb18030: str) -> str:
+    normalized_utf8 = _normalize_text(utf8)
+    normalized_gb18030 = _normalize_text(gb18030)
+    utf8_suspicious = _has_suspicious_text_content(normalized_utf8)
+    gb18030_suspicious = _has_suspicious_text_content(normalized_gb18030)
+    if utf8_suspicious != gb18030_suspicious:
+        return gb18030 if utf8_suspicious else utf8
+    if utf8_suspicious:
+        raise StorySourceError("story text encoding is ambiguous")
+
+    utf8_score = _cjk_plausibility(normalized_utf8)
+    gb18030_score = _cjk_plausibility(normalized_gb18030)
+    if utf8_score >= gb18030_score + 0.2:
+        return utf8
+    if gb18030_score >= utf8_score + 0.2:
+        return gb18030
+    raise StorySourceError("story text encoding is ambiguous")
+
+
+def _has_suspicious_text_content(text: str) -> bool:
+    return any(
+        (unicodedata.category(character) == "Cc" and character not in "\t\n\r")
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in text
+    )
+
+
+def _cjk_plausibility(text: str) -> float:
+    visible = [character for character in text if not character.isspace()]
+    if not visible:
+        return 0.0
+    cjk_count = sum(
+        0x3400 <= ord(character) <= 0x4DBF
+        or 0x4E00 <= ord(character) <= 0x9FFF
+        or 0xF900 <= ord(character) <= 0xFAFF
+        for character in visible
+    )
+    return cjk_count / len(visible)
+
+
+def _unsafe_docx_member_name(name: str) -> bool:
+    if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+        return True
+    if re.match(r"^[A-Za-z]:", name):
+        return True
+    return ".." in PurePosixPath(name).parts
