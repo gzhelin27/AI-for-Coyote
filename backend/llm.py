@@ -31,24 +31,6 @@ _CONTEXT_ERROR_CODES = frozenset(
     }
 )
 _CONTEXT_HTTP_STATUSES = frozenset((400, 413, 422))
-_NON_CONTEXT_ERROR_IDENTITY_MARKERS = (
-    "auth",
-    "unauthorized",
-    "permission",
-    "access_denied",
-    "privacy",
-    "data_policy",
-    "zero_data_retention",
-    "zdr",
-    "rate_limit",
-    "too_many_requests",
-    "quota",
-    "billing",
-    "payment",
-    "credit",
-    "capacity",
-    "overloaded",
-)
 _NON_CONTEXT_ERROR_MESSAGE_MARKERS = (
     "api key",
     "not authorized",
@@ -75,11 +57,6 @@ _NON_CONTEXT_ERROR_MESSAGE_MARKERS = (
 
 def _normalized_error_identity(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-
-
-def _non_context_error_identity(value: str) -> bool:
-    normalized = _normalized_error_identity(value)
-    return any(marker in normalized for marker in _NON_CONTEXT_ERROR_IDENTITY_MARKERS)
 
 
 def _non_context_error_message(text: str) -> bool:
@@ -147,16 +124,11 @@ def _verified_context_error(
     for field in ("code", "type"):
         value = error.get(field)
         if isinstance(value, str) and len(value) <= _MAX_ERROR_FIELD_CHARS:
-            bounded_identities.append(value)
-    if _non_context_error_message(bounded_message) or any(
-        _non_context_error_identity(value) for value in bounded_identities
-    ):
-        return False
-    if any(
-        _normalized_error_identity(value) in _CONTEXT_ERROR_CODES
-        for value in bounded_identities
-    ):
-        return True
+            identity = _normalized_error_identity(value)
+            if identity:
+                bounded_identities.append(identity)
+    if bounded_identities:
+        return all(identity in _CONTEXT_ERROR_CODES for identity in bounded_identities)
     if _explicit_context_overage(bounded_message):
         return True
 

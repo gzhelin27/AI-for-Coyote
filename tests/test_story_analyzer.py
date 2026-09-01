@@ -885,19 +885,103 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verified_error_code_classifies_context_limit(self):
         # Catches missing OpenAI/OpenRouter context-length error classification.
-        llm = self.llm_with_response(
-            400,
+        identities = (
+            {"code": "context_length_exceeded"},
+            {"type": "context_window_exceeded"},
             {
-                "error": {
-                    "message": "This model's maximum context length was exceeded.",
-                    "type": "invalid_request_error",
-                    "code": "context_length_exceeded",
-                }
+                "type": "max_context_length_exceeded",
+                "code": "maximum_context_length_exceeded",
             },
         )
+        for identity in identities:
+            with self.subTest(identity=identity):
+                llm = self.llm_with_response(
+                    400,
+                    {
+                        "error": {
+                            "message": "Provider rejected the structured request.",
+                            **identity,
+                        }
+                    },
+                )
 
-        with self.assertRaises(ContextLimitError):
-            await llm.complete_json("system", "private novel", "story_map")
+                with self.assertRaises(ContextLimitError):
+                    await llm.complete_json("system", "private novel", "story_map")
+
+    async def test_unknown_structured_identity_never_uses_message_inference(self):
+        # Catches new provider account/policy identities activating a second request.
+        explicit_overage = (
+            "This request contains 140000 tokens, exceeding the model context "
+            "limit of 128000 tokens."
+        )
+        cases = (
+            ("forbidden-diagnostic", {"type": "forbidden"}, explicit_overage),
+            (
+                "forbidden-wording",
+                {"code": "forbidden"},
+                "Request forbidden: input token count 140000 exceeds the model context limit of 128000.",
+            ),
+            (
+                "policy-diagnostic",
+                {"code": "policy_violation"},
+                explicit_overage,
+            ),
+            (
+                "policy-wording",
+                {"type": "policy_violation"},
+                "Safety policy violation: prompt token count 140000 exceeds the context window of 128000.",
+            ),
+            ("throttled-diagnostic", {"type": "throttled"}, explicit_overage),
+            (
+                "throttled-wording",
+                {"code": "throttled"},
+                "Requests are being throttled; input token count 140000 exceeds the context limit of 128000.",
+            ),
+            (
+                "usage-diagnostic",
+                {"code": "usage_limit_exceeded"},
+                explicit_overage,
+            ),
+            (
+                "usage-wording",
+                {"type": "usage_limit_exceeded"},
+                "Monthly usage limit exceeded; this request has 140000 tokens above the 128000-token context window.",
+            ),
+            (
+                "balance-diagnostic",
+                {"type": "account_balance_error"},
+                explicit_overage,
+            ),
+            (
+                "balance-wording",
+                {"code": "account_balance_error"},
+                "Account balance is too low; input token count 140000 exceeds the model context limit of 128000.",
+            ),
+            ("busy-diagnostic", {"code": "server_busy"}, explicit_overage),
+            (
+                "busy-wording",
+                {"type": "server_busy"},
+                "Server is busy; prompt token count 140000 exceeds the model context window of 128000.",
+            ),
+            (
+                "mixed-trusted-and-unknown",
+                {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                },
+                explicit_overage,
+            ),
+        )
+        for name, identity, message in cases:
+            with self.subTest(name=name):
+                llm = self.llm_with_response(
+                    400,
+                    {"error": {"message": message, **identity}},
+                )
+                with self.assertRaises(StoryAnalysisError) as raised:
+                    await llm.complete_json("system", "private novel", "story_map")
+                self.assertNotIsInstance(raised.exception, ContextLimitError)
+                self.assertEqual(llm.request_count, 1)
 
     async def test_auth_forbidden_and_not_found_never_classify_as_context_limit(self):
         # Catches misleading provider fields activating source chunking/resend.
@@ -1120,10 +1204,23 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 llm = self.llm_with_response(
                     400,
-                    {"error": {"message": message, "code": 400}},
+                    {"error": {"message": message}},
                 )
                 with self.assertRaises(ContextLimitError):
                     await llm.complete_json("system", "private novel", "story_map")
+
+        llm = self.llm_with_response(
+            400,
+            {
+                "error": {
+                    "message": messages[0],
+                    "type": "  ",
+                    "code": "",
+                }
+            },
+        )
+        with self.assertRaises(ContextLimitError):
+            await llm.complete_json("system", "private novel", "story_map")
 
     async def test_empty_or_malformed_success_and_413_are_typed_non_context_errors(self):
         # Characterizes empty/malformed provider bodies without inventing context fallback.
@@ -1207,7 +1304,6 @@ class StructuredLLMTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "error": {
                                     "message": "maximum context length exceeded",
-                                    "type": "invalid_request_error",
                                     "code": "context_length_exceeded",
                                 }
                             }
