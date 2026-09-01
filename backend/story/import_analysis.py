@@ -43,10 +43,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         story_cfg = cfg["story"]
         max_bytes = int(float(story_cfg["max_source_mb"]) * 1024 * 1024)
         analysis_directory = Path(str(story_cfg["analysis_dir"]))
+        candidate_directory = Path(str(story_cfg["candidate_dir"]))
         if not analysis_directory.is_absolute():
             analysis_directory = PROJECT_ROOT / analysis_directory
+        if not candidate_directory.is_absolute():
+            candidate_directory = PROJECT_ROOT / candidate_directory
         importer = OfflineAnalysisImporter(
-            StorySourceLoader(max_bytes=max_bytes), AnalysisStore(analysis_directory)
+            StorySourceLoader(max_bytes=max_bytes),
+            AnalysisStore(analysis_directory),
+            candidate_directory=candidate_directory,
         )
         dlc_version = dlc_provenance(cfg, project_root=PROJECT_ROOT)
         if arguments.action == "validate":
@@ -65,7 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dlc_version=dlc_version,
             )
             status = "imported"
-    except (AnalysisStoreError, KeyError, OfflineAnalysisError, OSError, TypeError, ValueError):
+    except (AnalysisStoreError, KeyError, OfflineAnalysisError, OSError, OverflowError, RecursionError, TypeError, UnicodeError, ValueError):
         print("offline analysis failed", file=sys.stderr)
         return 1
 

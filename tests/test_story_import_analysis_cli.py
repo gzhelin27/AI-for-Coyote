@@ -17,10 +17,12 @@ class OfflineAnalysisCliTests(unittest.TestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         self.project_root = Path(self.temporary_directory.name)
         self.source_path = self.project_root / "novel.txt"
-        self.candidate_path = self.project_root / "candidate.json"
+        self.candidate_directory = self.project_root / "data" / "story_candidates"
+        self.candidate_directory.mkdir(parents=True)
+        self.candidate_path = self.candidate_directory / "candidate.json"
         self.source_text = "Alpha\nBeta"
         self.source_path.write_text(self.source_text, encoding="utf-8")
-        source_hash = hashlib.sha256(self.source_path.read_bytes()).hexdigest()
+        source_hash = hashlib.sha256(self.source_text.encode("utf-8")).hexdigest()
         self.candidate_path.write_text(
             json.dumps(
                 {
@@ -51,7 +53,11 @@ class OfflineAnalysisCliTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.cfg = {
-            "story": {"max_source_mb": 1, "analysis_dir": "data/story_analysis"},
+            "story": {
+                "max_source_mb": 1,
+                "analysis_dir": "data/story_analysis",
+                "candidate_dir": "data/story_candidates",
+            },
             "character": {"role": "role", "profile": "profile", "prompt": "local only"},
             "timeline": {"waveform_policy": "all_allowed"},
         }
@@ -94,6 +100,20 @@ class OfflineAnalysisCliTests(unittest.TestCase):
                 self.assertNotEqual(status, 0)
                 self.assertIn(expected, stderr)
                 self.assertNotIn("PRIVATE-NOVEL-EXCERPT", stdout + stderr)
+
+    def test_cli_rejects_candidate_outside_local_candidate_directory(self):
+        outside = self.project_root / "outside.json"
+        outside.write_text(
+            self.candidate_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+        status, stdout, stderr = self._run(
+            "validate", "--source", str(self.source_path), "--map", str(outside)
+        )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "offline analysis failed\n")
 
     def _run(self, *argv: str) -> tuple[int, str, str]:
         stdout = io.StringIO()

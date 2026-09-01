@@ -145,6 +145,21 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual(second.status, "missing")
         self.assertIsNone(second.story_map)
 
+    def test_inspect_quarantines_huge_pace_without_leaking_overflow(self):
+        store = AnalysisStore(self.cache_directory)
+        store.save(self.key, self.scene_map)
+        cache_path = store.cache_path(self.key)
+        cache_path.write_text(
+            cache_path.read_text(encoding="utf-8").replace('"pace":1.0', '"pace":' + "9" * 1000),
+            encoding="utf-8",
+        )
+
+        first = store.inspect(self.key)
+        second = store.inspect(self.key)
+
+        self.assertEqual(first.status, "invalid")
+        self.assertEqual(second.status, "missing")
+
     def test_load_rejects_unknown_fields_future_schema_without_using_them(self):
         store = AnalysisStore(self.cache_directory)
         store.save(self.key, self.scene_map)
@@ -204,9 +219,12 @@ class AnalysisStoreTests(unittest.TestCase):
     def test_scene_pace_rejects_non_positive_non_finite_and_boolean_values(self):
         scene = self.scene_map.chapters[0].scenes[0]
 
-        for invalid_pace in (0, -1, math.nan, math.inf, -math.inf, True):
+        for invalid_pace in (0, -1, 0.249, 4.001, 10**1000, math.nan, math.inf, -math.inf, True):
             with self.subTest(invalid_pace=invalid_pace), self.assertRaises(ValueError):
                 replace(scene, pace=invalid_pace)
+
+        self.assertEqual(replace(scene, pace=0.25).pace, 0.25)
+        self.assertEqual(replace(scene, pace=4.0).pace, 4.0)
 
     def test_maps_reject_empty_summaries_and_empty_collections(self):
         chapter = self.scene_map.chapters[0]
@@ -220,6 +238,10 @@ class AnalysisStoreTests(unittest.TestCase):
             replace(chapter, summary="")
         with self.assertRaises(ValueError):
             replace(chapter, summary=" \t\n")
+        with self.assertRaises(ValueError):
+            replace(scene, summary="\ud800")
+        with self.assertRaises(ValueError):
+            replace(chapter, title="\ud800")
         with self.assertRaises(ValueError):
             replace(chapter, scenes=())
         with self.assertRaises(ValueError):

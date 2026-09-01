@@ -109,7 +109,7 @@ class AnalysisStore:
                     object_pairs_hook=_reject_duplicate_object,
                 )
                 return AnalysisLookup("ready", self._decode_document(document, key))
-            except (json.JSONDecodeError, UnicodeDecodeError, _CacheValidationError):
+            except (json.JSONDecodeError, UnicodeError, RecursionError, OverflowError, ValueError, _CacheValidationError):
                 if self._quarantine(cache_path, identity):
                     return AnalysisLookup("invalid", None)
                 return AnalysisLookup("missing", None)

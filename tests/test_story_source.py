@@ -25,7 +25,7 @@ _MULTILINGUAL_TEXTS = ("中文", "😊", "Привет", "café")
 
 
 class StorySourceTests(unittest.TestCase):
-    def test_txt_normalizes_newlines_and_hashes_original_bytes(self):
+    def test_txt_normalizes_newlines_and_hashes_normalized_text(self):
         original = "甲\r\n乙".encode("utf-8")
 
         imported = self._load_with_encoding("novel.txt", original, "utf-8")
@@ -35,7 +35,7 @@ class StorySourceTests(unittest.TestCase):
         self.assertEqual(imported.extension, ".txt")
         self.assertEqual(
             imported.source_sha256,
-            hashlib.sha256("甲\r\n乙".encode("utf-8")).hexdigest(),
+            hashlib.sha256("甲\n乙".encode("utf-8")).hexdigest(),
         )
         self.assertEqual(imported.original_bytes, original)
         with self.assertRaises(FrozenInstanceError):
@@ -49,8 +49,45 @@ class StorySourceTests(unittest.TestCase):
         self.assertEqual(imported.text, "第一章\n第二章")
         self.assertEqual(
             imported.source_sha256,
-            hashlib.sha256(original).hexdigest(),
+            hashlib.sha256("第一章\n第二章".encode("utf-8")).hexdigest(),
         )
+
+    def test_equivalent_normalized_text_has_one_identity_across_line_endings_bom_and_encoding(self):
+        loader = StorySourceLoader(max_bytes=1024)
+        variants = (
+            ("lf", "第一章\n正文".encode("utf-8"), "utf-8"),
+            ("crlf", "第一章\r\n正文".encode("utf-8"), "utf-8"),
+            ("bom", b"\xef\xbb\xbf" + "第一章\n正文".encode("utf-8"), "auto"),
+            ("gb18030", "第一章\n正文".encode("gb18030"), "gb18030"),
+        )
+
+        imported = [
+            loader.load(f"{name}.txt", payload, encoding=encoding)
+            for name, payload, encoding in variants
+        ]
+
+        self.assertEqual({story.text for story in imported}, {"第一章\n正文"})
+        self.assertEqual(len({story.source_sha256 for story in imported}), 1)
+        self.assertEqual(imported[0].original_bytes, variants[0][1])
+        self.assertNotEqual(imported[0].original_bytes, imported[1].original_bytes)
+
+    def test_docx_container_metadata_does_not_change_normalized_text_identity(self):
+        first = io.BytesIO()
+        second = io.BytesIO()
+        document = Document()
+        document.add_paragraph("第一章")
+        document.add_paragraph("正文")
+        document.save(first)
+        document.core_properties.author = "Different container metadata"
+        document.save(second)
+
+        loader = StorySourceLoader(max_bytes=1024 * 1024)
+        imported_first = loader.load("first.docx", first.getvalue())
+        imported_second = loader.load("second.docx", second.getvalue())
+
+        self.assertEqual(imported_first.text, "第一章\n正文")
+        self.assertEqual(imported_first.source_sha256, imported_second.source_sha256)
+        self.assertNotEqual(imported_first.original_bytes, imported_second.original_bytes)
 
     def test_story_source_encoding_options_are_public(self):
         encoding_type = getattr(story_domain, "StorySourceEncoding", None)
@@ -144,7 +181,10 @@ class StorySourceTests(unittest.TestCase):
 
         self.assertEqual(imported.text, "第一章\n雨落在窗前。\n第二章\n门在黎明前打开。")
         self.assertEqual(imported.extension, ".docx")
-        self.assertEqual(imported.source_sha256, hashlib.sha256(original).hexdigest())
+        self.assertEqual(
+            imported.source_sha256,
+            hashlib.sha256(imported.text.encode("utf-8")).hexdigest(),
+        )
 
     def test_docx_rejects_plain_text_encoding_override(self):
         original = self._generated_docx_bytes()
@@ -275,6 +315,7 @@ class StoryConfigurationTests(unittest.TestCase):
             {
                 "import_dir": "data/stories",
                 "analysis_dir": "data/story_analysis",
+                "candidate_dir": "data/story_candidates",
                 "max_source_mb": 2,
                 "analysis_prompt_version": "faithful-v1",
                 "reading_speed_cpm": {"slow": 250, "standard": 400, "fast": 600},
@@ -288,6 +329,7 @@ class StoryConfigurationTests(unittest.TestCase):
                 "story": {
                     "import_dir": "data\\stories\\imports",
                     "analysis_dir": "data/analysis/cache",
+                    "candidate_dir": "data/story_candidates/custom",
                     "max_source_mb": 2.5,
                     "analysis_prompt_version": " faithful-v2 ",
                     "reading_speed_cpm": {"slow": 250.0, "standard": 401.5, "fast": 600.0},
@@ -297,6 +339,7 @@ class StoryConfigurationTests(unittest.TestCase):
 
         self.assertEqual(config["story"]["import_dir"], "data/stories/imports")
         self.assertEqual(config["story"]["analysis_dir"], "data/analysis/cache")
+        self.assertEqual(config["story"]["candidate_dir"], "data/story_candidates/custom")
         self.assertEqual(config["story"]["max_source_mb"], 2.5)
         self.assertEqual(config["story"]["analysis_prompt_version"], "faithful-v2")
         self.assertEqual(
@@ -318,6 +361,7 @@ class StoryConfigurationTests(unittest.TestCase):
             {"reading_speed_cpm": {"slow": 250, "standard": float("inf"), "fast": 600}},
             {"import_dir": "../stories"},
             {"analysis_dir": "C:\\story-analysis"},
+            {"candidate_dir": "../story-candidates"},
             {"import_dir": "stories/imports"},
             {"analysis_dir": "data"},
             {"import_dir": ""},

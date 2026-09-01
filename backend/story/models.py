@@ -8,7 +8,12 @@ import math
 
 @dataclass(frozen=True)
 class ImportedStory:
-    """A validated local source and its normalized text representation."""
+    """A validated local source and its normalized text representation.
+
+    ``source_sha256`` names the SHA-256 digest of normalized UTF-8 text, not
+    the original container bytes. ``original_bytes`` remains available for
+    archive persistence and source-format handling.
+    """
 
     filename: str
     extension: str
@@ -20,6 +25,20 @@ class ImportedStory:
 def _require_non_empty_text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise ValueError(f"{name} must be valid UTF-8 text") from exc
+    return value
+
+
+def _require_utf8_string(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise ValueError(f"{name} must be valid UTF-8 text") from exc
     return value
 
 
@@ -35,14 +54,16 @@ def _require_offset(value: object, name: str) -> int:
     return value
 
 
-def _require_positive_finite_number(value: object, name: str) -> float | int:
+def _require_story_pace(value: object, name: str) -> float | int:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
     ):
-        raise ValueError(f"{name} must be a finite positive number")
+        raise ValueError(f"{name} must be a finite number from 0.25 to 4.0")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number from 0.25 to 4.0")
+    if value < 0.25 or value > 4.0:
+        raise ValueError(f"{name} must be from 0.25 to 4.0")
     return value
 
 
@@ -69,7 +90,7 @@ class StoryScene:
         if start_offset >= end_offset:
             raise ValueError("scene offsets must be increasing")
         _require_non_empty_text(self.summary, "scene summary")
-        _require_positive_finite_number(self.pace, "scene pace")
+        _require_story_pace(self.pace, "scene pace")
 
     @staticmethod
     def stable_id(source_hash: str, chapter_index: int, scene_index: int) -> str:
@@ -100,8 +121,7 @@ class StoryChapter:
         end_offset = _require_offset(self.end_offset, "chapter end offset")
         if start_offset >= end_offset:
             raise ValueError("chapter offsets must be increasing")
-        if not isinstance(self.title, str):
-            raise ValueError("chapter title must be a string")
+        _require_utf8_string(self.title, "chapter title")
         _require_non_empty_text(self.summary, "chapter summary")
         if not isinstance(self.scenes, tuple) or not self.scenes:
             raise ValueError("chapter scenes must be a non-empty tuple")

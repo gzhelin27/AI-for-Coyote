@@ -64,7 +64,7 @@ class StorySourceLoader:
             extension=extension,
             original_bytes=original_bytes,
             text=text,
-            source_sha256=hashlib.sha256(original_bytes).hexdigest(),
+            source_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         )
 
     def _source_name(self, filename: str) -> tuple[str, str]:

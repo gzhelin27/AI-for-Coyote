@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
+import stat
 
 from .analysis_store import AnalysisStore
 from .models import AnalysisKey, ImportedStory, StoryChapter, StoryMap, StoryScene
@@ -48,13 +50,20 @@ def offline_analysis_key(story: ImportedStory, dlc_version: str) -> AnalysisKey:
 class OfflineAnalysisImporter:
     """Load a real source, strictly validate a candidate, then atomically save it."""
 
-    def __init__(self, source_loader: StorySourceLoader, store: AnalysisStore) -> None:
+    def __init__(
+        self,
+        source_loader: StorySourceLoader,
+        store: AnalysisStore,
+        *,
+        candidate_directory: Path,
+    ) -> None:
         if not isinstance(source_loader, StorySourceLoader):
             raise TypeError("source_loader must be a StorySourceLoader")
         if not isinstance(store, AnalysisStore):
             raise TypeError("store must be an AnalysisStore")
         self._source_loader = source_loader
         self._store = store
+        self._candidate_directory = Path(candidate_directory)
 
     def validate(
         self,
@@ -97,12 +106,14 @@ class OfflineAnalysisImporter:
         except (OSError, StorySourceError, TypeError, ValueError) as exc:
             raise OfflineAnalysisError("story source could not be loaded") from exc
 
-    @staticmethod
-    def _read_candidate(candidate_path: Path) -> dict[str, object]:
+    def _read_candidate(self, candidate_path: Path) -> dict[str, object]:
+        identity = self._candidate_identity(candidate_path)
         try:
             payload = candidate_path.read_bytes()
-        except OSError as exc:
+        except (OSError, UnicodeError, RecursionError) as exc:
             raise OfflineAnalysisError("candidate file could not be read") from exc
+        if _regular_file_identity(candidate_path) != identity:
+            raise OfflineAnalysisError("candidate file changed while reading")
         if len(payload) > _MAX_CANDIDATE_BYTES:
             raise OfflineAnalysisError("candidate file exceeds the size limit")
         try:
@@ -111,10 +122,31 @@ class OfflineAnalysisImporter:
                 object_pairs_hook=_reject_duplicate_object,
                 parse_constant=_reject_json_constant,
             )
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        except (UnicodeError, json.JSONDecodeError, RecursionError, OverflowError, ValueError) as exc:
             raise OfflineAnalysisError("candidate JSON is invalid") from exc
-        _validate_json_shape(decoded)
+        try:
+            _validate_json_shape(decoded)
+        except (UnicodeError, RecursionError, OverflowError, ValueError) as exc:
+            raise OfflineAnalysisError("candidate JSON is invalid") from exc
         return _exact_object(decoded, _MAP_KEYS, "candidate")
+
+    def _candidate_identity(self, candidate_path: Path) -> tuple[int, int]:
+        try:
+            candidate_path.relative_to(self._candidate_directory)
+        except ValueError as exc:
+            raise OfflineAnalysisError("candidate file is outside the configured directory") from exc
+        if _contains_redirect(self._candidate_directory) or _contains_redirect(candidate_path):
+            raise OfflineAnalysisError("candidate path contains a filesystem redirect")
+        identity = _regular_file_identity(candidate_path)
+        if identity is None:
+            raise OfflineAnalysisError("candidate file is not a regular file")
+        try:
+            candidate_path.resolve(strict=True).relative_to(
+                self._candidate_directory.resolve(strict=True)
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise OfflineAnalysisError("candidate file is outside the configured directory") from exc
+        return identity
 
     @staticmethod
     def _decode_candidate(candidate: dict[str, object], story: ImportedStory) -> StoryMap:
@@ -135,7 +167,7 @@ class OfflineAnalysisImporter:
                 text_length=text_length,
                 chapters=decoded_chapters,
             )
-        except (TypeError, ValueError, OfflineAnalysisError) as exc:
+        except (TypeError, UnicodeError, RecursionError, OverflowError, ValueError, OfflineAnalysisError) as exc:
             if isinstance(exc, OfflineAnalysisError):
                 raise
             raise OfflineAnalysisError("candidate story map is invalid") from exc
@@ -200,10 +232,14 @@ def _validate_json_shape(root: object) -> None:
             raise OfflineAnalysisError("candidate JSON exceeds the nesting limit")
         if isinstance(current, dict):
             members += len(current)
-            pending.extend((value, depth + 1) for value in current.values())
+            for key, value in current.items():
+                key.encode("utf-8", "strict")
+                pending.append((value, depth + 1))
         elif isinstance(current, list):
             members += len(current)
             pending.extend((value, depth + 1) for value in current)
+        elif isinstance(current, str):
+            current.encode("utf-8", "strict")
         if members > _MAX_JSON_MEMBERS:
             raise OfflineAnalysisError("candidate JSON exceeds the member limit")
 
@@ -242,10 +278,12 @@ def _required_pace(value: object, name: str) -> float | int:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
     ):
-        raise OfflineAnalysisError(f"{name} must be a finite positive number")
+        raise OfflineAnalysisError(f"{name} must be a finite number from 0.25 to 4.0")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise OfflineAnalysisError(f"{name} must be a finite number from 0.25 to 4.0")
+    if value < 0.25 or value > 4.0:
+        raise OfflineAnalysisError(f"{name} must be from 0.25 to 4.0")
     return value
 
 
@@ -253,3 +291,33 @@ def _required_identity(value: object, name: str) -> str:
     if not isinstance(value, str) or not (identity := value.strip()):
         raise OfflineAnalysisError(f"{name} must be a non-empty string")
     return identity
+
+
+def _regular_file_identity(path: Path) -> tuple[int, int] | None:
+    if _is_redirect(path):
+        return None
+    try:
+        details = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(details.st_mode):
+        return None
+    return details.st_dev, details.st_ino
+
+
+def _contains_redirect(path: Path) -> bool:
+    return any(_is_redirect(candidate) for candidate in (path.absolute(), *path.absolute().parents))
+
+
+def _is_redirect(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        details = os.lstat(path)
+    except OSError:
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    return bool(getattr(details, "st_file_attributes", 0) & reparse_point)

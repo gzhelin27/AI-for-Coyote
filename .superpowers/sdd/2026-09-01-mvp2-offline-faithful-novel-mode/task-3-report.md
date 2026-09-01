@@ -53,3 +53,30 @@ Implemented and committed as `feat: import Codex story analysis offline`.
 - CLI success output contains identity/count fields only; errors use a fixed redacted message and do not emit source text.
 - No external model, network, device action, push, or tag was invoked.
 - Candidate JSON limits are deliberately fixed at 1 MiB, depth 32, and 10,000 aggregate members. Very large but otherwise valid analysis maps must be split into a smaller candidate representation rather than weakening the import boundary.
+
+## Fix round 1/5
+
+### RED evidence
+
+- New source-identity tests failed while `source_sha256` used original bytes: LF/CRLF, BOM, GB18030, and DOCX metadata-equivalent content produced different identities.
+- Candidate-directory tests failed because `OfflineAnalysisImporter` did not accept or enforce `candidate_directory`; CLI accepted arbitrary files.
+- Huge integer pace tests exposed `OverflowError` from `math.isfinite`; cache inspection did not quarantine the corrupt entry.
+- Escaped surrogate and model-string tests showed Python strings could pass validation without strict UTF-8 round-tripping.
+- Pace tests showed 0.249 and 4.001 were accepted before the shared model range was imposed.
+
+### GREEN evidence
+
+- `tests.test_story_source tests.test_story_offline_analysis tests.test_story_analysis_store tests.test_story_import_analysis_cli`: 70 passed, 2 skipped only where symlink privilege is unavailable.
+- `tests.test_app_state_timeline`: 20 passed.
+- `compileall -q backend tests` and `git diff --check` exited 0.
+
+### Fixes
+
+- `ImportedStory.source_sha256` now documents and computes SHA-256 over normalized UTF-8 `text`; raw source bytes remain intact.
+- Added and validated `story.candidate_dir`, with importer- and CLI-level regular-file, containment, symlink, junction, reparse-point, and read-race checks.
+- Bounded shared `StoryScene.pace` to inclusive 0.25–4.0 and converted untrusted Unicode/numeric/decode exceptions into typed importer, CLI, or cache-inspection outcomes.
+- Enforced strict UTF-8 round-tripping for candidate and model strings.
+
+### Residual risk
+
+- Candidate files must now be copied beneath `data/story_candidates/`; external paths are intentionally rejected. Windows symlink tests remain environment-skipped when the OS denies symlink creation, while the junction test passes.

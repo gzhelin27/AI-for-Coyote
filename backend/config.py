@@ -79,6 +79,7 @@ DEFAULTS = {
     "story": {
         "import_dir": "data/stories",
         "analysis_dir": "data/story_analysis",
+        "candidate_dir": "data/story_candidates",
         "max_source_mb": 20,
         "analysis_prompt_version": "faithful-v1",
         "reading_speed_cpm": {"slow": 250, "standard": 400, "fast": 600},
@@ -226,12 +227,13 @@ def _validate_story_config(cfg: Config) -> None:
     if not isinstance(story, dict):
         raise ValueError("story must be an object")
     expected_keys = {
-        "import_dir", "analysis_dir", "max_source_mb", "analysis_prompt_version", "reading_speed_cpm",
+        "import_dir", "analysis_dir", "candidate_dir", "max_source_mb", "analysis_prompt_version", "reading_speed_cpm",
     }
     if set(story) != expected_keys:
         raise ValueError("story contains unknown or missing configuration keys")
     story["import_dir"] = _safe_local_story_path(story.get("import_dir"), "story import_dir")
     story["analysis_dir"] = _safe_local_story_path(story.get("analysis_dir"), "story analysis_dir")
+    story["candidate_dir"] = _safe_local_story_path(story.get("candidate_dir"), "story candidate_dir")
     story["max_source_mb"] = _positive_story_number(story.get("max_source_mb"), "story max_source_mb")
     prompt_version = story.get("analysis_prompt_version")
     if not isinstance(prompt_version, str) or not (prompt_version := prompt_version.strip()):
