@@ -52,6 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             StorySourceLoader(max_bytes=max_bytes),
             AnalysisStore(analysis_directory),
             candidate_directory=candidate_directory,
+            project_root=PROJECT_ROOT,
         )
         dlc_version = dlc_provenance(cfg, project_root=PROJECT_ROOT)
         if arguments.action == "validate":

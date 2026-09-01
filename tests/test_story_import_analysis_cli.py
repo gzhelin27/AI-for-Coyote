@@ -2,6 +2,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -114,6 +115,26 @@ class OfflineAnalysisCliTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "offline analysis failed\n")
+
+    def test_relative_map_is_resolved_from_project_root_not_current_directory(self):
+        elsewhere = self.project_root / "elsewhere"
+        elsewhere.mkdir()
+        previous_directory = Path.cwd()
+        try:
+            os.chdir(elsewhere)
+            status, stdout, stderr = self._run(
+                "validate",
+                "--source",
+                str(self.source_path),
+                "--map",
+                "data/story_candidates/candidate.json",
+            )
+        finally:
+            os.chdir(previous_directory)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("status=validated", stdout)
 
     def _run(self, *argv: str) -> tuple[int, str, str]:
         stdout = io.StringIO()

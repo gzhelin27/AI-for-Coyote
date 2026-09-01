@@ -8,6 +8,9 @@ import math
 import os
 from pathlib import Path
 import stat
+from typing import BinaryIO
+
+from backend.timeline.replay_store import _opened_final_path
 
 from .analysis_store import AnalysisStore
 from .models import AnalysisKey, ImportedStory, StoryChapter, StoryMap, StoryScene
@@ -56,6 +59,7 @@ class OfflineAnalysisImporter:
         store: AnalysisStore,
         *,
         candidate_directory: Path,
+        project_root: Path,
     ) -> None:
         if not isinstance(source_loader, StorySourceLoader):
             raise TypeError("source_loader must be a StorySourceLoader")
@@ -63,7 +67,11 @@ class OfflineAnalysisImporter:
             raise TypeError("store must be an AnalysisStore")
         self._source_loader = source_loader
         self._store = store
-        self._candidate_directory = Path(candidate_directory)
+        self._project_root = _absolute_lexical_path(Path(project_root))
+        configured_directory = Path(candidate_directory)
+        if not configured_directory.is_absolute():
+            configured_directory = self._project_root / configured_directory
+        self._candidate_directory = _absolute_lexical_path(configured_directory)
 
     def validate(
         self,
@@ -107,15 +115,14 @@ class OfflineAnalysisImporter:
             raise OfflineAnalysisError("story source could not be loaded") from exc
 
     def _read_candidate(self, candidate_path: Path) -> dict[str, object]:
-        identity = self._candidate_identity(candidate_path)
+        candidate_path = self._candidate_path(candidate_path)
+        candidate_file = self._open_verified_candidate(candidate_path)
         try:
-            payload = candidate_path.read_bytes()
-        except (OSError, UnicodeError, RecursionError) as exc:
+            payload = _read_bounded(candidate_file, _MAX_CANDIDATE_BYTES)
+        except (OSError, UnicodeError, RecursionError, OverflowError) as exc:
             raise OfflineAnalysisError("candidate file could not be read") from exc
-        if _regular_file_identity(candidate_path) != identity:
-            raise OfflineAnalysisError("candidate file changed while reading")
-        if len(payload) > _MAX_CANDIDATE_BYTES:
-            raise OfflineAnalysisError("candidate file exceeds the size limit")
+        finally:
+            candidate_file.close()
         try:
             decoded = json.loads(
                 payload.decode("utf-8"),
@@ -130,23 +137,65 @@ class OfflineAnalysisImporter:
             raise OfflineAnalysisError("candidate JSON is invalid") from exc
         return _exact_object(decoded, _MAP_KEYS, "candidate")
 
-    def _candidate_identity(self, candidate_path: Path) -> tuple[int, int]:
+    def _candidate_path(self, candidate_path: Path) -> Path:
+        if not candidate_path.is_absolute():
+            candidate_path = self._project_root / candidate_path
+        candidate_path = _absolute_lexical_path(candidate_path)
         try:
             candidate_path.relative_to(self._candidate_directory)
         except ValueError as exc:
             raise OfflineAnalysisError("candidate file is outside the configured directory") from exc
-        if _contains_redirect(self._candidate_directory) or _contains_redirect(candidate_path):
+        if _contains_redirect(candidate_path):
             raise OfflineAnalysisError("candidate path contains a filesystem redirect")
-        identity = _regular_file_identity(candidate_path)
-        if identity is None:
-            raise OfflineAnalysisError("candidate file is not a regular file")
+        return candidate_path
+
+    def _trusted_candidate_root(self) -> Path:
+        if _contains_redirect(self._project_root) or _contains_redirect(
+            self._candidate_directory
+        ):
+            raise OfflineAnalysisError("candidate path contains a filesystem redirect")
         try:
-            candidate_path.resolve(strict=True).relative_to(
-                self._candidate_directory.resolve(strict=True)
-            )
+            project_root = self._project_root.resolve(strict=True)
+            candidate_root = self._candidate_directory.resolve(strict=True)
+            candidate_root.relative_to(project_root)
         except (OSError, RuntimeError, ValueError) as exc:
             raise OfflineAnalysisError("candidate file is outside the configured directory") from exc
-        return identity
+        try:
+            if not candidate_root.is_dir():
+                raise OfflineAnalysisError("candidate directory is not a directory")
+        except OSError as exc:
+            raise OfflineAnalysisError("candidate directory could not be read") from exc
+        return candidate_root
+
+    def _open_verified_candidate(self, candidate_path: Path) -> BinaryIO:
+        trusted_root = self._trusted_candidate_root()
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        candidate_file: BinaryIO | None = None
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(candidate_path, flags)
+            candidate_file = os.fdopen(descriptor, "rb")
+            descriptor = None
+            opened = os.fstat(candidate_file.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise OfflineAnalysisError("candidate file is not a regular file")
+            opened_path = _opened_final_path(candidate_file)
+            opened_path.relative_to(trusted_root)
+            if _path_key(self._trusted_candidate_root()) != _path_key(trusted_root):
+                raise OfflineAnalysisError("candidate directory changed while opening")
+        except OfflineAnalysisError:
+            if candidate_file is not None:
+                candidate_file.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            raise
+        except (OSError, RuntimeError, UnicodeError, RecursionError, ValueError) as exc:
+            if candidate_file is not None:
+                candidate_file.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            raise OfflineAnalysisError("candidate file could not be safely opened") from exc
+        return candidate_file
 
     @staticmethod
     def _decode_candidate(candidate: dict[str, object], story: ImportedStory) -> StoryMap:
@@ -293,16 +342,29 @@ def _required_identity(value: object, name: str) -> str:
     return identity
 
 
-def _regular_file_identity(path: Path) -> tuple[int, int] | None:
-    if _is_redirect(path):
-        return None
-    try:
-        details = os.lstat(path)
-    except OSError:
-        return None
-    if not stat.S_ISREG(details.st_mode):
-        return None
-    return details.st_dev, details.st_ino
+def _absolute_lexical_path(path: Path) -> Path:
+    """Make an absolute path without resolving redirects."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _read_bounded(candidate_file: BinaryIO, maximum_size: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining = maximum_size + 1 - total
+        chunk = candidate_file.read(min(64 * 1024, remaining))
+        if chunk == b"":
+            return b"".join(chunks)
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise OSError("candidate file read did not return bytes")
+        total += len(chunk)
+        if total > maximum_size:
+            raise OfflineAnalysisError("candidate file exceeds the size limit")
+        chunks.append(bytes(chunk))
 
 
 def _contains_redirect(path: Path) -> bool:

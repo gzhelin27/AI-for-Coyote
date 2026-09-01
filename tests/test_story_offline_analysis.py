@@ -4,9 +4,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from backend.story.analysis_store import AnalysisStore
 import backend.story as story_domain
+import backend.story.offline_analysis as offline_analysis
 from backend.story.offline_analysis import (
     OFFLINE_ANALYSIS_VERSION,
     OFFLINE_PRODUCER,
@@ -45,7 +47,10 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
         )
         self.store = CountingAnalysisStore(root / "analysis")
         self.importer = OfflineAnalysisImporter(
-            self.loader, self.store, candidate_directory=self.candidate_directory
+            self.loader,
+            self.store,
+            candidate_directory=self.candidate_directory,
+            project_root=self.root,
         )
         self.candidate = self._valid_candidate()
         self._write_candidate(self.candidate)
@@ -147,6 +152,102 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
                 self.source_path, linked, encoding="utf-8", dlc_version="dlc1-v1"
             )
 
+    def test_validation_reads_the_opened_candidate_when_a_race_replaces_its_path(self):
+        attacker = self._valid_candidate()
+        attacker["chapters"][0]["scenes"][0]["summary"] = "目录外候选内容。"
+        outside = self.root / "outside.json"
+        outside.write_text(json.dumps(attacker, ensure_ascii=False), encoding="utf-8")
+        held = self.root / "held-candidate.json"
+        original_read_bytes = Path.read_bytes
+        original_open = offline_analysis.os.open
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                self.candidate_path.replace(held)
+                outside.replace(self.candidate_path)
+                swapped = True
+
+        def read_bytes_with_race(path: Path) -> bytes:
+            if path == self.candidate_path:
+                replace_candidate()
+            return original_read_bytes(path)
+
+        def open_with_race(path, flags, *args, **kwargs):
+            descriptor = original_open(path, flags, *args, **kwargs)
+            if Path(path) == self.candidate_path:
+                try:
+                    replace_candidate()
+                except PermissionError as exc:
+                    os.close(descriptor)
+                    self.skipTest(f"opened files cannot be replaced on this platform: {exc}")
+            return descriptor
+
+        with patch.object(Path, "read_bytes", read_bytes_with_race), patch.object(
+            offline_analysis.os, "open", open_with_race
+        ):
+            result = self.importer.validate(
+                self.source_path,
+                self.candidate_path,
+                encoding="utf-8",
+                dlc_version="dlc1-v1",
+            )
+
+        self.assertTrue(swapped)
+        self.assertEqual(
+            result.story_map.chapters[0].scenes[0].summary, "章节标题出现。"
+        )
+
+    def test_validation_reads_the_opened_candidate_when_a_race_swaps_to_symlink(self):
+        outside = self.root / "outside.json"
+        attacker = self._valid_candidate()
+        attacker["chapters"][0]["scenes"][0]["summary"] = "目录外符号链接内容。"
+        outside.write_text(json.dumps(attacker, ensure_ascii=False), encoding="utf-8")
+        original_read_bytes = Path.read_bytes
+        original_open = offline_analysis.os.open
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                self.candidate_path.unlink()
+                try:
+                    self.candidate_path.symlink_to(outside)
+                except OSError as exc:
+                    self.skipTest(f"symlinks are unavailable: {exc}")
+                swapped = True
+
+        def read_bytes_with_race(path: Path) -> bytes:
+            if path == self.candidate_path:
+                replace_candidate()
+            return original_read_bytes(path)
+
+        def open_with_race(path, flags, *args, **kwargs):
+            descriptor = original_open(path, flags, *args, **kwargs)
+            if Path(path) == self.candidate_path:
+                try:
+                    replace_candidate()
+                except PermissionError as exc:
+                    os.close(descriptor)
+                    self.skipTest(f"opened files cannot be replaced on this platform: {exc}")
+            return descriptor
+
+        with patch.object(Path, "read_bytes", read_bytes_with_race), patch.object(
+            offline_analysis.os, "open", open_with_race
+        ):
+            result = self.importer.validate(
+                self.source_path,
+                self.candidate_path,
+                encoding="utf-8",
+                dlc_version="dlc1-v1",
+            )
+
+        self.assertTrue(swapped)
+        self.assertEqual(
+            result.story_map.chapters[0].scenes[0].summary, "章节标题出现。"
+        )
+
     def test_validation_rejects_junction_candidate_directory(self):
         if os.name != "nt":
             self.skipTest("junctions are a Windows-only filesystem feature")
@@ -164,7 +265,12 @@ class OfflineAnalysisImporterTests(unittest.TestCase):
         self.addCleanup(lambda: junction.rmdir() if junction.exists() else None)
         candidate = outside / "candidate.json"
         candidate.write_text(json.dumps(self._valid_candidate()), encoding="utf-8")
-        importer = OfflineAnalysisImporter(self.loader, self.store, candidate_directory=junction)
+        importer = OfflineAnalysisImporter(
+            self.loader,
+            self.store,
+            candidate_directory=junction,
+            project_root=self.root,
+        )
 
         with self.assertRaises(OfflineAnalysisError):
             importer.validate(

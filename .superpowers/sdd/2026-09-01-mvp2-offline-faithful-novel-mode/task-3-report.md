@@ -80,3 +80,26 @@ Implemented and committed as `feat: import Codex story analysis offline`.
 ### Residual risk
 
 - Candidate files must now be copied beneath `data/story_candidates/`; external paths are intentionally rejected. Windows symlink tests remain environment-skipped when the OS denies symlink creation, while the junction test passes.
+
+## Fix round 2/5
+
+### RED evidence
+
+- `D:\AI-for-Coyote\.venv\Scripts\python.exe -m unittest tests.test_story_offline_analysis tests.test_story_import_analysis_cli -v` failed before the implementation: a `data/story_candidates/candidate.json` map was rejected after changing CWD, and a controlled pathname replacement raised `OfflineAnalysisError("candidate file changed while reading")` rather than retaining the already-opened candidate.
+
+### GREEN evidence
+
+- Focused source/store/importer/CLI/AppState-provenance suite: 93 passed, 4 skipped only for unavailable Windows symlink privilege or Windows' non-replaceable opened-file semantics.
+- Full `unittest discover -s tests -q` suite passed (444 tests, 4 platform skips).
+- `D:\AI-for-Coyote\.venv\Scripts\python.exe -m compileall -q backend tests` and `git diff --check` exited 0.
+
+### Fixes
+
+- Resolve relative candidate map paths lexically from the explicit repository `project_root`, so CLI `--map data/story_candidates/<hash>.json` is independent of the calling CWD.
+- Open a candidate exactly once, validate its `fstat` regular-file type and the kernel-resolved opened-handle target against a stable trusted candidate-root snapshot, then read only that handle with a fixed byte limit. Redirected or changed roots fail closed; unavailable opened-handle resolution is surfaced as the typed offline-import error.
+- Added deterministic CWD and pathname-swap regressions, including a symlink-swap case when the platform permits it.
+
+### Self-review and residual risk
+
+- The importer no longer relies on a check/read/check identity comparison. On this Windows host the C runtime denies replacement of an already-opened file, so the two true replacement-race tests skip after documenting that OS behavior; on replace-capable platforms they exercise the verified-handle read path. The existing Windows junction regression passes and static symlink coverage remains privilege-gated.
+- No external model, network, device action, push, or tag was invoked.
