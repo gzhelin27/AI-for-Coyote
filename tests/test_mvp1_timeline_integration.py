@@ -303,7 +303,7 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
         reconciliation_returned = asyncio.Event()
         normal_queued = asyncio.Event()
         normal_channel_task = None
-        attempts_at_report_acceptance = None
+        b_normal_attempt_baseline = None
 
         async def block_b_channel(snapshot):
             blocker_started.set()
@@ -318,10 +318,8 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
         original_run_locked = harness.loop.output_coordinator._run_channel_locked
 
         async def observe_reconcile(*args, **kwargs):
-            nonlocal attempts_at_report_acceptance
             reconciliation_started.set()
             result = await original_reconcile(*args, **kwargs)
-            attempts_at_report_acceptance = len(harness.relay.attempts)
             reconciliation_returned.set()
             return result
 
@@ -355,6 +353,7 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ):
                 await asyncio.wait_for(blocker_started.wait(), timeout=1)
+                b_normal_attempt_baseline = len(harness.relay.attempts)
                 report = asyncio.create_task(
                     harness.loop.update_device_state(
                         {"intensityB": 30},
@@ -400,10 +399,10 @@ class MVP1IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 harness.loop.output_coordinator.confirmed("B").strength, 20
             )
-            self.assertIsNotNone(attempts_at_report_acceptance)
+            self.assertIsNotNone(b_normal_attempt_baseline)
             b_normal_waveforms = [
                 frame
-                for frame in harness.relay.attempts[attempts_at_report_acceptance:]
+                for frame in harness.relay.attempts[b_normal_attempt_baseline:]
                 for method, payload in (harness.relay._operation(frame),)
                 if method == "device.op"
                 and payload.get("t") == 0
