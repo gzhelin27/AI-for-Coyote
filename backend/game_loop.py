@@ -46,6 +46,7 @@ class _AutopilotTurnToken:
     generation: int | None
     busy_token: _TurnBusyToken
     action_origin: _AIActionOrigin
+    history_revision: int
 
 
 async def _await_owned_group(awaitables):
@@ -90,6 +91,7 @@ class GameLoop:
             )
 
         self.history: list[dict] = []          # [{"role","content"}]
+        self._history_revision = 0
         self.notes: list[str] = []             # 反馈按钮等系统备注，注入下一轮
         self.keep = int(cfg["log"]["history_keep"])
 
@@ -233,9 +235,13 @@ class GameLoop:
         return state
 
     # ---------- 用户回合 ----------
+    def _commit_history(self, history: list[dict]) -> None:
+        self.history = history
+        self._history_revision += 1
+
     def clear_history(self) -> None:
         """清空对话历史（模型上下文；页面消息记录由前端同步清）。"""
-        self.history.clear()
+        self._commit_history([])
         logger.info("对话历史已清空")
 
     def _character_for_turn(self) -> dict:
@@ -257,8 +263,8 @@ class GameLoop:
         action_origin = self._capture_ai_action_origin()
         character = self._character_for_turn()
 
-        self.history.append({"role": "user", "content": text})
-        self.history = self.history[-self.keep:]
+        user_history = [*self.history, {"role": "user", "content": text}]
+        self._commit_history(user_history[-self.keep:])
 
         busy_token = self._claim_turn_busy()
         try:
@@ -289,7 +295,9 @@ class GameLoop:
         finally:
             self._release_turn_busy(busy_token)
 
-        self.history.append({"role": "assistant", "content": line})
+        self._commit_history(
+            [*self.history, {"role": "assistant", "content": line}]
+        )
         return {"line": line, "executed": executed, "dropped": dropped, "error": error}
 
     # ---------- 画面辅助 ----------
@@ -314,8 +322,7 @@ class GameLoop:
                 "不要只调强度不给波形。不要等待玩家先说话。）"
             ),
         }
-        self.history.append(prompt_msg)
-        self.history = self.history[-self.keep:]
+        self._commit_history([*self.history, prompt_msg][-self.keep:])
         error = None
         busy_token = self._claim_turn_busy()
         try:
@@ -337,7 +344,9 @@ class GameLoop:
                 await self._apply_channel_floor()
         finally:
             self._release_turn_busy(busy_token)
-        self.history.append({"role": "assistant", "content": line})
+        self._commit_history(
+            [*self.history, {"role": "assistant", "content": line}]
+        )
         return {
             "line": line,
             "executed": executed,
@@ -401,8 +410,7 @@ class GameLoop:
                 "最后说一句台词接住他的状态。不要询问玩家，保持角色。）"
             ),
         }
-        self.history.append(prompt_msg)
-        self.history = self.history[-self.keep:]
+        self._commit_history([*self.history, prompt_msg][-self.keep:])
         busy_token = self._claim_turn_busy()
         try:
             try:
@@ -421,7 +429,9 @@ class GameLoop:
                 await self._apply_channel_floor()
         finally:
             self._release_turn_busy(busy_token)
-        self.history.append({"role": "assistant", "content": line})
+        self._commit_history(
+            [*self.history, {"role": "assistant", "content": line}]
+        )
         return {"line": line, "executed": executed, "dropped": dropped}
 
     # ---------- 自动运行（玩家不输入，AI 自主回合） ----------
@@ -825,10 +835,11 @@ class GameLoop:
                 "不要只调强度不给波形。不要等待玩家先说话。）"
             ),
         }
+        history_revision = self._history_revision
         turn_history = [*deepcopy(self.history), prompt_msg][-self.keep:]
         busy_token = self._claim_turn_busy()
         turn_token = self._capture_autopilot_turn_token(
-            action_origin, busy_token
+            action_origin, busy_token, history_revision
         )
         try:
             try:
@@ -839,7 +850,7 @@ class GameLoop:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("自动回合模型调用失败: %s", exc)
                 if self._autopilot_turn_is_current(turn_token):
-                    self.history = turn_history
+                    self._commit_history(turn_history)
                 return None
             if not self._autopilot_turn_is_current(turn_token):
                 return None
@@ -859,8 +870,9 @@ class GameLoop:
             turn_token, require_busy=False
         ):
             return None
-        self.history = turn_history
-        self.history.append({"role": "assistant", "content": line})
+        self._commit_history(
+            [*turn_history, {"role": "assistant", "content": line}]
+        )
         logger.info("自动回合台词: %s", line)
         result = {"line": line, "executed": executed, "dropped": dropped}
         if self.on_ai_turn:
@@ -874,6 +886,7 @@ class GameLoop:
         self,
         action_origin: _AIActionOrigin,
         busy_token: _TurnBusyToken,
+        history_revision: int,
     ) -> _AutopilotTurnToken:
         task = asyncio.current_task()
         generation = (
@@ -886,6 +899,7 @@ class GameLoop:
             generation=generation,
             busy_token=busy_token,
             action_origin=action_origin,
+            history_revision=history_revision,
         )
 
     def _autopilot_turn_is_current(
@@ -895,6 +909,8 @@ class GameLoop:
         require_busy: bool = True,
     ) -> bool:
         if require_busy and token.busy_token not in self._turn_busy_tokens:
+            return False
+        if token.history_revision != self._history_revision:
             return False
         if token.generation is None:
             return True

@@ -2037,6 +2037,70 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
         self.assertEqual(self.harness.store.list(), [])
 
+    async def test_chat_commit_invalidates_a_blocked_current_autopilot_turn(self):
+        autopilot_llm_started = asyncio.Event()
+        release_autopilot_llm = asyncio.Event()
+        chat_lines = []
+        llm_calls = 0
+
+        async def record_ai_turn(result):
+            chat_lines.append(result["line"])
+
+        async def blocked_autopilot_then_user(*_args, **_kwargs):
+            nonlocal llm_calls
+            llm_calls += 1
+            if llm_calls == 1:
+                autopilot_llm_started.set()
+                await release_autopilot_llm.wait()
+                return (
+                    "stale autopilot line",
+                    [{"op": "hold_strength", "channel": "A", "value": 40}],
+                )
+            return "user line", []
+
+        self.harness.loop.autopilot_interval = 0.001
+        self.harness.llm.chat.side_effect = blocked_autopilot_then_user
+        self.harness.loop.on_ai_turn = record_ai_turn
+        try:
+            started = await self.client.post("/api/session/start")
+            self.assertEqual(started.status_code, 200)
+            await asyncio.wait_for(autopilot_llm_started.wait(), timeout=0.2)
+            self.harness.loop.autopilot_interval = 3600
+
+            user_response = await self.client.post(
+                "/api/chat", json={"message": "user survives"}
+            )
+            expected_history = [
+                {"role": "user", "content": "user survives"},
+                {"role": "assistant", "content": "user line"},
+            ]
+            self.assertEqual(user_response.status_code, 200)
+            self.assertEqual(user_response.json()["line"], "user line")
+            self.assertEqual(self.harness.loop.history, expected_history)
+
+            release_autopilot_llm.set()
+
+            async def wait_for_autopilot_turn_to_settle():
+                while self.harness.loop.turn_busy:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(
+                wait_for_autopilot_turn_to_settle(), timeout=0.2
+            )
+            self.assertEqual(
+                (
+                    self.harness.loop.turn_count,
+                    self.harness.loop.history,
+                    chat_lines,
+                    self.harness.safety.current["A"],
+                ),
+                (1, expected_history, [], 0),
+            )
+        finally:
+            release_autopilot_llm.set()
+            with suppress(Exception):
+                await self.client.post("/api/session/stop")
+
     async def test_history_clear_finishes_live_session_before_mutation(self):
         started = await self.client.post("/api/session/start")
         self.assertEqual(started.status_code, 200)
