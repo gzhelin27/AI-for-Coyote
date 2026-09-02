@@ -764,12 +764,16 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
                 stubborn.late_action_finished.wait(), timeout=0.2
             )
 
-    async def test_retired_real_autopilot_turn_cannot_starve_or_clear_new_owner(self):
+    async def test_retired_real_autopilot_turn_cannot_starve_clear_or_mutate_new_owner(self):
         old_llm_started = asyncio.Event()
         old_cancellation_seen = asyncio.Event()
         release_old_llm = asyncio.Event()
         new_llm_started = asyncio.Event()
         release_new_llm = asyncio.Event()
+        chat_lines = []
+
+        async def record_ai_turn(result):
+            chat_lines.append(result["line"])
 
         async def cancellation_resistant_chat(*_args, **_kwargs):
             if not old_llm_started.is_set():
@@ -779,13 +783,17 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
                         await release_old_llm.wait()
                     except asyncio.CancelledError:
                         old_cancellation_seen.set()
-                return "retired timeline line", []
+                return (
+                    "retired timeline line",
+                    [{"op": "hold_strength", "channel": "A", "value": 40}],
+                )
             new_llm_started.set()
             await release_new_llm.wait()
             return "new timeline line", []
 
         self.harness.loop.autopilot_interval = 0.001
         self.harness.llm.chat.side_effect = cancellation_resistant_chat
+        self.harness.loop.on_ai_turn = record_ai_turn
         old_task = None
         new_task = None
         with patch("backend.game_loop.reload_character"):
@@ -825,9 +833,27 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(self.harness.loop.turn_busy)
 
+                shared_before_old_release = (
+                    self.harness.loop.turn_count,
+                    deepcopy(self.harness.loop.history),
+                    list(chat_lines),
+                    self.harness.safety.current["A"],
+                    self.harness.loop.turn_busy,
+                )
                 release_old_llm.set()
                 await asyncio.wait_for(old_task, timeout=0.2)
-                self.assertTrue(self.harness.loop.turn_busy)
+                shared_after_old_release = (
+                    self.harness.loop.turn_count,
+                    deepcopy(self.harness.loop.history),
+                    list(chat_lines),
+                    self.harness.safety.current["A"],
+                    self.harness.loop.turn_busy,
+                )
+                expected_shared_state = (0, [], [], 0, True)
+                self.assertEqual(
+                    (shared_before_old_release, shared_after_old_release),
+                    (expected_shared_state, expected_shared_state),
+                )
             finally:
                 release_old_llm.set()
                 with suppress(Exception):

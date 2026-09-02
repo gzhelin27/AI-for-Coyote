@@ -40,6 +40,14 @@ class _TurnBusyToken:
     generation: int
 
 
+@dataclass(frozen=True)
+class _AutopilotTurnToken:
+    task: asyncio.Task | None
+    generation: int | None
+    busy_token: _TurnBusyToken
+    action_origin: _AIActionOrigin
+
+
 async def _await_owned_group(awaitables):
     """Own every child through settlement before propagating an outcome."""
     tasks = tuple(asyncio.ensure_future(item) for item in awaitables)
@@ -104,6 +112,7 @@ class GameLoop:
         self.autopilot_interval = float(cfg.get("autopilot", {}).get("interval_s", 12))
         self.autopilot_task: asyncio.Task | None = None
         self.autopilot_stop = asyncio.Event()
+        self._autopilot_generation = 0
         self._retired_autopilot_tasks: set[asyncio.Task] = set()
         self._autopilot_transition_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
@@ -724,6 +733,7 @@ class GameLoop:
         if self.autopilot_task is None or self.autopilot_task.done():
             stop_event = asyncio.Event()
             self.autopilot_stop = stop_event
+            self._autopilot_generation += 1
             self.autopilot_task = asyncio.create_task(
                 self._autopilot_loop(stop_event)
             )
@@ -815,26 +825,41 @@ class GameLoop:
                 "不要只调强度不给波形。不要等待玩家先说话。）"
             ),
         }
-        self.history.append(prompt_msg)
-        self.history = self.history[-self.keep:]
+        turn_history = [*deepcopy(self.history), prompt_msg][-self.keep:]
         busy_token = self._claim_turn_busy()
+        turn_token = self._capture_autopilot_turn_token(
+            action_origin, busy_token
+        )
         try:
             try:
                 line, actions = await self.llm.chat(
-                    character, self.history, state,
+                    character, deepcopy(turn_history), state,
                     image_b64=self._latest_image(),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("自动回合模型调用失败: %s", exc)
+                if self._autopilot_turn_is_current(turn_token):
+                    self.history = turn_history
+                return None
+            if not self._autopilot_turn_is_current(turn_token):
                 return None
             self.turn_count += 1
             executed, dropped, timeline_managed = await self._execute_ai_actions(
                 actions, action_origin
             )
+            if not self._autopilot_turn_is_current(turn_token):
+                return None
             if not timeline_managed:
                 await self._apply_channel_floor()
+            if not self._autopilot_turn_is_current(turn_token):
+                return None
         finally:
             self._release_turn_busy(busy_token)
+        if not self._autopilot_turn_is_current(
+            turn_token, require_busy=False
+        ):
+            return None
+        self.history = turn_history
         self.history.append({"role": "assistant", "content": line})
         logger.info("自动回合台词: %s", line)
         result = {"line": line, "executed": executed, "dropped": dropped}
@@ -844,6 +869,58 @@ class GameLoop:
             except Exception:  # noqa: BLE001
                 logger.exception("自动回合推送失败")
         return result
+
+    def _capture_autopilot_turn_token(
+        self,
+        action_origin: _AIActionOrigin,
+        busy_token: _TurnBusyToken,
+    ) -> _AutopilotTurnToken:
+        task = asyncio.current_task()
+        generation = (
+            self._autopilot_generation
+            if task is self.autopilot_task
+            else None
+        )
+        return _AutopilotTurnToken(
+            task=task,
+            generation=generation,
+            busy_token=busy_token,
+            action_origin=action_origin,
+        )
+
+    def _autopilot_turn_is_current(
+        self,
+        token: _AutopilotTurnToken,
+        *,
+        require_busy: bool = True,
+    ) -> bool:
+        if require_busy and token.busy_token not in self._turn_busy_tokens:
+            return False
+        if token.generation is None:
+            return True
+        if (
+            not self.autopilot
+            or token.task is not self.autopilot_task
+            or token.generation != self._autopilot_generation
+        ):
+            return False
+        origin = token.action_origin
+        controller = self.timeline_session
+        if origin.controller is None:
+            return controller is None
+        if (
+            controller is not origin.controller
+            or controller.routing_generation != origin.routing_generation
+        ):
+            return False
+        session_state = controller.to_state()
+        if origin.mode is None:
+            return session_state.mode is None
+        return (
+            session_state.mode == origin.mode
+            and session_state.session_id == origin.session_id
+            and session_state.status.value == "running"
+        )
 
     def _capture_ai_action_origin(self) -> _AIActionOrigin:
         controller = self.timeline_session
