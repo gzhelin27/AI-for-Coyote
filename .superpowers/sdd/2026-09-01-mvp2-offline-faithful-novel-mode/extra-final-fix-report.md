@@ -222,3 +222,174 @@ git status --short
 - 如果第三方/故障 coroutine 永远不退出，retired task 会留在进程内集合直至事件循环终止；这是 asyncio 无法强制终止协作式 coroutine 的固有限制。它不再拥有 output/session generation，且 finish/stop/disconnect/estop/shutdown 不等待它。
 - 运行身份变更会让旧 identity 的 process-local analysis lookup 留在字典中但永远不可达；运行时设置变更通常低频，当前 extra-wave 不引入额外淘汰策略，以避免超出授权范围。
 - 完整后端的 5 项 skip 均为既有平台/权限条件；未执行网络、真实设备或外部安全审计。
+
+## Extra-wave fix round 1：retired 回合的 busy 所有权
+
+日期：2026-09-02
+
+复审起点：`0deb5b60d5c9155c6f731bec2844df02f0ee488f`
+
+修复提交：`036653f29809e0eda1acfa1a607907702c6d8281`
+
+### 复审结论与根因
+
+定向复审确认前述 A（stale runtime identity）和 C（Windows HANDLE transfer）已解决，但 B 仍有一个 Important：真实 `_autopilot_turn()` 在进入 LLM await 前把共享 `turn_busy` 设为 `True`，只有该 coroutine 最终离开 `finally` 才设回 `False`。双有界 stop 可以 retire 一个永久吞 `CancelledError` 的旧任务，却没有释放这个共享 busy 值；新 autopilot loop 因此一直跳过回合。若只在 retire 时直接清布尔值，旧任务迟到的 `finally` 又会误清新 owner 的 busy。
+
+此前的 owner-generation 测试 mock 了整个 `_autopilot_turn()`，绕过了真实 busy 写入点，因而没有覆盖该缺陷。
+
+### RED
+
+先新增走真实 `_autopilot_loop()` → `_autopilot_turn()` → `llm.chat()` 的测试；只在外部 LLM seam 注入永久吞取消的首个 await，第二个 owner 的 LLM await 独立阻塞：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_game_loop_timeline.GameLoopTimelineTests.test_retired_real_autopilot_turn_cannot_starve_or_clear_new_owner -v
+```
+
+基线实现稳定失败，且与复审探针一致：
+
+```text
+AssertionError: Tuples differ: (True, False) != (False, True)
+
+First differing element 0:
+True
+False
+
+- (True, False)
++ (False, True)
+
+Ran 1 test in 0.475s
+FAILED (failures=1)
+exit code 1
+```
+
+元组分别表示 `(busy_after_retire, new_started_before_old_release)`：旧任务 retire 后仍占 busy；在旧 LLM 未 release 前，新 owner 没有进入真实 LLM 执行边界。
+
+### GREEN / 最小修复
+
+- 用冻结的 `_TurnBusyToken(task, generation)` 代替无所有权的共享布尔写入；每个真实 AI 回合 claim 自己的单调 token，并在 `finally` 只 discard 自己的 token。
+- `turn_busy` 成为当前非 retired token 集合是否非空的只读派生值，保持 autopilot/观察循环现有判断接口。
+- `_retire_autopilot_task(task)` 只删除属于该旧 task 的 token，使新 owner 可立即进入；旧 task 迟到的 `finally` 再 discard 旧 token，不会影响新 token。
+- 用户消息、主动开场、自动观察和 autopilot 四条真实 AI 回合路径统一采用同一 token contract，避免共享 gate 的任一路径继续无条件清除别的 owner。
+- 保持既有 output routing generation 防护不变，没有改变公共 API、物理输出或 session 生命周期。
+
+同一测试在最小修复后：
+
+```text
+Ran 1 test in 0.282s
+OK
+exit code 0
+```
+
+测试随后释放旧 LLM、让旧真实 `_autopilot_turn` 经过迟到 `finally` 完成，并断言新 owner 仍保持 `turn_busy=True`，覆盖“旧 finally 不得清新 owner”。
+
+### 相关测试稳定性复核
+
+第一次完整门禁中，上一轮的 `test_shutdown_stop_retires_permanently_cancellation_resistant_autopilot` 在等待“进入取消阶段”的 200ms 条件上限处超时；同一用例立即单跑通过，但耗时 0.183s，确认是 full-suite 负载下接近上限的测试观察窗口，而非生产生命周期回归：
+
+```text
+Ran 1 test in 0.183s
+OK
+```
+
+仅把该相关测试等待 `cancellation_seen` 条件出现的保护上限从 0.2s 调整为 0.5s；取消发生后的关键 bounded-return 断言仍保持 0.25s，不放宽生产要求。随后 GameLoop 模块与完整后端均 fresh 通过。
+
+### 本轮变更文件
+
+- `backend/game_loop.py`：generation-scoped busy token claim/release；retire 按 task 释放旧 token。
+- `tests/test_game_loop_timeline.py`：真实生产回合的 cancellation-resistant LLM 回归；相关条件等待去负载抖动。
+
+### 本轮完整验证输出
+
+生产路径定向 GREEN：
+
+```text
+Ran 1 test in 0.282s
+OK
+```
+
+GameLoop、session endpoints 与 AppState timeline 相关聚焦：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline -v
+```
+
+```text
+Ran 118 tests in 32.663s
+OK
+exit code 0
+```
+
+GameLoop 模块在测试等待调整后 fresh 复核：
+
+```text
+Ran 26 tests in 3.541s
+OK
+exit code 0
+```
+
+完整后端 authoritative rerun：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest discover -s tests -p 'test_*.py'
+```
+
+```text
+Ran 586 tests in 71.343s
+OK (skipped=5)
+exit code 0
+```
+
+Python 编译：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m compileall -q backend tests
+```
+
+```text
+exit code 0
+(no stdout)
+```
+
+前端测试：
+
+```text
+tests 9
+suites 0
+pass 9
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 131.3258
+exit code 0
+```
+
+前端生产构建：
+
+```text
+vite v6.4.3 building for production...
+✓ 1608 modules transformed.
+dist/index.html                               0.42 kB │ gzip:  0.31 kB
+dist/assets/theme-cushou-CHvRhc1C.png       532.71 kB
+dist/assets/theme-pingpinghui-BWDEkUrz.png  728.78 kB
+dist/assets/index-4HIDINJO.css               30.99 kB │ gzip:  6.63 kB
+dist/assets/index-Doxnx5Pn.js               275.92 kB │ gzip: 84.82 kB
+✓ built in 1.32s
+exit code 0
+```
+
+Git whitespace 检查：
+
+```text
+git diff --check
+exit code 0
+仅有 Windows autocrlf 的 LF→CRLF warning；无 whitespace error。
+```
+
+### 本轮自审与剩余风险
+
+- token 集合而非单一 owner 值可正确表示重叠 AI 回合；任一回合完成都不会提前把仍在运行的另一个回合标为 idle。
+- retire 仅按 asyncio task identity 移除 token；generation 使同一 task 的不同回合 token 仍保持唯一，迟到 release 幂等。
+- mutation check：若恢复共享布尔，RED 元组失败；若 retire 不释放 token，新 owner 无法开始；若旧 finally 无条件清 busy，旧 LLM release 后的最终 `assertTrue(turn_busy)` 失败。
+- 永远不退出的第三方 coroutine 仍可能作为 retired task 占用内存，这是 asyncio 的协作式取消限制；本轮保证它不再占用共享 busy、output 或 session owner。
+- 本轮没有新依赖、网络、设备、push、merge 或 tag；完整后端的 5 项 skip 仍是既有平台/权限条件。
