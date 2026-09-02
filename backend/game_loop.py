@@ -97,6 +97,7 @@ class GameLoop:
         self.autopilot_interval = float(cfg.get("autopilot", {}).get("interval_s", 12))
         self.autopilot_task: asyncio.Task | None = None
         self.autopilot_stop = asyncio.Event()
+        self._retired_autopilot_tasks: set[asyncio.Task] = set()
         self._autopilot_transition_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._execution_context = (
@@ -692,14 +693,37 @@ class GameLoop:
     def _start_autopilot_task(self) -> None:
         self.autopilot = True
         if self.autopilot_task is None or self.autopilot_task.done():
-            self.autopilot_stop = asyncio.Event()
-            self.autopilot_task = asyncio.create_task(self._autopilot_loop())
+            stop_event = asyncio.Event()
+            self.autopilot_stop = stop_event
+            self.autopilot_task = asyncio.create_task(
+                self._autopilot_loop(stop_event)
+            )
             logger.info(
                 "自动运行已开启：每 %.1fs 一个自主回合",
                 self.autopilot_interval,
             )
 
-    async def _stop_autopilot_task(self, *, force_after: float | None = None) -> None:
+    def _retire_autopilot_task(self, task: asyncio.Task) -> None:
+        if task in self._retired_autopilot_tasks:
+            return
+        self._retired_autopilot_tasks.add(task)
+
+        def reap(completed: asyncio.Task) -> None:
+            self._retired_autopilot_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "retired autopilot task failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(reap)
+
+    async def _stop_autopilot_task(
+        self, *, force_after: float | None = 0.05
+    ) -> None:
         self.autopilot = False
         self.autopilot_stop.set()
         task = self.autopilot_task
@@ -707,19 +731,29 @@ class GameLoop:
         if task is not None and task is not asyncio.current_task():
             task.cancel()
             if force_after is not None:
-                done, _pending = await asyncio.wait({task}, timeout=force_after)
+                timeout = max(0.0, float(force_after))
+                done, _pending = await asyncio.wait({task}, timeout=timeout)
                 if not done:
-                    # The production autopilot loop never suppresses cancellation.
-                    # Bound a faulty task that does so after output ownership has
-                    # already been disabled by prepare_finish().
                     task.cancel()
+                    done, _pending = await asyncio.wait({task}, timeout=timeout)
+                    if not done:
+                        # Output was already cleared and its generation retired by
+                        # the owning lifecycle.  Keep retrieving this faulty task's
+                        # eventual result without blocking the safety transition.
+                        self._retire_autopilot_task(task)
+                        return
             await asyncio.gather(task, return_exceptions=True)
 
-    async def _autopilot_loop(self) -> None:
-        while not self.autopilot_stop.is_set():
+    async def _autopilot_loop(
+        self, stop_event: asyncio.Event | None = None
+    ) -> None:
+        owned_stop = stop_event or self.autopilot_stop
+        while not owned_stop.is_set():
             try:
                 try:
-                    await asyncio.wait_for(self.autopilot_stop.wait(), timeout=self.autopilot_interval)
+                    await asyncio.wait_for(
+                        owned_stop.wait(), timeout=self.autopilot_interval
+                    )
                     break
                 except asyncio.TimeoutError:
                     pass

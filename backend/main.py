@@ -9,7 +9,7 @@
 import asyncio
 import contextlib
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 import io
 import json
@@ -103,6 +103,12 @@ class _StoryRuntimeSignature:
     caps: tuple[tuple[str, int], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _StoryRuntimeIdentity:
+    revision: int
+    signature: _StoryRuntimeSignature
+
+
 @dataclass(eq=False, slots=True)
 class _StoryRuntimeOwner:
     kind: str
@@ -120,6 +126,7 @@ class _StoryAnalysisInspection:
     key: AnalysisKey
     dlc_version: str
     source_generation: int
+    runtime_identity: _StoryRuntimeIdentity
     lookup: AnalysisLookup
 
 
@@ -144,6 +151,7 @@ class _StoryPlanningContext:
     speed: object
     planner: ChapterPlanner
     story_map: StoryMap
+    runtime_identity: _StoryRuntimeIdentity
     runtime_signature: _StoryRuntimeSignature
     runtime_owner: _StoryRuntimeOwner
 
@@ -403,7 +411,7 @@ def _inspect_import_story_analysis(
     analysis_store: AnalysisStore,
     story: ImportedStory,
 ) -> _StoryImportInspection:
-    dlc_version = dlc_provenance(
+    dlc_version = _story_dlc_version_for_snapshot(
         cfg_snapshot,
         project_root=project_root,
         waveform_policy=waveform_policy,
@@ -413,6 +421,19 @@ def _inspect_import_story_analysis(
         dlc_version=dlc_version,
         key=key,
         lookup=analysis_store.inspect(key),
+    )
+
+
+def _story_dlc_version_for_snapshot(
+    cfg_snapshot: dict[str, object],
+    *,
+    project_root: Path,
+    waveform_policy: str,
+) -> str:
+    return dlc_provenance(
+        cfg_snapshot,
+        project_root=project_root,
+        waveform_policy=waveform_policy,
     )
 
 
@@ -628,7 +649,7 @@ class AppState:
         self.story_source_max_bytes = max_source_bytes
         self.story_analysis_store = AnalysisStore(story_analysis_directory)
         self.story_analysis_lookups: dict[
-            tuple[str, str], AnalysisLookup
+            tuple[str, str, _StoryRuntimeIdentity], AnalysisLookup
         ] = {}
         self.story_sources: dict[str, _StorySourceRecord] = {}
         self.active_story_source_id: str | None = None
@@ -641,9 +662,15 @@ class AppState:
         self.story_cleanup_tasks: set[asyncio.Task] = set()
         self.story_import_requests: set[asyncio.Task] = set()
         self.story_shutting_down = False
+        self.story_runtime_identity_revision = 0
+        self.story_runtime_identity: _StoryRuntimeIdentity | None = None
         self.story_dlc_version = self._current_story_dlc_version()
         self.story_seed_factory = lambda: secrets.randbits(63)
         self.story_planner_signature = self._story_runtime_signature()
+        self.story_runtime_identity = _StoryRuntimeIdentity(
+            revision=self.story_runtime_identity_revision,
+            signature=self.story_planner_signature,
+        )
         self.chapter_planner = self._build_story_planner(
             self.story_planner_signature
         )
@@ -675,25 +702,140 @@ class AppState:
         self.story_dlc_version = current
         return current
 
+    def _story_runtime_identity_revision_value(self) -> int:
+        revision = getattr(self, "story_runtime_identity_revision", 0)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            revision = 0
+            self.story_runtime_identity_revision = revision
+        return revision
+
+    def _invalidate_story_runtime_identity(self) -> None:
+        self.story_runtime_identity_revision = (
+            self._story_runtime_identity_revision_value() + 1
+        )
+        self.story_runtime_identity = None
+
+    def _ensure_story_runtime_identity(self) -> _StoryRuntimeIdentity:
+        revision = self._story_runtime_identity_revision_value()
+        current = getattr(self, "story_runtime_identity", None)
+        if isinstance(current, _StoryRuntimeIdentity) and current.revision == revision:
+            live_signature = self._story_runtime_signature(
+                dlc_version=current.signature.dlc_version
+            )
+            if live_signature == current.signature:
+                return current
+            self._invalidate_story_runtime_identity()
+            revision = self._story_runtime_identity_revision_value()
+        dlc_version = str(getattr(self, "story_dlc_version", "") or "")
+        identity = _StoryRuntimeIdentity(
+            revision=revision,
+            signature=self._story_runtime_signature(dlc_version=dlc_version),
+        )
+        self.story_runtime_identity = identity
+        return identity
+
+    def _adopt_story_runtime_identity(
+        self,
+        signature: _StoryRuntimeSignature,
+        *,
+        expected_revision: int,
+    ) -> _StoryRuntimeIdentity | None:
+        if self._story_runtime_identity_revision_value() != expected_revision:
+            return None
+        current = getattr(self, "story_runtime_identity", None)
+        revision = expected_revision
+        if (
+            isinstance(current, _StoryRuntimeIdentity)
+            and current.revision == expected_revision
+            and current.signature != signature
+        ):
+            self._invalidate_story_runtime_identity()
+            revision = self._story_runtime_identity_revision_value()
+        identity = _StoryRuntimeIdentity(revision=revision, signature=signature)
+        self.story_runtime_identity = identity
+        self.story_dlc_version = signature.dlc_version
+        return identity
+
+    def _story_runtime_identity_matches(
+        self, identity: _StoryRuntimeIdentity
+    ) -> bool:
+        current = getattr(self, "story_runtime_identity", None)
+        if (
+            not isinstance(current, _StoryRuntimeIdentity)
+            or current != identity
+            or self._story_runtime_identity_revision_value() != identity.revision
+        ):
+            return False
+        live_signature = self._story_runtime_signature(
+            dlc_version=identity.signature.dlc_version
+        )
+        if live_signature != identity.signature:
+            self._invalidate_story_runtime_identity()
+            return False
+        return True
+
+    async def _derive_story_runtime_identity_offloop(
+        self,
+    ) -> _StoryRuntimeIdentity | None:
+        for attempt in range(2):
+            revision = self._story_runtime_identity_revision_value()
+            signature_seed = self._story_runtime_signature(dlc_version="")
+            cfg_snapshot = deepcopy(self.cfg)
+            waveform_policy = self.timeline_session.waveform_policy
+            task = self._track_story_io(
+                asyncio.to_thread(
+                    _story_dlc_version_for_snapshot,
+                    cfg_snapshot,
+                    project_root=PROJECT_ROOT,
+                    waveform_policy=waveform_policy,
+                ),
+                name=f"story-runtime-identity-{attempt}",
+            )
+            dlc_version = await asyncio.shield(task)
+            if not isinstance(dlc_version, str) or not dlc_version:
+                raise RuntimeError("story runtime identity returned an invalid result")
+            signature = replace(signature_seed, dlc_version=dlc_version)
+            if self._story_runtime_identity_revision_value() != revision:
+                continue
+            if (
+                self._story_runtime_signature(dlc_version=dlc_version)
+                != signature
+            ):
+                self._invalidate_story_runtime_identity()
+                continue
+            return self._adopt_story_runtime_identity(
+                signature, expected_revision=revision
+            )
+        return None
+
     @staticmethod
     def _story_analysis_cache_identity(
-        record: _StorySourceRecord, key: AnalysisKey
-    ) -> tuple[str, str]:
-        return record.source_id, key.digest()
+        record: _StorySourceRecord,
+        key: AnalysisKey,
+        runtime_identity: _StoryRuntimeIdentity,
+    ) -> tuple[str, str, _StoryRuntimeIdentity]:
+        return record.source_id, key.digest(), runtime_identity
 
     def _cached_story_analysis(
         self, record: _StorySourceRecord
     ) -> AnalysisLookup:
+        identity = getattr(self, "story_runtime_identity", None)
+        if not isinstance(identity, _StoryRuntimeIdentity):
+            return AnalysisLookup("missing", None)
+        if not self._story_runtime_identity_matches(identity):
+            return AnalysisLookup("missing", None)
         try:
             key = offline_analysis_key(
-                record.story, getattr(self, "story_dlc_version", "")
+                record.story, identity.signature.dlc_version
             )
         except (TypeError, ValueError):
             return AnalysisLookup("missing", None)
         lookups = getattr(self, "story_analysis_lookups", None)
         if not isinstance(lookups, dict):
             return AnalysisLookup("missing", None)
-        lookup = lookups.get(self._story_analysis_cache_identity(record, key))
+        lookup = lookups.get(
+            self._story_analysis_cache_identity(record, key, identity)
+        )
         return (
             lookup
             if isinstance(lookup, AnalysisLookup)
@@ -705,6 +847,7 @@ class AppState:
         record: _StorySourceRecord,
         key: AnalysisKey,
         lookup: AnalysisLookup,
+        runtime_identity: _StoryRuntimeIdentity,
     ) -> None:
         lookups = getattr(self, "story_analysis_lookups", None)
         if not isinstance(lookups, dict):
@@ -716,11 +859,16 @@ class AppState:
             if lookup.status in ("ready", "missing")
             else AnalysisLookup("missing", None)
         )
-        lookups[self._story_analysis_cache_identity(record, key)] = published
+        lookups[
+            self._story_analysis_cache_identity(
+                record, key, runtime_identity
+            )
+        ] = published
 
     async def _inspect_story_analysis_offloop(
         self, record: _StorySourceRecord
     ) -> _StoryAnalysisInspection:
+        captured_identity = self._ensure_story_runtime_identity()
         cfg_snapshot = deepcopy(self.cfg)
         project_root = PROJECT_ROOT
         waveform_policy = self.timeline_session.waveform_policy
@@ -739,14 +887,64 @@ class AppState:
         inspected = await asyncio.shield(task)
         if not isinstance(inspected, _StoryImportInspection):
             raise RuntimeError("story analysis inspection returned an invalid result")
-        self.story_dlc_version = inspected.dlc_version
-        self._publish_story_analysis(record, inspected.key, inspected.lookup)
-        return _StoryAnalysisInspection(
+        inspection_identity = _StoryRuntimeIdentity(
+            revision=captured_identity.revision,
+            signature=replace(
+                captured_identity.signature, dlc_version=inspected.dlc_version
+            ),
+        )
+        current_identity = await self._derive_story_runtime_identity_offloop()
+        inspection = _StoryAnalysisInspection(
             key=inspected.key,
             dlc_version=inspected.dlc_version,
             source_generation=generation,
+            runtime_identity=inspection_identity,
             lookup=inspected.lookup,
         )
+        if (
+            current_identity == inspection_identity
+            and self.story_source_generation == generation
+            and _story_record(self, record.source_id) is record
+            and self._story_runtime_identity_matches(inspection_identity)
+        ):
+            self._publish_story_analysis(
+                record,
+                inspected.key,
+                inspected.lookup,
+                inspection_identity,
+            )
+        return inspection
+
+    def _story_analysis_inspection_is_current(
+        self,
+        record: _StorySourceRecord,
+        inspection: _StoryAnalysisInspection,
+    ) -> bool:
+        if (
+            self.story_source_generation != inspection.source_generation
+            or _story_record(self, record.source_id) is not record
+            or not self._story_runtime_identity_matches(
+                inspection.runtime_identity
+            )
+        ):
+            return False
+        try:
+            current_key = offline_analysis_key(
+                record.story,
+                inspection.runtime_identity.signature.dlc_version,
+            )
+        except (TypeError, ValueError):
+            return False
+        return current_key == inspection.key
+
+    def _story_lookup_for_inspection(
+        self,
+        record: _StorySourceRecord,
+        inspection: _StoryAnalysisInspection,
+    ) -> AnalysisLookup:
+        if self._story_analysis_inspection_is_current(record, inspection):
+            return inspection.lookup
+        return self._cached_story_analysis(record)
 
     async def _refresh_active_story_analysis(self) -> None:
         record = _active_story_record(self)
@@ -979,7 +1177,7 @@ class AppState:
         story_map: StoryMap,
         chapter_id: str,
         speed: object,
-        runtime_signature: _StoryRuntimeSignature,
+        runtime_identity: _StoryRuntimeIdentity,
     ) -> tuple[asyncio.Task, _StoryPlanningContext]:
         if self.story_planning_task is not None:
             raise _StoryConflict(
@@ -997,7 +1195,9 @@ class AppState:
             raise _StoryConflict(
                 "story_state_changed", "the selected story source changed"
             )
-        runtime_signature = self._ensure_story_planner_current(runtime_signature)
+        runtime_signature = self._ensure_story_planner_current(
+            runtime_identity.signature
+        )
         planner = self.chapter_planner
         runtime_owner = self._acquire_story_runtime_owner("planning")
         context = _StoryPlanningContext(
@@ -1007,6 +1207,7 @@ class AppState:
             speed=speed,
             planner=planner,
             story_map=story_map,
+            runtime_identity=runtime_identity,
             runtime_signature=runtime_signature,
             runtime_owner=runtime_owner,
         )
@@ -1613,9 +1814,23 @@ def make_app() -> FastAPI:
                             state.story_sources[record.source_id] = record
                             state.active_story_source_id = record.source_id
                             state.story_source_generation = source_generation + 1
-                            state.story_dlc_version = analysis_dlc_version
+                            runtime_identity = state._adopt_story_runtime_identity(
+                                state._story_runtime_signature(
+                                    dlc_version=analysis_dlc_version
+                                ),
+                                expected_revision=(
+                                    state._story_runtime_identity_revision_value()
+                                ),
+                            )
+                            if runtime_identity is None:
+                                raise RuntimeError(
+                                    "story runtime identity changed during import"
+                                )
                             state._publish_story_analysis(
-                                record, analysis_key, lookup
+                                record,
+                                analysis_key,
+                                lookup,
+                                runtime_identity,
                             )
                             transaction.committed = True
                         except Exception:
@@ -1675,7 +1890,7 @@ def make_app() -> FastAPI:
         if record is None:
             return _story_not_found_response()
         inspection = await state._inspect_story_analysis_offloop(record)
-        lookup = inspection.lookup
+        lookup = state._story_lookup_for_inspection(record, inspection)
         if lookup.status != "ready":
             return _analysis_error_response(state, record, lookup)
         return JSONResponse(_story_analysis_payload(state, record, "ready"))
@@ -1686,7 +1901,7 @@ def make_app() -> FastAPI:
         if record is None:
             return _story_not_found_response()
         inspection = await state._inspect_story_analysis_offloop(record)
-        lookup = inspection.lookup
+        lookup = state._story_lookup_for_inspection(record, inspection)
         if lookup.status != "ready" or lookup.story_map is None:
             return _analysis_error_response(state, record, lookup)
         return JSONResponse(
@@ -1715,16 +1930,15 @@ def make_app() -> FastAPI:
             async with state.timeline_transition_lock:
                 current_record = _story_record(state, source_id)
                 current_key = offline_analysis_key(
-                    record.story, state.story_dlc_version
-                )
-                runtime_signature = state._story_runtime_signature(
-                    dlc_version=inspection.dlc_version
+                    record.story,
+                    inspection.runtime_identity.signature.dlc_version,
                 )
                 if (
                     current_record is not record
                     or state.active_story_source_id != record.source_id
-                    or state.story_source_generation
-                    != inspection.source_generation
+                    or not state._story_analysis_inspection_is_current(
+                        record, inspection
+                    )
                     or current_key != inspection.key
                 ):
                     raise _StoryConflict(
@@ -1735,7 +1949,7 @@ def make_app() -> FastAPI:
                     lookup.story_map,
                     chapter_id,
                     speed,
-                    runtime_signature,
+                    inspection.runtime_identity,
                 )
             await state.broadcast()
             try:
@@ -1770,22 +1984,24 @@ def make_app() -> FastAPI:
                 current_record = _story_record(state, source_id)
                 current_lookup = final_inspection.lookup
                 current_key = offline_analysis_key(
-                    record.story, state.story_dlc_version
-                )
-                current_runtime_signature = state._story_runtime_signature(
-                    dlc_version=state.story_dlc_version
+                    record.story,
+                    planning_context.runtime_identity.signature.dlc_version,
                 )
                 if (
                     current_record is not record
                     or state.active_story_source_id != record.source_id
-                    or final_inspection.source_generation
-                    != planning_context.generation
+                    or not state._story_analysis_inspection_is_current(
+                        record, final_inspection
+                    )
+                    or final_inspection.runtime_identity
+                    != planning_context.runtime_identity
                     or current_key != final_inspection.key
-                    or state.story_dlc_version != final_inspection.dlc_version
                     or current_lookup.status != "ready"
                     or current_lookup.story_map is None
                     or current_lookup.story_map != planning_context.story_map
-                    or current_runtime_signature != planning_context.runtime_signature
+                    or not state._story_runtime_identity_matches(
+                        planning_context.runtime_identity
+                    )
                     or state.story_planner_signature
                     != planning_context.runtime_signature
                     or state.timeline_session.to_state().status.value != "idle"
@@ -1834,7 +2050,7 @@ def make_app() -> FastAPI:
                 status_code=409,
             )
         inspection = await state._inspect_story_analysis_offloop(record)
-        lookup = inspection.lookup
+        lookup = state._story_lookup_for_inspection(record, inspection)
         if lookup.status != "ready" or lookup.story_map is None:
             return _analysis_error_response(state, record, lookup)
         return JSONResponse(
@@ -1854,7 +2070,7 @@ def make_app() -> FastAPI:
                 status_code=409,
             )
         inspection = await state._inspect_story_analysis_offloop(record)
-        lookup = inspection.lookup
+        lookup = state._story_lookup_for_inspection(record, inspection)
         if lookup.status != "ready" or lookup.story_map is None:
             return _analysis_error_response(state, record, lookup)
         text = record.story.text
@@ -2289,6 +2505,7 @@ def make_app() -> FastAPI:
                     raise _StoryConflict(
                         "story_runtime_busy", "story runtime reservation changed"
                     )
+                state._invalidate_story_runtime_identity()
                 result = await state.loop.set_runtime_cap(ch, value)
         except _StoryConflict as exc:
             return _story_transition_error(state, exc)
@@ -2389,6 +2606,7 @@ def make_app() -> FastAPI:
                         prepared = await state.loop.prepare_timeline_finish()
                         await state.set_sensors(False)
                     else:
+                        state._invalidate_story_runtime_identity()
                         save_character_runtime(cfg, role=role, profile=profile)
                         return {
                             "ok": True,
@@ -2400,6 +2618,7 @@ def make_app() -> FastAPI:
                     if state.story_runtime_owner is not owner:
                         raise RuntimeError("profile transition ownership changed")
                     await state.loop.finalize_timeline_finish(prepared)
+                    state._invalidate_story_runtime_identity()
                     save_character_runtime(cfg, role=role, profile=profile)
                     return {
                         "ok": True,
@@ -2491,6 +2710,9 @@ def make_app() -> FastAPI:
             m2 = re.match(r"^(.+?)-角色提示词-(.+?)\.md$", name)
             grp = f"DLC导入-{m2.group(1)}-{m2.group(2)}" if m2 else (Path(name).stem or "DLC导入")
             groups[grp] = {name: data}
+
+        async with state.timeline_transition_lock:
+            state._invalidate_story_runtime_identity()
 
         # 落盘
         for grp, mds in groups.items():
@@ -2683,6 +2905,7 @@ def make_app() -> FastAPI:
                     raise _StoryConflict(
                         "story_runtime_busy", "story runtime is already active"
                     )
+                state._invalidate_story_runtime_identity()
                 cfg_path = PROJECT_ROOT / "config" / "config.yaml"
                 example = PROJECT_ROOT / "config" / "config.example.yaml"
                 if not cfg_path.exists():
@@ -2711,6 +2934,10 @@ def make_app() -> FastAPI:
                 signature = state._story_runtime_signature()
                 state.chapter_planner = state._build_story_planner(signature)
                 state.story_planner_signature = signature
+                state._adopt_story_runtime_identity(
+                    signature,
+                    expected_revision=state._story_runtime_identity_revision_value(),
+                )
         except _StoryConflict as exc:
             return _story_transition_error(state, exc)
         finally:

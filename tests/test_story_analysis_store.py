@@ -1,13 +1,16 @@
+import ctypes
 import json
 import math
 import os
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import backend.story as story_domain
 import backend.story.analysis_store as analysis_store_module
@@ -418,6 +421,31 @@ class AnalysisStoreTests(unittest.TestCase):
             self.assertIsNone(store.load(self.key))
 
         self.assertFalse(stale.exists())
+
+    def test_windows_directory_handle_transfer_failure_closes_native_handle(self):
+        native_handle = 12345
+        transfer_failure = OSError("descriptor transfer failed")
+        create_file = MagicMock(return_value=native_handle)
+        close_handle = MagicMock(return_value=True)
+        kernel32 = SimpleNamespace(
+            CreateFileW=create_file,
+            CloseHandle=close_handle,
+        )
+        fake_msvcrt = SimpleNamespace(
+            open_osfhandle=MagicMock(side_effect=transfer_failure)
+        )
+
+        with (
+            patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+            patch.object(ctypes, "WinDLL", return_value=kernel32, create=True),
+        ):
+            with self.assertRaises(OSError) as raised:
+                analysis_store_module._open_windows_directory_without_redirect(
+                    Path("C:/analysis")
+                )
+
+        self.assertIs(raised.exception, transfer_failure)
+        close_handle.assert_called_once_with(native_handle)
 
     @unittest.skipUnless(os.name == "nt", "Windows directory durability")
     def test_windows_save_flushes_the_pinned_directory_handle(self):

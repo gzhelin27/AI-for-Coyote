@@ -577,6 +577,44 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(started.wait(), timeout=0.2)
         return cancellation_seen, release
 
+    async def _install_cancellation_resistant_autopilot_task(self):
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        late_action_finished = asyncio.Event()
+        cancellation_count = []
+        late_result = []
+        origin = self.harness.loop._capture_ai_action_origin()
+
+        async def cancellation_resistant_task():
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_count.append(None)
+                    cancellation_seen.set()
+            late_result.append(
+                await self.harness.loop._execute_ai_actions(
+                    [{"op": "hold_strength", "channel": "A", "value": 40}],
+                    origin,
+                )
+            )
+            late_action_finished.set()
+
+        task = asyncio.create_task(cancellation_resistant_task())
+        self.harness.loop.autopilot = True
+        self.harness.loop.autopilot_task = task
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        return SimpleNamespace(
+            task=task,
+            cancellation_seen=cancellation_seen,
+            cancellation_count=cancellation_count,
+            release=release,
+            late_action_finished=late_action_finished,
+            late_result=late_result,
+        )
+
     async def _install_blocked_runner_watcher_teardown(self):
         original = self.harness.controller._runner_watchers.pop("A")
         original.cancel()
@@ -630,6 +668,165 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.controller.to_state().status.value, "idle")
         self.assertEqual(self.harness.safety.current, {"A": 0, "B": 0})
         self.assertEqual(len(self.harness.store.list()), 1)
+
+    async def test_finish_retires_permanently_cancellation_resistant_autopilot(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        stubborn = await self._install_cancellation_resistant_autopilot_task()
+        loop = asyncio.get_running_loop()
+        unhandled = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        finishing = asyncio.create_task(self.harness.loop.finish_timeline_session())
+        try:
+            await asyncio.wait_for(stubborn.cancellation_seen.wait(), timeout=0.2)
+            done, _pending = await asyncio.wait({finishing}, timeout=0.25)
+            completed_before_release = bool(done)
+            if completed_before_release:
+                await finishing
+                generations = {
+                    channel: self.harness.loop.output_coordinator.generation(channel)
+                    for channel in ("A", "B")
+                }
+                self.assertGreaterEqual(len(stubborn.cancellation_count), 2)
+                self.assertIn(
+                    stubborn.task,
+                    self.harness.loop._retired_autopilot_tasks,
+                )
+                self.assertIsNone(self.harness.loop.autopilot_task)
+                self.assertFalse(self.harness.loop.autopilot)
+                self.assertEqual(
+                    self.harness.controller.to_state().status.value, "idle"
+                )
+                self.assertTrue(self.harness.loop._global_clear_is_confirmed())
+                await asyncio.wait_for(
+                    self.harness.loop.stop_timeline_session(), timeout=0.25
+                )
+                stubborn.release.set()
+                await asyncio.wait_for(
+                    stubborn.late_action_finished.wait(), timeout=0.2
+                )
+                for _ in range(20):
+                    if stubborn.task not in self.harness.loop._retired_autopilot_tasks:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(stubborn.late_result, [([], [], True)])
+                self.assertEqual(
+                    {
+                        channel: self.harness.loop.output_coordinator.generation(channel)
+                        for channel in ("A", "B")
+                    },
+                    generations,
+                )
+                self.assertNotIn(
+                    stubborn.task,
+                    self.harness.loop._retired_autopilot_tasks,
+                )
+                self.assertEqual(unhandled, [])
+            else:
+                stubborn.release.set()
+                await asyncio.wait_for(finishing, timeout=1.0)
+            self.assertTrue(completed_before_release)
+        finally:
+            stubborn.release.set()
+            if not finishing.done():
+                await asyncio.gather(finishing, return_exceptions=True)
+            loop.set_exception_handler(previous_handler)
+
+    async def test_shutdown_stop_retires_permanently_cancellation_resistant_autopilot(self):
+        await self.harness.controller.start_live()
+        await self._automatic_turn()
+        stubborn = await self._install_cancellation_resistant_autopilot_task()
+        stopping = asyncio.create_task(self.harness.loop.stop_timeline_session())
+        try:
+            await asyncio.wait_for(stubborn.cancellation_seen.wait(), timeout=0.2)
+            done, _pending = await asyncio.wait({stopping}, timeout=0.25)
+            completed_before_release = bool(done)
+            if completed_before_release:
+                await stopping
+                self.assertIn(
+                    stubborn.task,
+                    self.harness.loop._retired_autopilot_tasks,
+                )
+                self.assertEqual(
+                    self.harness.controller.to_state().status.value, "idle"
+                )
+                self.assertTrue(self.harness.loop._global_clear_is_confirmed())
+            else:
+                stubborn.release.set()
+                await asyncio.wait_for(stopping, timeout=1.0)
+            self.assertTrue(completed_before_release)
+        finally:
+            stubborn.release.set()
+            if not stopping.done():
+                await asyncio.gather(stopping, return_exceptions=True)
+            await asyncio.wait_for(
+                stubborn.late_action_finished.wait(), timeout=0.2
+            )
+
+    async def test_retired_autopilot_loop_cannot_join_a_new_owner_generation(self):
+        await self.harness.controller.start_live()
+        old_turn_started = asyncio.Event()
+        old_cancellation_seen = asyncio.Event()
+        release_old_turn = asyncio.Event()
+        new_turn_started = asyncio.Event()
+        release_new_turn = asyncio.Event()
+        old_reacquired = asyncio.Event()
+        old_task = None
+
+        async def controlled_turn():
+            current = asyncio.current_task()
+            if current is old_task and not old_turn_started.is_set():
+                old_turn_started.set()
+                while not release_old_turn.is_set():
+                    try:
+                        await release_old_turn.wait()
+                    except asyncio.CancelledError:
+                        old_cancellation_seen.set()
+                return None
+            if current is old_task:
+                old_reacquired.set()
+            else:
+                new_turn_started.set()
+            await release_new_turn.wait()
+            return None
+
+        self.harness.loop.autopilot_interval = 0.001
+        with patch.object(
+            self.harness.loop, "_autopilot_turn", side_effect=controlled_turn
+        ):
+            self.harness.loop._start_autopilot_task()
+            old_task = self.harness.loop.autopilot_task
+            await asyncio.wait_for(old_turn_started.wait(), timeout=0.2)
+            finishing = asyncio.create_task(
+                self.harness.loop.finish_timeline_session()
+            )
+            try:
+                await asyncio.wait_for(
+                    old_cancellation_seen.wait(), timeout=0.2
+                )
+                await asyncio.wait_for(finishing, timeout=0.3)
+                self.assertIn(
+                    old_task, self.harness.loop._retired_autopilot_tasks
+                )
+
+                await self.harness.controller.start_live()
+                self.harness.loop._start_autopilot_task()
+                await asyncio.wait_for(new_turn_started.wait(), timeout=0.2)
+                release_old_turn.set()
+                try:
+                    await asyncio.wait_for(old_reacquired.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass
+
+                self.assertFalse(old_reacquired.is_set())
+            finally:
+                release_old_turn.set()
+                release_new_turn.set()
+                self.harness.loop.autopilot_stop.set()
+                await self.harness.loop._stop_autopilot_task()
+                if old_task is not None and not old_task.done():
+                    await asyncio.gather(old_task, return_exceptions=True)
 
     async def test_cancelled_automatic_off_awaits_controller_teardown_and_clear(self):
         await self.harness.controller.start_live()

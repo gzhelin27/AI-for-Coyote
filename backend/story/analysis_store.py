@@ -745,9 +745,19 @@ def _open_windows_directory_without_redirect(path: Path) -> _DirectoryHandle:
     )
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
-    descriptor = msvcrt.open_osfhandle(
-        handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
-    )
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+    except BaseException:
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        try:
+            close_handle(handle)
+        except BaseException:
+            pass
+        raise
     return _DirectoryHandle(descriptor)
 
 

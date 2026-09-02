@@ -978,6 +978,119 @@ class StoryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(ticked_at[0] - started_at, 0.1)
         self.assertFalse(self.state.story_source_io_tasks)
 
+    async def _assert_stalled_state_inspection_rejects_runtime_change(
+        self, mutate_runtime
+    ) -> None:
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        self._save_analysis(story)
+        ready = await self.client.get(f"/api/story/{source_id}/analysis")
+        self.assertEqual(ready.status_code, 200, ready.text)
+        stalled = StalledAnalysisStore(self.state.story_analysis_store)
+        self.state.story_analysis_store = stalled
+        request = asyncio.create_task(self.client.get("/api/state"))
+        try:
+            self.assertTrue(
+                await asyncio.to_thread(stalled.inspect_started.wait, 0.5)
+            )
+            mutation = mutate_runtime()
+            if asyncio.iscoroutine(mutation):
+                await mutation
+        finally:
+            stalled.inspect_release.set()
+        response = await asyncio.wait_for(request, timeout=1.0)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["story"]["analysis"]["status"], "missing"
+        )
+
+    async def test_stalled_state_inspection_rejects_concurrent_profile_change(self):
+        await self._assert_stalled_state_inspection_rejects_runtime_change(
+            lambda: self.state.cfg["character"].__setitem__(
+                "profile", "concurrent-profile"
+            )
+        )
+
+    async def test_stalled_state_inspection_rejects_concurrent_dlc_change(self):
+        await self._assert_stalled_state_inspection_rejects_runtime_change(
+            lambda: self.state.cfg["character"].__setitem__(
+                "prompt", "concurrent DLC prompt"
+            )
+        )
+
+    async def test_stalled_state_inspection_rejects_concurrent_llm_change(self):
+        def replace_llm() -> None:
+            self.state.llm = SimpleNamespace(model="model-two", client=object())
+
+        await self._assert_stalled_state_inspection_rejects_runtime_change(
+            replace_llm
+        )
+
+    async def test_stalled_state_inspection_rejects_cap_change_even_after_aba(self):
+        original_cap = self.state.safety.user_caps["A"]
+
+        async def change_and_restore_cap() -> None:
+            changed = await self.client.post(
+                "/api/device/channels/cap", json={"channel": "A", "value": 30}
+            )
+            restored = await self.client.post(
+                "/api/device/channels/cap",
+                json={"channel": "A", "value": original_cap},
+            )
+            self.assertEqual(changed.status_code, 200, changed.text)
+            self.assertEqual(restored.status_code, 200, restored.text)
+
+        await self._assert_stalled_state_inspection_rejects_runtime_change(
+            change_and_restore_cap
+        )
+
+    async def test_stalled_state_inspection_rejects_concurrent_waveform_change(self):
+        def add_waveform() -> None:
+            existing = next(iter(self.state.safety.presets.values()))
+            self.state.safety.presets["concurrent-waveform"] = dict(existing)
+
+        await self._assert_stalled_state_inspection_rejects_runtime_change(
+            add_waveform
+        )
+
+    async def test_play_rejects_stale_inspection_without_overwriting_current_dlc(self):
+        source_bytes = b"ABCD"
+        imported = await self._import("story.txt", source_bytes, "utf-8")
+        source_id = imported.json()["source"]["source_id"]
+        story = self._load_story("story.txt", source_bytes, "utf-8")
+        story_map = self._save_analysis(story)
+        stalled = StalledAnalysisStore(self.state.story_analysis_store)
+        self.state.story_analysis_store = stalled
+        playing = asyncio.create_task(
+            self.client.post(
+                f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+                json={"speed": "standard"},
+            )
+        )
+        try:
+            self.assertTrue(
+                await asyncio.to_thread(stalled.inspect_started.wait, 0.5)
+            )
+            self.state.cfg["character"]["profile"] = "new-profile"
+            current_dlc = main_module.dlc_provenance(
+                self.state.cfg,
+                project_root=main_module.PROJECT_ROOT,
+                waveform_policy=self.state.timeline_session.waveform_policy,
+            )
+            self.state.story_dlc_version = current_dlc
+        finally:
+            stalled.inspect_release.set()
+        response = await asyncio.wait_for(playing, timeout=1.0)
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["code"], "story_state_changed")
+        self.assertEqual(self.state.story_dlc_version, current_dlc)
+        self.assertEqual(self.llm.call_count, 0)
+        self.assertEqual(self.state.novel_session.to_state().status.value, "idle")
+
     async def test_play_stalled_analysis_never_holds_transition_lock(self):
         source_bytes = b"ABCD"
         imported = await self._import("story.txt", source_bytes, "utf-8")
