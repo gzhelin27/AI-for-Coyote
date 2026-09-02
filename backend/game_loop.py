@@ -34,6 +34,12 @@ class _AIActionOrigin:
     session_id: str | None
 
 
+@dataclass(frozen=True)
+class _TurnBusyToken:
+    task: asyncio.Task | None
+    generation: int
+
+
 async def _await_owned_group(awaitables):
     """Own every child through settlement before propagating an outcome."""
     tasks = tuple(asyncio.ensure_future(item) for item in awaitables)
@@ -90,7 +96,8 @@ class GameLoop:
         # 自动观察循环（阶段 3 摄像头闭环）
         self.observe_task: asyncio.Task | None = None
         self.observe_stop = asyncio.Event()
-        self.turn_busy = False                 # 防止用户回合与自动观察并发
+        self._turn_busy_generation = 0
+        self._turn_busy_tokens: set[_TurnBusyToken] = set()
 
         # 自动运行（AI 自主回合：观察→描写→动作→发言，玩家不用打字）
         self.autopilot = bool(cfg.get("autopilot", {}).get("enabled", False))
@@ -118,6 +125,28 @@ class GameLoop:
         self.rage_triggered = False
 
     # ---------- 状态 ----------
+    @property
+    def turn_busy(self) -> bool:
+        """Whether any non-retired AI turn still owns the shared busy gate."""
+        return bool(self._turn_busy_tokens)
+
+    def _claim_turn_busy(self) -> _TurnBusyToken:
+        self._turn_busy_generation += 1
+        token = _TurnBusyToken(
+            task=asyncio.current_task(),
+            generation=self._turn_busy_generation,
+        )
+        self._turn_busy_tokens.add(token)
+        return token
+
+    def _release_turn_busy(self, token: _TurnBusyToken) -> None:
+        self._turn_busy_tokens.discard(token)
+
+    def _release_turn_busy_for_task(self, task: asyncio.Task) -> None:
+        self._turn_busy_tokens = {
+            token for token in self._turn_busy_tokens if token.task is not task
+        }
+
     def _sensor_rage(self) -> bool:
         """画面持续黑暗 或 麦克风持续无声 → 怒气积累。"""
         dark = False
@@ -222,7 +251,7 @@ class GameLoop:
         self.history.append({"role": "user", "content": text})
         self.history = self.history[-self.keep:]
 
-        self.turn_busy = True
+        busy_token = self._claim_turn_busy()
         try:
             self._note_rage()
             state = self.build_state()
@@ -249,7 +278,7 @@ class GameLoop:
             if error is None and not timeline_managed:
                 await self._apply_channel_floor()
         finally:
-            self.turn_busy = False
+            self._release_turn_busy(busy_token)
 
         self.history.append({"role": "assistant", "content": line})
         return {"line": line, "executed": executed, "dropped": dropped, "error": error}
@@ -279,7 +308,7 @@ class GameLoop:
         self.history.append(prompt_msg)
         self.history = self.history[-self.keep:]
         error = None
-        self.turn_busy = True
+        busy_token = self._claim_turn_busy()
         try:
             try:
                 line, actions = await self.llm.chat(
@@ -298,7 +327,7 @@ class GameLoop:
             if not timeline_managed:
                 await self._apply_channel_floor()
         finally:
-            self.turn_busy = False
+            self._release_turn_busy(busy_token)
         self.history.append({"role": "assistant", "content": line})
         return {
             "line": line,
@@ -365,7 +394,7 @@ class GameLoop:
         }
         self.history.append(prompt_msg)
         self.history = self.history[-self.keep:]
-        self.turn_busy = True
+        busy_token = self._claim_turn_busy()
         try:
             try:
                 line, actions = await self.llm.chat(
@@ -382,7 +411,7 @@ class GameLoop:
             if not timeline_managed:
                 await self._apply_channel_floor()
         finally:
-            self.turn_busy = False
+            self._release_turn_busy(busy_token)
         self.history.append({"role": "assistant", "content": line})
         return {"line": line, "executed": executed, "dropped": dropped}
 
@@ -704,6 +733,7 @@ class GameLoop:
             )
 
     def _retire_autopilot_task(self, task: asyncio.Task) -> None:
+        self._release_turn_busy_for_task(task)
         if task in self._retired_autopilot_tasks:
             return
         self._retired_autopilot_tasks.add(task)
@@ -787,7 +817,7 @@ class GameLoop:
         }
         self.history.append(prompt_msg)
         self.history = self.history[-self.keep:]
-        self.turn_busy = True
+        busy_token = self._claim_turn_busy()
         try:
             try:
                 line, actions = await self.llm.chat(
@@ -804,7 +834,7 @@ class GameLoop:
             if not timeline_managed:
                 await self._apply_channel_floor()
         finally:
-            self.turn_busy = False
+            self._release_turn_busy(busy_token)
         self.history.append({"role": "assistant", "content": line})
         logger.info("自动回合台词: %s", line)
         result = {"line": line, "executed": executed, "dropped": dropped}

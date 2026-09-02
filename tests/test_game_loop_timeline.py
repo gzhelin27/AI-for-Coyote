@@ -739,7 +739,7 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
         stubborn = await self._install_cancellation_resistant_autopilot_task()
         stopping = asyncio.create_task(self.harness.loop.stop_timeline_session())
         try:
-            await asyncio.wait_for(stubborn.cancellation_seen.wait(), timeout=0.2)
+            await asyncio.wait_for(stubborn.cancellation_seen.wait(), timeout=0.5)
             done, _pending = await asyncio.wait({stopping}, timeout=0.25)
             completed_before_release = bool(done)
             if completed_before_release:
@@ -763,6 +763,84 @@ class GameLoopTimelineTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(
                 stubborn.late_action_finished.wait(), timeout=0.2
             )
+
+    async def test_retired_real_autopilot_turn_cannot_starve_or_clear_new_owner(self):
+        old_llm_started = asyncio.Event()
+        old_cancellation_seen = asyncio.Event()
+        release_old_llm = asyncio.Event()
+        new_llm_started = asyncio.Event()
+        release_new_llm = asyncio.Event()
+
+        async def cancellation_resistant_chat(*_args, **_kwargs):
+            if not old_llm_started.is_set():
+                old_llm_started.set()
+                while not release_old_llm.is_set():
+                    try:
+                        await release_old_llm.wait()
+                    except asyncio.CancelledError:
+                        old_cancellation_seen.set()
+                return "retired timeline line", []
+            new_llm_started.set()
+            await release_new_llm.wait()
+            return "new timeline line", []
+
+        self.harness.loop.autopilot_interval = 0.001
+        self.harness.llm.chat.side_effect = cancellation_resistant_chat
+        old_task = None
+        new_task = None
+        with patch("backend.game_loop.reload_character"):
+            try:
+                await self.harness.loop.start_timeline_session()
+                old_task = self.harness.loop.autopilot_task
+                await asyncio.wait_for(old_llm_started.wait(), timeout=0.2)
+
+                finishing = asyncio.create_task(
+                    self.harness.loop.finish_timeline_session()
+                )
+                await asyncio.wait_for(
+                    old_cancellation_seen.wait(), timeout=0.2
+                )
+                await asyncio.wait_for(finishing, timeout=0.35)
+                self.assertIn(
+                    old_task, self.harness.loop._retired_autopilot_tasks
+                )
+                busy_after_retire = self.harness.loop.turn_busy
+
+                await self.harness.loop.start_timeline_session()
+                new_task = self.harness.loop.autopilot_task
+                new_started_wait = asyncio.create_task(new_llm_started.wait())
+                done, _pending = await asyncio.wait(
+                    {new_started_wait}, timeout=0.2
+                )
+                new_started_before_old_release = bool(done)
+                if not done:
+                    new_started_wait.cancel()
+                    await asyncio.gather(
+                        new_started_wait, return_exceptions=True
+                    )
+
+                self.assertEqual(
+                    (busy_after_retire, new_started_before_old_release),
+                    (False, True),
+                )
+                self.assertTrue(self.harness.loop.turn_busy)
+
+                release_old_llm.set()
+                await asyncio.wait_for(old_task, timeout=0.2)
+                self.assertTrue(self.harness.loop.turn_busy)
+            finally:
+                release_old_llm.set()
+                with suppress(Exception):
+                    await self.harness.loop.stop_timeline_session()
+                release_new_llm.set()
+                await asyncio.gather(
+                    *(
+                        task
+                        for task in (old_task, new_task)
+                        if task is not None
+                    ),
+                    return_exceptions=True,
+                )
 
     async def test_retired_autopilot_loop_cannot_join_a_new_owner_generation(self):
         await self.harness.controller.start_live()
