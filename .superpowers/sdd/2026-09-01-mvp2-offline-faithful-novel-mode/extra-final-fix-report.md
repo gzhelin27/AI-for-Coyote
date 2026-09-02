@@ -393,3 +393,165 @@ exit code 0
 - mutation check：若恢复共享布尔，RED 元组失败；若 retire 不释放 token，新 owner 无法开始；若旧 finally 无条件清 busy，旧 LLM release 后的最终 `assertTrue(turn_busy)` 失败。
 - 永远不退出的第三方 coroutine 仍可能作为 retired task 占用内存，这是 asyncio 的协作式取消限制；本轮保证它不再占用共享 busy、output 或 session owner。
 - 本轮没有新依赖、网络、设备、push、merge 或 tag；完整后端的 5 项 skip 仍是既有平台/权限条件。
+
+## Extra-wave fix round 2：retired 回合的逻辑状态隔离
+
+日期：2026-09-02
+
+复审起点：`5aaa70c87e31324486082e577286dd9e0791ecc4`
+
+修复提交：`6fc2366675422459a07534214123671f0bbab96c`
+
+### 复审结论与根因
+
+fix round 1 已把共享 busy 改成 task/generation scoped token，使双有界 retire 后新 owner 可以进入真实 LLM，且旧 `finally` 不会清除新 owner 的 busy。但真实 `_autopilot_turn()` 仍在 LLM await 前把自动 prompt 直接追加到共享 `history`；取消抵抗的旧 LLM 在 retire 后恢复时，又无条件递增 `turn_count`、追加 assistant reply 并调用 `on_ai_turn`。既有 session routing generation 只拒绝迟到的物理动作，不能阻止这些逻辑状态写入。
+
+因此 reviewer 探针在旧 LLM release 前观察到 `(turn_count=0, history_len=2, chat=[], A=0)`，release 后变成 `(1, 3, ['retired timeline line'], 0)`：两条 prompt 分别来自旧、新 owner，而迟到旧 reply 又污染了未来模型上下文和页面 chat。
+
+### RED
+
+先扩展上一轮的真实生产路径测试；测试仍经过 `_autopilot_loop()` → `_autopilot_turn()`，只在外部 `llm.chat` seam 让旧调用永久吞 `CancelledError`，不 mock `_autopilot_turn`。新 owner 在旧 LLM 未 release 前必须已经进入第二个 LLM await 并持有 busy；旧任务 release 前后都断言共享状态为 `(turn_count=0, history=[], chat=[], A=0, busy=True)`。
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_game_loop_timeline.GameLoopTimelineTests.test_retired_real_autopilot_turn_cannot_starve_clear_or_mutate_new_owner -v
+```
+
+基线实现稳定失败（以下仅把很长的固定 prompt 正文归一化为 `<old prompt>` / `<new prompt>`，状态值与失败结果保持原样）：
+
+```text
+test_retired_real_autopilot_turn_cannot_starve_clear_or_mutate_new_owner ... FAIL
+
+AssertionError: Tuples differ:
+((0, [<old prompt>, <new prompt>], [], 0, True),
+ (1, [<old prompt>, <new prompt>,
+      {'role': 'assistant', 'content': 'retired timeline line'}],
+     ['retired timeline line'], 0, True))
+!=
+((0, [], [], 0, True), (0, [], [], 0, True))
+
+Ran 1 test in 0.285s
+FAILED (failures=1)
+exit code 1
+```
+
+这个 RED 同时证明：旧 prompt 在 retire 前已经污染共享 history；旧 LLM 恢复后又污染 counter、reply 和 chat callback；物理 A 输出虽然已由旧 routing generation 拒绝，仍不足以隔离完整回合。
+
+### GREEN / 最小修复
+
+- 新增冻结的 `_AutopilotTurnToken`，捕获当前 asyncio task、单调 `_autopilot_generation`、本回合 busy token，以及已有的 session action origin（controller identity、routing generation、mode、session ID）。
+- 每次创建真实 autopilot owner 时递增 generation；校验同时要求 task 仍是当前 `autopilot_task`、generation 未变、autopilot 仍启用、busy 所有权仍有效，且 session provenance 仍匹配并处于 running。
+- 自动 prompt 和进入 LLM 的 history 使用本回合局部深拷贝 staging，不再在 await 前写共享 history。LLM 返回后、动作 await 后、channel floor 后和最终 publish/callback 前重新校验 token；任一校验失败即返回 `None`，完全丢弃旧 prompt/result。
+- 只有仍为 current 的回合才写 `turn_count/history`、执行/保底动作和调用 `on_ai_turn`。回调继续在 busy token 释放后运行，保持正常回合既有可见行为；用户消息、观察和主动开场路径未改。
+
+同一生产路径测试在最终实现上：
+
+```text
+test_retired_real_autopilot_turn_cannot_starve_clear_or_mutate_new_owner ... ok
+
+Ran 1 test in 0.332s
+OK
+exit code 0
+```
+
+### 本轮变更文件
+
+- `backend/game_loop.py`：immutable autopilot/session turn token、单调 owner generation、局部 history staging，以及 publish 前 identity 复核。
+- `tests/test_game_loop_timeline.py`：扩展真实 cancellation-resistant LLM 回归，覆盖新 owner 已开始、旧任务 release 前后逻辑状态不变、无旧 chat/output、旧 `finally` 不清新 busy。
+
+### 本轮完整验证输出
+
+GameLoop 模块 fresh 复核：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_game_loop_timeline
+```
+
+```text
+Ran 26 tests in 3.587s
+OK
+exit code 0
+```
+
+GameLoop、session endpoints 与 AppState timeline 聚焦：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline -v
+```
+
+```text
+Ran 118 tests in 28.002s
+OK
+exit code 0
+```
+
+完整后端 authoritative run：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest discover -s tests -p 'test_*.py'
+```
+
+```text
+Ran 586 tests in 71.142s
+OK (skipped=5)
+exit code 0
+```
+
+Python 编译：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m compileall -q backend tests
+```
+
+```text
+exit code 0
+(no stdout)
+```
+
+前端测试（当前 shell 没有 npm，因此用桌面环境提供的 Node 直接执行 `package.json` 的同一 `node --test tests/*.test.mjs` 脚本）：
+
+```text
+tests 9
+suites 0
+pass 9
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 120.5285
+exit code 0
+```
+
+前端生产构建（同一 Node 依次执行现有 `tsc` 与 `vite build`）：
+
+```text
+tsc: exit code 0 (no stdout)
+
+vite v6.4.3 building for production...
+✓ 1608 modules transformed.
+dist/index.html                               0.42 kB │ gzip:  0.31 kB
+dist/assets/theme-cushou-CHvRhc1C.png       532.71 kB
+dist/assets/theme-pingpinghui-BWDEkUrz.png  728.78 kB
+dist/assets/index-4HIDINJO.css               30.99 kB │ gzip:  6.63 kB
+dist/assets/index-Doxnx5Pn.js               275.92 kB │ gzip: 84.82 kB
+✓ built in 1.50s
+exit code 0
+```
+
+Git whitespace 检查：
+
+```text
+git diff --check
+exit code 0
+仅有 Windows autocrlf 的 LF→CRLF warning；无 whitespace error。
+```
+
+环境说明：首次 `npm.cmd test` 因当前 shell 无 npm 而未启动；随后尝试的 bundled pnpm 启动器在执行项目脚本前因其 `ERR_PNPM_IGNORED_BUILDS` 策略退出，并生成两个未跟踪 workspace/lock 文件。两个确定由本轮启动器生成的文件已删除，未保留依赖、lockfile 或 workspace 变更；authoritative frontend test/build 均直接使用现有安装树完成。
+
+### 本轮自审与剩余风险
+
+- mutation check：移除任一 LLM 后 identity gate，旧任务会恢复 RED 中的 counter/history/chat 污染；恢复 await 前共享 prompt 写入，则 release 前 history 断言失败；移除 generation/task 检查，则旧 task 可在新 session 中发布；移除 busy token 归属检查，则 retire 隔离不完整。
+- token 为冻结值，generation 单调递增；session action origin 复用既有 controller routing generation，避免只比较可能被旧回合覆盖的全局布尔/值。
+- 新 owner 的 prompt 也保持局部，因而在其 LLM 尚未完成时共享 history 仍为空；旧 owner 恢复前后测试均以完整 history 列表断言，不只是检查输出强度。
+- 正常回合仍在 busy 释放后 publish/callback；26 项 GameLoop 与 118 项相关聚焦验证覆盖用户消息、观察、主动开场和正常 timeline autopilot，未观察到非 autopilot 路径行为变化。
+- 永久不退出的第三方 LLM coroutine 仍会作为 retired task 占用内存直到自身退出，这是 asyncio 协作式取消的既有边界；本轮保证它不再拥有 busy、session/output 或逻辑 history/chat/counter 发布权。
+- 完整后端的 5 项 skip 仍为既有平台/权限条件；本轮无新依赖、网络、设备、push、merge 或 tag。
