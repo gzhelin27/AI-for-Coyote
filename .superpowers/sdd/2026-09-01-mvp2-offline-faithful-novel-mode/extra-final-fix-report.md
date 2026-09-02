@@ -555,3 +555,165 @@ exit code 0
 - 正常回合仍在 busy 释放后 publish/callback；26 项 GameLoop 与 118 项相关聚焦验证覆盖用户消息、观察、主动开场和正常 timeline autopilot，未观察到非 autopilot 路径行为变化。
 - 永久不退出的第三方 LLM coroutine 仍会作为 retired task 占用内存直到自身退出，这是 asyncio 协作式取消的既有边界；本轮保证它不再拥有 busy、session/output 或逻辑 history/chat/counter 发布权。
 - 完整后端的 5 项 skip 仍为既有平台/权限条件；本轮无新依赖、网络、设备、push、merge 或 tag。
+
+## Extra-wave fix round 3：并发用户 history 的 optimistic commit
+
+日期：2026-09-02
+
+复审起点：`a4789140936d334306a5ac856652a89637a5f93e`
+
+修复提交：`7e514cd217529127a2af194566d2e3a802b9e6a4`
+
+### 复审结论与根因
+
+fix round 2 把 autopilot prompt/history 保持为局部 staging，并用 task/session generation 阻止 retired owner 发布；但一个仍属于当前 session 的 autopilot 在 LLM await 期间允许正常 `/api/chat` 完成。task、autopilot generation、busy token 与 session routing generation 此时都仍匹配，因此最终 `self.history = turn_history` 会用 LLM 开始前的整表快照覆盖刚提交的用户消息和回复。
+
+这是 optimistic snapshot 缺少 logical-history version 的 last-writer-wins：session identity 能回答“是不是当前会话”，不能回答“模型上下文在 await 期间是否已被别的正常回合推进”。用锁包住 LLM 会让不协作调用阻塞用户回合与安全生命周期，因此不符合 ledger 裁定。
+
+### RED
+
+新增真实生产并发回归：通过 `/api/session/start` 启动真实 autopilot loop，让第一笔真实 `_autopilot_turn` 阻塞在外部 LLM seam；随后通过真实 `/api/chat` 完成用户回合，再释放当前（非 retired）autopilot LLM。测试不 mock `_autopilot_turn`、`handle_user_message` 或 HTTP route，并让迟到 autopilot 返回一个非空 A 强度动作，以同时观察 history、counter、chat 与 action 边界。
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_session_endpoints.SessionEndpointTests.test_chat_commit_invalidates_a_blocked_current_autopilot_turn -v
+```
+
+基线实现稳定失败：
+
+```text
+test_chat_commit_invalidates_a_blocked_current_autopilot_turn ... FAIL
+
+AssertionError: Tuples differ:
+(2,
+ [{'role': 'user', 'content': '<staged auto prompt>'},
+  {'role': 'assistant', 'content': 'stale autopilot line'}],
+ ['stale autopilot line'],
+ 40)
+!=
+(1,
+ [{'role': 'user', 'content': 'user survives'},
+  {'role': 'assistant', 'content': 'user line'}],
+ [],
+ 0)
+
+Ran 1 test in 0.114s
+FAILED (failures=1)
+exit code 1
+```
+
+失败证明用户回合完成后，当前 autopilot 仍覆盖了两条用户 history，额外增加一次 `turn_count`，发布 stale chat，并实际执行 A=40；不是只存在不可见的内部 snapshot 差异。
+
+### GREEN / 最小修复
+
+- `GameLoop` 新增从 0 单调递增的 `_history_revision`，以及唯一的 `_commit_history()` 写入边界；每次逻辑 history commit 先替换完整列表，再推进 revision。
+- 用户 prompt/reply、主动开场 prompt/reply、观察 prompt/reply、clear，以及 autopilot 成功/失败的 history commit 全部统一经过该边界；生产文件中不再存在绕过 helper 的 `self.history` append/clear/assignment。
+- 冻结的 `_AutopilotTurnToken` 增加捕获时的 `history_revision`。捕获 revision、复制 history 和创建 token 之间没有 await，也不持有跨 LLM 的锁。
+- `_autopilot_turn_is_current()` 同时校验 logical-history revision。LLM 返回后的第一道 gate 位于 `turn_count += 1` 和 `_execute_ai_actions()` 之前；revision 有任何推进时直接返回 `None`，不 merge、不覆盖、不执行 action、不写 chat。后续既有 await 后 gates 也复用同一 revision 校验。
+- 无竞争 autopilot 的 revision 保持一致并按原顺序提交 prompt+reply；普通 user/opening/observe/clear 的可见 history 内容与回合行为保持不变。
+
+同一 HTTP 生产路径测试在最终实现上：
+
+```text
+test_chat_commit_invalidates_a_blocked_current_autopilot_turn ... ok
+
+Ran 1 test in 0.105s
+OK
+exit code 0
+```
+
+上一轮 retired owner 回归与本轮用户并发回归组合复核：
+
+```text
+Ran 2 tests in 0.385s
+OK
+exit code 0
+```
+
+### 本轮变更文件
+
+- `backend/game_loop.py`：单调 logical-history revision、统一 commit ledger、autopilot token revision 捕获/校验。
+- `tests/test_session_endpoints.py`：真实 session start + blocked autopilot LLM + `/api/chat` 并发回归。
+
+### 本轮完整验证输出
+
+GameLoop、session endpoints 与 AppState timeline 聚焦：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest tests.test_game_loop_timeline tests.test_session_endpoints tests.test_app_state_timeline -v
+```
+
+```text
+Ran 119 tests in 28.136s
+OK
+exit code 0
+```
+
+完整后端 authoritative run：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m unittest discover -s tests -p 'test_*.py'
+```
+
+```text
+Ran 587 tests in 72.834s
+OK (skipped=5)
+exit code 0
+```
+
+Python 编译：
+
+```powershell
+& 'D:\AI-for-Coyote\.venv\Scripts\python.exe' -m compileall -q backend tests
+```
+
+```text
+exit code 0
+(no stdout)
+```
+
+前端测试（桌面环境 Node 直接执行现有 `node --test tests/*.test.mjs` 脚本）：
+
+```text
+tests 9
+suites 0
+pass 9
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 118.9374
+exit code 0
+```
+
+前端生产构建（同一 Node 依次执行现有 `tsc` 与 `vite build`）：
+
+```text
+tsc: exit code 0 (no stdout)
+
+vite v6.4.3 building for production...
+✓ 1608 modules transformed.
+dist/index.html                               0.42 kB │ gzip:  0.31 kB
+dist/assets/theme-cushou-CHvRhc1C.png       532.71 kB
+dist/assets/theme-pingpinghui-BWDEkUrz.png  728.78 kB
+dist/assets/index-4HIDINJO.css               30.99 kB │ gzip:  6.63 kB
+dist/assets/index-Doxnx5Pn.js               275.92 kB │ gzip: 84.82 kB
+✓ built in 1.42s
+exit code 0
+```
+
+Git whitespace 检查：
+
+```text
+git diff --check
+exit code 0
+仅有 Windows autocrlf 的 LF→CRLF warning；无 whitespace error。
+```
+
+### 本轮自审与剩余风险
+
+- 数据流审计：`rg` 显示生产中的 `self.history =` 仅存在于 `_commit_history`；user/opening/observe/clear/autopilot 的每个 prompt/reply commit 均推进 revision。
+- mutation check：移除 token 的 revision 字段或 compare，本轮 RED 恢复；把首次 compare 移到 `turn_count`/action 后，只检查 history 的测试仍可能通过，但 count/A 断言会失败；若尝试 merge staged auto 结果，完整 literal history 断言失败。
+- 测试在释放 autopilot 前先断言 `/api/chat` 已得到 `user line` 且共享 history 为完整两条用户记录；释放后再次断言相同列表、`turn_count=1`、chat 为空、A=0，覆盖“保留用户 + 丢弃 stale auto”的双边契约。
+- revision check 是同步整数比较，没有锁或 await；不协作 LLM 不会阻塞用户 history commit。竞争时 autopilot 结果按 ledger 丢弃，下一正常 interval 可基于新 history 重试。
+- `_history_revision` 是进程内单调整数；未来任何新增直接 history 写入必须继续经过 `_commit_history`。当前生产搜索无旁路。
+- 完整后端的 5 项 skip 仍为既有平台/权限条件；本轮无新依赖、网络、设备、push、merge 或 tag。
