@@ -5,6 +5,7 @@ Pinned file primitives are shared with the existing local analysis store.
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterable
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -73,14 +74,65 @@ class VideoSourceStore:
         name = source_id + '.media'
         temporary = '.' + source_id + '.tmp'
         files = self._files
-        files._verify_root()
-        descriptor = files._open_relative(temporary, create=True, writable=True)
+        descriptor = None
         installed = False
         committed = False
-        try:
+        total, digest = 0, hashlib.sha256()
+
+        async def disk(operation):
+            task = asyncio.create_task(asyncio.to_thread(operation))
+            cancelled = False
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            result = task.result()
+            if cancelled:
+                raise asyncio.CancelledError()
+            return result
+
+        def create():
+            nonlocal descriptor
+            files._verify_root()
+            descriptor = files._open_relative(temporary, create=True, writable=True)
+            self._verified(_DirectoryHandle(descriptor), temporary)
+
+        def write(part):
+            digest.update(part)
+            while part:
+                written = os.write(descriptor, part)
+                if written <= 0:
+                    raise OSError('video write made no progress')
+                part = part[written:]
+
+        def install(source):
+            nonlocal installed
+            os.fsync(descriptor)
+            files._verify_root()
             handle = _DirectoryHandle(descriptor)
             self._verified(handle, temporary)
-            total, digest = 0, hashlib.sha256()
+            files._install_relative(descriptor, temporary, name)
+            installed = True
+            self._verified(handle, name)
+            files._write_atomically(source_id + '.json',
+                                    {'version': 1, 'source': asdict(source), 'csv': None},
+                                    maximum_size=_RECORD_LIMIT, create_only=True)
+
+        def cleanup():
+            if descriptor is None:
+                return
+            try:
+                if not committed and os.name == 'nt':
+                    files._mark_windows_delete(descriptor)
+            finally:
+                os.close(descriptor)
+            if not committed:
+                files._delete_relative_regular(name if installed else temporary)
+                files._delete_relative_regular(source_id + '.json')
+
+        try:
+            await disk(create)
             async for chunk in chunks:
                 if not isinstance(chunk, bytes):
                     raise ValueError('video stream must yield bytes')
@@ -90,34 +142,15 @@ class VideoSourceStore:
                 view = memoryview(chunk)
                 for offset in range(0, len(view), _CHUNK):
                     part = view[offset:offset + _CHUNK]
-                    digest.update(part)
-                    while part:
-                        written = os.write(descriptor, part)
-                        if written <= 0:
-                            raise OSError('video write made no progress')
-                        part = part[written:]
+                    await disk(lambda: write(part))
             if total == 0:
                 raise ValueError('empty video')
-            os.fsync(descriptor)
-            files._verify_root()
-            self._verified(handle, temporary)
-            files._install_relative(descriptor, temporary, name)
-            installed = True
-            self._verified(handle, name)
             source = VideoSource(source_id, filename, digest.hexdigest(), total, duration_ms)
-            files._write_atomically(source_id + '.json',
-                                    {'version': 1, 'source': asdict(source), 'csv': None},
-                                    maximum_size=_RECORD_LIMIT, create_only=True)
+            await disk(lambda: install(source))
             committed = True
             return source
         finally:
-            try:
-                if not committed and os.name == 'nt':
-                    files._mark_windows_delete(descriptor)
-            finally:
-                os.close(descriptor)
-            if not committed:
-                files._delete_relative_regular(name if installed else temporary)
+            await disk(cleanup)
 
     def _record(self, source_id):
         source_id = self._id(source_id)

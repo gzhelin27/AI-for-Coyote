@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+from unittest.mock import patch
 import unittest
 
 from backend.video.source import VideoSourceStore
@@ -52,6 +54,29 @@ class VideoSourceTests(unittest.IsolatedAsyncioTestCase):
         for duration in (True, 0, -1, 1.2, float('inf'), 10**20):
             with self.assertRaises(ValueError):
                 await self.store.import_stream('x', chunks(b'x'), duration)
+
+    async def test_slow_disk_write_does_not_block_event_loop_and_cancel_waits_for_cleanup(self):
+        entered, release = threading.Event(), threading.Event()
+        original_write = os.write
+        def slow_write(descriptor, payload):
+            if not entered.is_set():
+                entered.set()
+                release.wait(0.3)
+            return original_write(descriptor, payload)
+        with patch('backend.video.source.os.write', slow_write):
+            task = asyncio.create_task(self.store.import_stream('x', chunks(b'abc'), 2000))
+            await asyncio.sleep(0.05)
+            try:
+                self.assertTrue(entered.is_set())
+                self.assertFalse(task.done(), 'disk write blocked the event loop')
+                task.cancel()
+                await asyncio.sleep(0.01)
+                self.assertFalse(task.done(), 'cancel must wait before closing active disk descriptor')
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(list(self.root.iterdir()), [])
 
     async def test_binding_is_atomic_persistent_and_source_specific(self):
         source = await self.store.import_stream('same.mp4', chunks(b'one'), 2000)
