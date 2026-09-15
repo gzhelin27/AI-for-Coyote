@@ -73,70 +73,55 @@ class VideoDryRunIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def strength(self, channel='A'):
         return self.output.snapshot(channel).strength
 
-    async def test_full_ramp_survives_thirty_second_blocks_then_tail_gap_clears(self):
+    async def test_immediate_targets_survive_blocks_without_repeated_strength_commands(self):
         plan = await self.load('0:00:00,0:01:10,30,15\n')
         self.assertEqual([(b.start_ms, b.end_ms) for b in plan.blocks],
                          [(0, 30000), (30000, 60000), (60000, 70000)])
         await self.observe(0)
-        self.assertEqual((self.strength(), self.strength('B')), (10, 10))
-        await self.advance(1999)
-        self.assertEqual(self.strength(), 10)
-        await self.advance(1)
-        self.assertEqual(self.strength(), 11)
-        await self.advance(18000)
-        self.assertEqual((self.strength(), self.strength('B')), (20, 15))
-        await self.advance(9900)
-        self.assertEqual(self.strength(), 24)
+        self.assertEqual((self.strength(), self.strength('B')), (30, 15))
+        await self.advance(29900)
         old_pattern = self.session.state()['channels']['A']['pattern']
         await self.advance(100)
-        self.assertEqual(self.strength(), 25)
+        self.assertEqual((self.strength(), self.strength('B')), (30, 15))
         self.assertNotEqual(self.session.state()['channels']['A']['pattern'], old_pattern)
-        await self.advance(9900)
-        self.assertEqual(self.strength(), 29)
-        await self.advance(100)
-        self.assertEqual(self.strength(), 30)
-        a_audit = [event for event in self.session.audit if event['channel'] == 'A']
-        self.assertEqual([(event['confirmed_at'], event['strength']) for event in a_audit],
-                         [(0., 10), (2., 11), (4., 12), (6., 13), (8., 14),
-                          (10., 15), (12., 16), (14., 17), (16., 18), (18., 19),
-                          (20., 20), (22., 21), (24., 22), (26., 23), (28., 24),
-                          (30., 25), (32., 26), (34., 27), (36., 28), (38., 29), (40., 30)])
-        await self.advance(19900)
-        prior_pattern = self.session.state()['channels']['A']['pattern']
+        await self.advance(29900)
+        old_pattern = self.session.state()['channels']['A']['pattern']
         await self.advance(100)
         self.assertEqual((self.strength(), self.strength('B')), (30, 15))
-        self.assertNotEqual(self.session.state()['channels']['A']['pattern'], prior_pattern)
+        self.assertNotEqual(self.session.state()['channels']['A']['pattern'], old_pattern)
         await self.advance(9999)
         self.assertEqual((self.strength(), self.strength('B')), (30, 15))
+        self.assertEqual([(event['channel'], event['confirmed_at'], event['strength'])
+                          for event in self.session.audit], [('A', 0., 30), ('B', 0., 15)])
         await self.advance(1)
         self.assertEqual((self.strength(), self.strength('B')), (0, 0))
         self.assertIsNone(self.session.state()['block'])
 
-    async def test_new_targets_use_permitted_jump_and_two_second_excess(self):
-        await self.load('0:00:00,0:00:21,20,0\n'
-                        '0:00:21,0:00:22,30,0\n'
-                        '0:00:22,0:00:23,20,0\n'
-                        '0:00:23,0:00:30,31,0\n')
+    async def test_changed_targets_are_immediate_and_large_targets_remain_capped(self):
+        await self.load('0:00:00,0:00:01,20,0\n'
+                        '0:00:01,0:00:02,30,0\n'
+                        '0:00:02,0:00:03,20,0\n'
+                        '0:00:03,0:00:04,31,0\n'
+                        '0:00:04,0:00:10,60,15\n')
         await self.observe(0)
-        await self.advance(20000)
         self.assertEqual(self.strength(), 20)
-        await self.advance(1000)
-        self.assertEqual(self.strength(), 30)  # 20 -> 30 is immediate.
-        await self.advance(1000)
-        self.assertEqual(self.strength(), 20)  # Decreases do not wait.
-        await self.advance(1000)
-        self.assertEqual(self.strength(), 30)  # 20 -> 31 starts with +10.
-        await self.advance(1999)
-        self.assertEqual(self.strength(), 30)
-        await self.advance(1)
-        self.assertEqual(self.strength(), 31)
-        self.assertEqual(self.strength('B'), 0)
+        for expected in (30, 20, 31, 40):
+            await self.advance(1000)
+            self.assertEqual(self.strength(), expected)
+        state = self.session.state()['channels']
+        self.assertEqual((state['A']['target'], state['A']['capped_target'], state['A']['strength']),
+                         (60, 40, 40))
+        self.assertEqual(self.strength('B'), 15)
+        await self.advance(2000)
+        self.assertEqual([(event['confirmed_at'], event['strength']) for event in self.session.audit
+                          if event['channel'] == 'A'],
+                         [(0., 20), (1., 30), (2., 20), (3., 31), (4., 40)])
 
-    async def test_seek_pause_clears_and_resume_uses_confirmed_zero(self):
+    async def test_seek_pause_clears_and_resume_applies_current_targets(self):
         await self.load('0:00:00,0:01:10,30,15\n')
         await self.observe(0)
         await self.advance(4000)
-        self.assertEqual((self.strength(), self.strength('B')), (12, 12))
+        self.assertEqual((self.strength(), self.strength('B')), (30, 15))
         await self.observe(65000, 'seeking', epoch=self.session.epoch + 1)
         self.assertEqual((self.strength(), self.strength('B')), (0, 0))
         await self.observe(65000, 'paused')
@@ -146,9 +131,9 @@ class VideoDryRunIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.strength(), self.strength('B')), (0, 0))
         await self.observe(65000)
         self.assertEqual(self.session.state()['block']['index'], 2)
-        self.assertEqual((self.strength(), self.strength('B')), (10, 10))
+        self.assertEqual((self.strength(), self.strength('B')), (30, 15))
         await self.advance(2000)
-        self.assertEqual((self.strength(), self.strength('B')), (11, 11))
+        self.assertEqual((self.strength(), self.strength('B')), (30, 15))
         await self.observe(state='paused')
         self.assertEqual((self.strength(), self.strength('B')), (0, 0))
 

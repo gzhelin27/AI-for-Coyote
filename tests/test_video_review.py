@@ -41,7 +41,7 @@ class VideoReviewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_normal_boundary_does_not_reset_confirmed_strength_with_inflight_wave(self):
         await self.observe(29400)
-        self.assertEqual(self.output.snapshot('A').strength, 10)
+        self.assertEqual(self.output.snapshot('A').strength, 30)
         # A continuation's network write is in flight when the next media block arrives.
         self.h.safety.dry_run = False
         original_send = self.h.relay.send_frame
@@ -64,7 +64,7 @@ class VideoReviewTests(unittest.IsolatedAsyncioTestCase):
         resets = [f for f in self.h.relay.sent_frames if f['data']['m'] == 'device.op'
                   and f['data']['data']['t'] == 7]
         self.assertEqual(resets, [], 'normal waveform boundary must preserve confirmed intensity')
-        self.assertEqual(self.output.snapshot('A').strength, 10)
+        self.assertEqual(self.output.snapshot('A').strength, 30)
 
     async def test_paused_new_node_and_watchdog_do_not_resume(self):
         await self.observe(0)

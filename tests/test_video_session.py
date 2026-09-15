@@ -45,14 +45,14 @@ class VideoSessionTests(unittest.IsolatedAsyncioTestCase):
             await self.session.tick()
             await self.session.flush()
 
-    async def test_conditional_ramp_then_permitted_next_target(self):
+    async def test_video_targets_apply_immediately_and_independently(self):
         await self.observe(0)
-        self.assertEqual(self.output.snapshot('A').strength, 10)
+        self.assertEqual(self.output.snapshot('A').strength, 20)
         await self.advance(2)
-        self.assertEqual(self.output.snapshot('A').strength, 11)
+        self.assertEqual(self.output.snapshot('A').strength, 20)
         await self.advance(28)
         self.assertEqual(self.output.snapshot('A').strength, 30)
-        self.assertEqual(self.output.snapshot('B').strength, 10)
+        self.assertEqual(self.output.snapshot('B').strength, 15)
         self.assertFalse(self.h.relay.sent_frames)  # Entire run is simulated.
 
     async def test_seek_selects_current_block_and_paused_seek_stays_zero(self):
@@ -62,7 +62,7 @@ class VideoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.output.snapshot('A').strength, 0)
         await self.observe(65000, epoch=2)
         self.assertEqual(self.session.state()['block']['index'], 2)
-        self.assertEqual(self.output.snapshot('A').strength, 10)
+        self.assertEqual(self.output.snapshot('A').strength, 30)
         await self.observe(75000, 'seeking', epoch=3)
         await self.observe(75000, epoch=3)
         self.assertEqual(self.output.snapshot('A').strength, 0)
@@ -79,12 +79,13 @@ class VideoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.session.state()['status'], 'playing')
         self.assertEqual(self.output.snapshot('A').strength, 0)
 
-    async def test_repeated_clock_does_not_reset_wave_or_restart_ramp(self):
+    async def test_repeated_clock_does_not_reset_wave_or_resend_strength(self):
         await self.observe(0)
         for _ in range(10):
             await self.observe(0)
-        self.assertEqual(self.output.snapshot('A').strength, 10)
+        self.assertEqual(self.output.snapshot('A').strength, 20)
         self.assertEqual(self.output.offsets['A'], 5)
+        self.assertEqual([(item['channel'], item['strength']) for item in self.session.audit], [('A', 20)])
 
     async def test_state_reports_processed_sequence_and_safety_epoch(self):
         await self.observe(0)
