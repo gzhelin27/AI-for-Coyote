@@ -73,6 +73,8 @@ def make_endpoint_state(harness):
     state.audio = FakeSensor()
     state.loop = harness.loop
     state.replay_store = harness.store
+    state.story_import_directory = harness.store.root / "stories"
+    state.story_source_max_bytes = 20 * 1024 * 1024
     state.timeline_session = harness.controller
     state.ws_clients = set()
     state.tasks = []
