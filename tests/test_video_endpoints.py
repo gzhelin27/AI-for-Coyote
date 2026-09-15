@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 import unittest
@@ -148,6 +149,36 @@ class VideoEndpointTests(unittest.TestCase):
                 result = self.client.post('/api/video/sessions', json={'source_id': source_id})
                 self.assertEqual(result.status_code, 409)
                 self.assertIsNone(self.state.video_session)
+            finally:
+                release.set()
+            self.assertEqual(legacy.result().status_code, 200)
+
+    def test_waiting_video_start_cannot_block_legacy_cancellation(self):
+        source_id = self.import_source()
+        self.client.post(f'/api/video/sources/{source_id}/csv', files={'file': ('x.csv', CSV)})
+        entered, cancelled, release = threading.Event(), threading.Event(), threading.Event()
+        @self.app.post('/api/story/locked-owner')
+        async def locked_owner():
+            async with self.state.timeline_transition_lock:
+                entered.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+            return {'done': True}
+        @self.app.post('/api/story/cancel-owner')
+        async def cancel_owner():
+            cancelled.set()
+            release.set()
+            return {'cancelled': True}
+        with ThreadPoolExecutor() as pool:
+            legacy = pool.submit(self.client.post, '/api/story/locked-owner')
+            try:
+                self.assertTrue(entered.wait(1))
+                starting = pool.submit(self.client.post, '/api/video/sessions', json={'source_id': source_id})
+                time.sleep(0.1)
+                cancelling = pool.submit(self.client.post, '/api/story/cancel-owner')
+                self.assertEqual(starting.result(timeout=0.5).status_code, 409)
+                self.assertEqual(cancelling.result(timeout=0.5).status_code, 200)
+                self.assertTrue(cancelled.is_set())
             finally:
                 release.set()
             self.assertEqual(legacy.result().status_code, 200)

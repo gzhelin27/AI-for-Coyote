@@ -209,6 +209,10 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
             raise HTTPException(409, str(exc)) from exc
         plan_id = await storage_call(lambda: source_store().save_plan(source_id, plan))
         async with video_start_guard():
+            # Do not wait for a legacy owner's transition lock while holding
+            # the mode lock needed by its cancellation request.
+            if legacy_requests:
+                raise HTTPException(409, 'another playback or device request is in progress')
             if source_id in binding_sources or version != binding_versions.get(source_id, 0):
                 raise HTTPException(409, 'CSV changed while starting video; retry playback')
             if presets != state.safety.presets:
