@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ from unittest.mock import patch
 import unittest
 
 from backend.video.source import VideoSourceStore
+from backend.video.waveforms import resolve_video_plan
 
 
 CSV = b'start_time,end_time,A_target,B_target\n0:00:00,0:00:01,20,0\n'
@@ -123,6 +125,30 @@ class VideoSourceTests(unittest.IsolatedAsyncioTestCase):
         destination.write_text(json.dumps(record))
         with self.assertRaises(ValueError):
             self.store.get(source.source_id)
+
+    async def test_resolved_plan_is_persisted_atomically_with_content_identities(self):
+        source = await self.store.import_stream('video.mp4', chunks(b'one'), 2000)
+        timeline = self.store.bind_csv(source.source_id, CSV)
+        plan = resolve_video_plan(timeline, allowed=('wave-a',), library_sha256='a' * 64, seed=42)
+        plan_id = self.store.save_plan(source.source_id, plan)
+        path = self.root / (plan_id + '.plan.json')
+        saved = json.loads(path.read_text())
+        self.assertEqual(saved['source']['sha256'], hashlib.sha256(b'one').hexdigest())
+        self.assertEqual(saved['source']['source_id'], source.source_id)
+        self.assertEqual(saved['csv_sha256'], timeline.sha256)
+        self.assertEqual((saved['seed'], saved['library_sha256']), (42, 'a' * 64))
+        self.assertEqual([(b['start_ms'], b['end_ms'], b['a_pattern'], b['a_target'], b['b_pattern'])
+                         for b in saved['blocks']], [(0, 1000, 'wave-a', 20, None)])
+        before = path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.store.save_plan(source.source_id, replace(plan, timeline_sha256='b' * 64))
+        with self.assertRaises(ValueError):
+            self.store.save_plan(source.source_id, replace(plan, blocks=()))
+        with patch.object(self.store._files, '_write_atomically', side_effect=OSError('disk unavailable')):
+            with self.assertRaises(OSError):
+                self.store.save_plan(source.source_id, plan)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(list(self.root.glob('*.plan.json'))), 1)
 
     async def test_redirected_root_is_rejected(self):
         target = Path(self.tmp.name) / 'target'

@@ -158,6 +158,59 @@ class VideoEndpointTests(unittest.TestCase):
                 release.set()
             self.assertEqual(handoff.result().status_code, 200)
 
+    def test_replacement_waits_for_clear_even_after_old_session_marks_closed(self):
+        self.start_session()
+        prior = self.state.video_session
+        prior.closed = True
+        entered, release = threading.Event(), threading.Event()
+        async def pending_clear(reason):
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return prior.state()
+        with patch.object(prior, 'close', pending_clear), ThreadPoolExecutor() as pool:
+            replacement = pool.submit(self.client.post, '/api/video/sessions', json={'source_id': prior.source_id})
+            try:
+                self.assertTrue(entered.wait(1), 'replacement skipped outstanding old clear')
+                self.assertFalse(replacement.done())
+                self.assertIs(self.state.video_session, prior)
+            finally:
+                release.set()
+            self.assertEqual(replacement.result().status_code, 200)
+
+    def test_plan_persistence_failure_prevents_session_activation(self):
+        source_id = self.import_source()
+        self.client.post(f'/api/video/sources/{source_id}/csv', files={'file': ('x.csv', CSV)})
+        with patch.object(VideoSourceStore, 'save_plan', side_effect=OSError('disk unavailable')):
+            response = self.client.post('/api/video/sessions', json={'source_id': source_id})
+        self.assertEqual(response.status_code, 409)
+        self.assertIsNone(self.state.video_session)
+
+    def test_slow_plan_commit_allows_estop_and_binding_change_prevents_activation(self):
+        source_id = self.import_source()
+        self.client.post(f'/api/video/sources/{source_id}/csv', files={'file': ('x.csv', CSV)})
+        entered, release = threading.Event(), threading.Event()
+        original = VideoSourceStore.save_plan
+        def slow_save(store, identity, plan):
+            saved = original(store, identity, plan)
+            entered.set()
+            release.wait(3)
+            return saved
+        with patch.object(VideoSourceStore, 'save_plan', slow_save), ThreadPoolExecutor() as pool:
+            start = pool.submit(self.client.post, '/api/video/sessions', json={'source_id': source_id})
+            try:
+                self.assertTrue(entered.wait(1))
+                stop = pool.submit(self.client.post, '/api/estop')
+                self.assertEqual(stop.result(timeout=0.5).status_code, 200)
+                self.assertIsNone(self.state.video_session)
+                changed = self.client.post(f'/api/video/sources/{source_id}/csv',
+                    files={'file': ('new.csv', CSV.replace(b',20,0', b',30,0'))})
+                self.assertEqual(changed.status_code, 200)
+            finally:
+                release.set()
+            self.assertEqual(start.result().status_code, 409)
+            self.assertIsNone(self.state.video_session)
+
     def test_session_start_rejects_csv_replaced_during_source_scan(self):
         self.start_session()
         identity = self.state.video_session.source_id

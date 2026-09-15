@@ -17,7 +17,7 @@ import secrets
 
 from backend.story.analysis_store import AnalysisStore, _DirectoryHandle
 from .csv_timeline import parse_video_csv
-from .models import VideoCsv
+from .models import VideoCsv, VideoPlan
 
 _CHUNK = 1024 * 1024
 _RECORD_LIMIT = 20 * 1024 * 1024
@@ -220,6 +220,10 @@ class VideoSourceStore:
 
     def bound_csv(self, source_id: str) -> VideoCsv | None:
         source, document = self._record(source_id)
+        return self._binding(source, document)
+
+    @staticmethod
+    def _binding(source, document):
         binding = document.get('csv')
         if binding is None:
             return None
@@ -231,3 +235,46 @@ class VideoSourceStore:
         if timeline.sha256 != binding.get('sha256'):
             raise ValueError('CSV identity mismatch')
         return timeline
+
+    def save_plan(self, source_id: str, plan: VideoPlan) -> str:
+        """Atomically retain resolved values before a session can own output.
+
+        This synchronous disk operation belongs in a worker thread. Each plan
+        receives a new opaque ID, so a failed save cannot replace prior evidence.
+        """
+        source, document = self._record(source_id)
+        timeline = self._binding(source, document)
+        if (not isinstance(plan, VideoPlan) or timeline is None
+                or plan.timeline_sha256 != timeline.sha256
+                or type(plan.seed) is not int
+                or not isinstance(plan.library_sha256, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', plan.library_sha256)
+                or not isinstance(plan.blocks, tuple) or len(plan.blocks) > 100000):
+            raise ValueError('resolved plan does not match the video binding')
+        index = 0
+        for row in timeline.intervals:
+            for start in range(row.start_ms, row.end_ms, 30000):
+                if index >= len(plan.blocks):
+                    raise ValueError('resolved plan has missing blocks')
+                block = plan.blocks[index]
+                if ((block.row_id, block.index, block.start_ms, block.end_ms,
+                     block.a_target, block.b_target) !=
+                        (row.row_id, index, start, min(start + 30000, row.end_ms),
+                         row.a_target, row.b_target)):
+                    raise ValueError('resolved plan has inconsistent blocks')
+                for target, pattern in ((block.a_target, block.a_pattern),
+                                        (block.b_target, block.b_pattern)):
+                    if ((target == 0 and pattern is not None) or
+                            (target > 0 and (not isinstance(pattern, str) or not pattern))):
+                        raise ValueError('resolved plan has invalid waveforms')
+                index += 1
+        if index != len(plan.blocks):
+            raise ValueError('resolved plan has extra blocks')
+        plan_id = secrets.token_hex(16)
+        record = {'version': 1, 'plan_id': plan_id, 'source': asdict(source),
+                  'csv_sha256': timeline.sha256, 'seed': plan.seed,
+                  'library_sha256': plan.library_sha256,
+                  'blocks': [asdict(block) for block in plan.blocks]}
+        self._files._write_atomically(plan_id + '.plan.json', record,
+                                     maximum_size=_RECORD_LIMIT, create_only=True)
+        return plan_id

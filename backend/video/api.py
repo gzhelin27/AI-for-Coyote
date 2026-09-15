@@ -50,7 +50,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
 
     async def close_current(reason):
         session = state.video_session
-        if session is not None and not session.closed:
+        if session is not None:
             result = await session.close(reason)
             remember(result)
             return result
@@ -172,6 +172,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
             plan = await asyncio.to_thread(prepare_plan)
         except (ValueError, TypeError) as exc:
             raise HTTPException(409, str(exc)) from exc
+        plan_id = await storage_call(lambda: source_store().save_plan(source_id, plan))
         async with mode_lock:
             if source_id in binding_sources or version != binding_versions.get(source_id, 0):
                 raise HTTPException(409, 'CSV changed while starting video; retry playback')
@@ -195,7 +196,8 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
                                       duration_ms=source.duration_ms, timeline=timeline,
                                       dry_run=bool(state.cfg.get('app', {}).get('dry_run', True)))
                     state.video_session = session
-                    return await session.start()
+                    result = await session.start()
+                    return dict(result, plan_id=plan_id)
                 except (ValueError, TypeError, RuntimeError, OSError) as exc:
                     await close_current('start_failed')
                     raise HTTPException(409, str(exc)) from exc
@@ -213,7 +215,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
         async with mode_lock:
             current = state.video_session
             if current is not None and current.state()['session_id'] == session_id:
-                result = current.state() if current.closed else await current.close('operator_stop')
+                result = await current.close('operator_stop')
                 remember(result)
                 return result
             return retired_sessions.get(session_id, {'session_id': session_id, 'status': 'ended'})
@@ -266,7 +268,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
             if state.video_session is session and not session.closed:
                 session.interrupt('socket_disconnected')
             async with mode_lock:
-                if state.video_session is session and not session.closed:
+                if state.video_session is session:
                     remember(await session.close('socket_disconnected'))
             if socket_owner is socket:
                 socket_owner = None
