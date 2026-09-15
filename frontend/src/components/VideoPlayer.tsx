@@ -241,7 +241,6 @@ export default function VideoPlayer() {
           <div><dt className="text-muted">限幅目标</dt><dd>{channel.capped_target}</dd></div>
           <div><dt className="text-muted">已确认强度</dt><dd>{channel.strength}</dd></div>
         </dl><p className="mt-2 text-sm">波形：{channel.pattern ?? '停止'}</p>
-        {channel.ramping && <p className="mt-1 text-xs text-muted">缓升中：每 2 秒最多增加 1；区间结束可能尚未达到目标。</p>}
         {channel.target > channel.capped_target && <p className="mt-1 text-xs text-warn">目标受当前安全上限约束。</p>}
         {channel.reason && <p className="mt-1 text-xs text-muted">原因：{channel.reason}</p>}
       </div>;
@@ -249,6 +248,7 @@ export default function VideoPlayer() {
     <details className="text-sm text-muted"><summary className="cursor-pointer">CSV 格式与播放规则</summary>
       <pre className="mt-2 overflow-x-auto rounded-lg bg-ink2 p-3">{'start_time,end_time,A_target,B_target\n0:10:20,0:11:30,20,15'}</pre>
       <p className="mt-2">时间使用 H:MM:SS 文本格式；未覆盖区间归零。每行独立划分最多 30 秒的随机波形段，定位后保持已选序列。视频与 CSV 单独绑定，上传不会自动播放。</p>
+      <p className="mt-2">强度直接到达限幅目标，即 CSV 目标与当前安全上限的较小值；定位后继续播放、暂停后恢复也采用同一规则。实际输出以设备确认为准。</p>
     </details>
   </section>;
 }

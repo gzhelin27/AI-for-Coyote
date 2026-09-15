@@ -140,3 +140,13 @@ test('current sequence safety pause is authoritative while waiting recovery is n
     assert.equal(h.video.paused, true);
   } finally { h.restore(); }
 });
+test('video displays direct capped targets without obsolete ramp indicators', async () => {
+  const h = harness(); try {
+    await prepared(h);
+    h.receive({ ...initial(), channels: { A: { target: 60, capped_target: 40, strength: 40,
+      pattern: 'synthetic', ramping: true, reason: null }, B: initial().channels.B } });
+    assert.match(h.text(), /直接到达限幅目标/);
+    assert.match(h.text(), /CSV 目标60限幅目标40已确认强度40/);
+    assert.doesNotMatch(h.text(), /缓升|每 2 秒/);
+  } finally { h.restore(); }
+});

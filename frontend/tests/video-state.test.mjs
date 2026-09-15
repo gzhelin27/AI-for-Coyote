@@ -16,7 +16,7 @@ test('state preserves requested capped and confirmed values and pause reason', (
     source_id: 'src', row: { start_ms: 620000, end_ms: 690000 }, block: { start_ms: 620000, end_ms: 650000, index: 0 },
     channels: { A: { target: 60, capped_target: 40, strength: 10, pattern: 'wave', ramping: true, reason: 'cap' }, B: { target: 0, capped_target: 0, strength: 0, pattern: null, ramping: false, reason: null } }, dry_run: true });
   assert.equal(state.channels.A.target, 60); assert.equal(state.channels.A.capped_target, 40);
-  assert.equal(state.channels.A.strength, 10); assert.equal(state.channels.A.ramping, true);
+  assert.equal(state.channels.A.strength, 10); assert.equal('ramping' in state.channels.A, false);
   assert.equal(state.row.start_ms, 620000); assert.equal(state.dry_run, true);
 });
 test('malformed active state fails closed and timecode supports hours above 23', () => {

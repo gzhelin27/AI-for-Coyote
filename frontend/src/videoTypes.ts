@@ -1,7 +1,7 @@
 export type VideoMediaState = 'playing' | 'paused' | 'seeking' | 'waiting' | 'ended' | 'error';
 export interface VideoChannel {
   target: number; capped_target: number; strength: number;
-  pattern: string | null; ramping: boolean; reason: string | null;
+  pattern: string | null; reason: string | null;
 }
 export interface VideoState {
   session_id: string | null; source_id: string | null;
@@ -22,7 +22,7 @@ const nullableText = (value: unknown): string | null => typeof value === 'string
 function channel(value: unknown): VideoChannel {
   const row = record(value);
   return { target: integer(row.target), capped_target: integer(row.capped_target), strength: integer(row.strength),
-    pattern: nullableText(row.pattern), ramping: row.ramping === true, reason: nullableText(row.reason) };
+    pattern: nullableText(row.pattern), reason: nullableText(row.reason) };
 }
 function interval(value: unknown): { start_ms: number; end_ms: number } | null {
   const row = record(value);
