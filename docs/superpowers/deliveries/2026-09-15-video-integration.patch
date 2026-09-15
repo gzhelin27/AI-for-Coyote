@@ -19,16 +19,41 @@
          self._sync_output_coordinator_channel(channel)
          confirmed_strength = self.output_coordinator.confirmed(channel).strength
          effective_cap = self.safety.cap_for(channel)
-@@ -1722,6 +1734,8 @@
+@@ -1716,12 +1728,33 @@
+             enabled=bool(self.safety.enabled.get(channel, True)),
+         )
+ 
++    def _register_video_output(self, session):
++        # Registration is internal to VideoSession.start, not a JSON operation.
++        from .video.session import VideoSession
++        if type(session) is not VideoSession or session.output.loop is not self or session.closed:
++            raise ValueError("invalid video output owner")
++        previous = getattr(self, "_video_owner_session", None)
++        if previous is not None and previous is not session and (not previous.closed or previous._clear_required):
++            raise ValueError("previous video output has not completed cleanup")
++        self._video_owner_session = session
++        self._video_owner_token = object()
++        return self._video_owner_token
++
++    def _video_owner_allows(self, token, revision, actions, generations):
++        session = getattr(self, "_video_owner_session", None)
++        return (token is not None and token is getattr(self, "_video_owner_token", None)
++                and session is not None and revision == session._revision
++                and session._authorizes_output(actions, generations))
++
+     async def execute_actions(
+         self,
+         actions: list,
          *,
          intent: OutputIntentKind = OutputIntentKind.MANUAL,
          owner_generations: Mapping[str, int] | None = None,
 +        waveform_managed_channels: tuple[str, ...] = (),
 +        video_remaining_ms=None,
++        _video_owner=None,
      ) -> tuple[list, list]:
          """Validate and execute actions through the single output coordinator.
  
-@@ -1731,6 +1745,14 @@
+@@ -1731,6 +1764,20 @@
          """
          if not isinstance(intent, OutputIntentKind):
              raise ValueError("intent must be an OutputIntentKind")
@@ -40,13 +65,24 @@
 +            raise ValueError("managed waveform channels require timeline ownership")
 +        if video_remaining_ms is not None and (not waveform_managed_channels or not callable(video_remaining_ms)):
 +            raise ValueError("video deadline requires owned waveform execution")
++        if _video_owner is not None and (
++                _video_owner is not getattr(self, "_video_owner_token", None)
++                or intent is not OutputIntentKind.TIMELINE_OR_REPLAY
++                or not waveform_managed_channels or video_remaining_ms is None):
++            raise ValueError("invalid internal video authority")
++        video_revision = self._video_owner_session._revision if _video_owner is not None else None
          effective_intent = intent
          if (
              intent is OutputIntentKind.MANUAL
-@@ -1752,11 +1774,17 @@
+@@ -1751,12 +1798,23 @@
+             }
          )
          async with self._action_lock:
++            if _video_owner is not None and not self._video_owner_allows(_video_owner, video_revision, actions, generations):
++                return [], [{"action": action, "reason": "retired video output authority"} for action in actions]
              previous = self._execution_context
++            previous_video = getattr(self, "_video_execution_context", None)
++            self._video_execution_context = (_video_owner, video_revision, actions, generations) if _video_owner is not None else None
 +            previous_managed = getattr(self, "_waveform_managed_channels", ())
 +            previous_deadline = getattr(self, "_video_remaining_ms", None)
 +            self._waveform_managed_channels = waveform_managed_channels
@@ -56,12 +92,13 @@
                  return await self._execute_actions_locked(actions)
              finally:
                  self._execution_context = previous
++                self._video_execution_context = previous_video
 +                self._waveform_managed_channels = previous_managed
 +                self._video_remaining_ms = previous_deadline
  
      async def _execute_actions_locked(self, actions: list) -> tuple[list, list]:
          """校验并执行动作列表，返回 (已执行说明列表, 被拒绝说明列表)。"""
-@@ -1794,7 +1822,7 @@
+@@ -1794,7 +1852,7 @@
                      strength_channel = None
                  if strength_channel in ("A", "B"):
                      activation_strength_channels.add(strength_channel)
@@ -70,17 +107,28 @@
                  continue
              wave_ok, _, wave_cmd = self.safety.validate(candidate)
              if wave_ok and wave_cmd and wave_cmd.get("channel") in ("A", "B"):
-@@ -1824,6 +1852,9 @@
+@@ -1823,7 +1881,19 @@
+                     prerequisite_channel = None
                  if prerequisite_channel in activation_ready:
                      activation_ready[prerequisite_channel] = False
-             ok, reason, cmd = self.safety.validate(action)
+-            ok, reason, cmd = self.safety.validate(action)
++            video_context = getattr(self, "_video_execution_context", None)
++            if video_context is not None:
++                if not self._video_owner_allows(*video_context):
++                    dropped.append({"action": action, "reason": "retired video output authority"})
++                    continue
++                ok, reason, cmd = self.safety.validate(action, _video_hold_authority=self.safety._video_hold_authority)
++                if ok and cmd:
++                    cmd["_video_owner_check"] = lambda context=video_context: self._video_owner_allows(*context)
++            else:
++                ok, reason, cmd = self.safety.validate(action)
 +            if (ok and cmd and action.get("op") in ("pulse_video", "hold_strength")
 +                    and getattr(self, "_video_remaining_ms", None) is not None):
 +                cmd["_video_remaining_ms"] = self._video_remaining_ms
              if (
                  not ok
                  and self.safety.estop_active
-@@ -1892,6 +1923,7 @@
+@@ -1892,6 +1962,7 @@
                  cmd["kind"] in ("hold", "add", "temp")
                  and channel in ("A", "B")
                  and channel not in explicit_cycle_channels
@@ -88,11 +136,15 @@
                  and channel not in self.loop_tasks
                  and not self.safety.pulse_active().get(channel)
              )
-@@ -2015,6 +2047,19 @@
+@@ -2015,6 +2086,23 @@
              ):
                  state["error"] = "stale output safety policy"
                  return TransportOutcome(sent=False, error=state["error"])
 +            remaining = cmd.get("_video_remaining_ms")
++            owner_check = cmd.get("_video_owner_check")
++            if owner_check is not None and not owner_check():
++                state["error"] = "retired video output authority"
++                return TransportOutcome(sent=False, error=state["error"])
 +            if remaining is not None:
 +                # Recompute after the action/coordinator locks and any earlier
 +                # queue ACK, immediately before building the physical frames.
@@ -108,7 +160,7 @@
              helper_cmd = self._default_wave_command(channel) if helper_required else None
              if helper_required and helper_cmd is None:
                  state["error"] = "默认波形不可用"
-@@ -2714,7 +2759,7 @@
+@@ -2714,7 +2802,7 @@
              frames.append(
                  self.ops.pulse(
                      client_id, slot_id, ch, cmd["frames"],

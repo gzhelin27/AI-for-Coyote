@@ -1,0 +1,97 @@
+--- a/backend/game_loop.py
++++ b/backend/game_loop.py
+@@ -1728,6 +1728,24 @@
+             enabled=bool(self.safety.enabled.get(channel, True)),
+         )
+ 
++    def _register_video_output(self, session):
++        # Registration is internal to VideoSession.start, not a JSON operation.
++        from .video.session import VideoSession
++        if type(session) is not VideoSession or session.output.loop is not self or session.closed:
++            raise ValueError("invalid video output owner")
++        previous = getattr(self, "_video_owner_session", None)
++        if previous is not None and previous is not session and (not previous.closed or previous._clear_required):
++            raise ValueError("previous video output has not completed cleanup")
++        self._video_owner_session = session
++        self._video_owner_token = object()
++        return self._video_owner_token
++
++    def _video_owner_allows(self, token, revision, actions, generations):
++        session = getattr(self, "_video_owner_session", None)
++        return (token is not None and token is getattr(self, "_video_owner_token", None)
++                and session is not None and revision == session._revision
++                and session._authorizes_output(actions, generations))
++
+     async def execute_actions(
+         self,
+         actions: list,
+@@ -1736,6 +1754,7 @@
+         owner_generations: Mapping[str, int] | None = None,
+         waveform_managed_channels: tuple[str, ...] = (),
+         video_remaining_ms=None,
++        _video_owner=None,
+     ) -> tuple[list, list]:
+         """Validate and execute actions through the single output coordinator.
+ 
+@@ -1753,6 +1772,12 @@
+             raise ValueError("managed waveform channels require timeline ownership")
+         if video_remaining_ms is not None and (not waveform_managed_channels or not callable(video_remaining_ms)):
+             raise ValueError("video deadline requires owned waveform execution")
++        if _video_owner is not None and (
++                _video_owner is not getattr(self, "_video_owner_token", None)
++                or intent is not OutputIntentKind.TIMELINE_OR_REPLAY
++                or not waveform_managed_channels or video_remaining_ms is None):
++            raise ValueError("invalid internal video authority")
++        video_revision = self._video_owner_session._revision if _video_owner is not None else None
+         effective_intent = intent
+         if (
+             intent is OutputIntentKind.MANUAL
+@@ -1773,7 +1798,11 @@
+             }
+         )
+         async with self._action_lock:
++            if _video_owner is not None and not self._video_owner_allows(_video_owner, video_revision, actions, generations):
++                return [], [{"action": action, "reason": "retired video output authority"} for action in actions]
+             previous = self._execution_context
++            previous_video = getattr(self, "_video_execution_context", None)
++            self._video_execution_context = (_video_owner, video_revision, actions, generations) if _video_owner is not None else None
+             previous_managed = getattr(self, "_waveform_managed_channels", ())
+             previous_deadline = getattr(self, "_video_remaining_ms", None)
+             self._waveform_managed_channels = waveform_managed_channels
+@@ -1783,6 +1812,7 @@
+                 return await self._execute_actions_locked(actions)
+             finally:
+                 self._execution_context = previous
++                self._video_execution_context = previous_video
+                 self._waveform_managed_channels = previous_managed
+                 self._video_remaining_ms = previous_deadline
+ 
+@@ -1851,7 +1881,16 @@
+                     prerequisite_channel = None
+                 if prerequisite_channel in activation_ready:
+                     activation_ready[prerequisite_channel] = False
+-            ok, reason, cmd = self.safety.validate(action)
++            video_context = getattr(self, "_video_execution_context", None)
++            if video_context is not None:
++                if not self._video_owner_allows(*video_context):
++                    dropped.append({"action": action, "reason": "retired video output authority"})
++                    continue
++                ok, reason, cmd = self.safety.validate(action, _video_hold_authority=self.safety._video_hold_authority)
++                if ok and cmd:
++                    cmd["_video_owner_check"] = lambda context=video_context: self._video_owner_allows(*context)
++            else:
++                ok, reason, cmd = self.safety.validate(action)
+             if (ok and cmd and action.get("op") in ("pulse_video", "hold_strength")
+                     and getattr(self, "_video_remaining_ms", None) is not None):
+                 cmd["_video_remaining_ms"] = self._video_remaining_ms
+@@ -2048,6 +2087,10 @@
+                 state["error"] = "stale output safety policy"
+                 return TransportOutcome(sent=False, error=state["error"])
+             remaining = cmd.get("_video_remaining_ms")
++            owner_check = cmd.get("_video_owner_check")
++            if owner_check is not None and not owner_check():
++                state["error"] = "retired video output authority"
++                return TransportOutcome(sent=False, error=state["error"])
+             if remaining is not None:
+                 # Recompute after the action/coordinator locks and any earlier
+                 # queue ACK, immediately before building the physical frames.
