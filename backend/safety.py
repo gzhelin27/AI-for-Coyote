@@ -17,7 +17,7 @@ logger = logging.getLogger("ai-for-coyote.safety")
 
 VALID_OPS = {
     "temp_strength", "hold_strength", "add_strength", "pulse", "pulse_hold",
-    "pulse_cycle", "clear", "stop",
+    "pulse_cycle", "pulse_video", "clear", "stop",
 }
 
 
@@ -133,6 +133,8 @@ class SafetyManager:
                 return self._validate_pulse_hold(action)
             if op == "pulse_cycle":
                 return self._validate_pulse_cycle(action)
+            if op == "pulse_video":
+                return self._validate_pulse_video(action)
             if op == "clear":
                 return self._validate_clear(action)
             if op == "stop":
@@ -322,6 +324,26 @@ class SafetyManager:
                 "duration_ms": len(frames) * 100,
             },
         )
+
+    def _validate_pulse_video(self, a: dict):
+        """Bounded video chunk built only from a validated local preset."""
+        ok, reason, cmd = self._validate_pulse_cycle(a)
+        duration = a.get("duration_ms")
+        offset = a.get("frame_offset", 0)
+        if (type(duration) is not int or duration <= 0 or
+                type(offset) is not int or not 0 <= offset <= 1_000_000_000):
+            raise SafetyError("视频波形时长或帧位置无效")
+        meta = self._preset_meta(cmd["pattern"])
+        limit = min(30_000, int(self.max_pulse_s * 1000),
+                    int(meta["max_duration_s"] * 1000))
+        count = min(duration, limit) // 100
+        if count < 1:
+            raise SafetyError("视频波形剩余时间不足一帧")
+        base = cmd["frames"]
+        cmd["frames"] = [base[(offset + i) % len(base)] for i in range(count)]
+        cmd["duration_ms"] = count * 100
+        cmd["immediate"] = a.get("append") is not True
+        return ok, reason, cmd
 
     def _validate_clear(self, a: dict):
         ch = None

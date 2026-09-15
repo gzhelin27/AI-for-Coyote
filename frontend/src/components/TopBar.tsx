@@ -1,6 +1,6 @@
 import { useApp } from "../store";
 
-export type ViewName = "control" | "novel" | "history" | "pair" | "settings";
+export type ViewName = "control" | "novel" | "video" | "history" | "pair" | "settings";
 
 interface Props {
   view: ViewName;
@@ -18,6 +18,7 @@ export default function TopBar({ view, onView }: Props) {
   const nav: { key: ViewName; label: string }[] = [
     { key: "control", label: "控制台" },
     { key: "novel", label: "小说" },
+    { key: "video", label: "视频" },
     { key: "history", label: "历史" },
     { key: "settings", label: "设置" },
   ];
