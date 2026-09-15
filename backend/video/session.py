@@ -8,7 +8,6 @@ import time
 
 from .csv_timeline import find_interval
 from .waveforms import find_block
-from .ramp import RampPolicy
 
 
 class VideoSession:
@@ -26,8 +25,6 @@ class VideoSession:
         self._revision, self._dirty, self._clear_required = 0, False, False
         self._observed_at, self._lease_until = clock(), 0.
         self._last_clear_attempt = -math.inf
-        self._ramps = {c: RampPolicy() for c in ('A', 'B')}
-        self._requested = {'A': None, 'B': None}
         self._wave_keys = {'A': None, 'B': None}
         self._wave_until = {'A': 0., 'B': 0.}
         self._boundary_cleared = None
@@ -36,6 +33,7 @@ class VideoSession:
 
     async def start(self):
         await self.output.clear()
+        self.output.bind_session(self)
         self.output.claim()
         if self._watch_enabled:
             self._watcher = asyncio.create_task(self._watch(), name='video-lease-watchdog')
@@ -54,10 +52,10 @@ class VideoSession:
                       '未覆盖区间' if row is None else
                       '已停止' if self.status != 'playing' else
                       '安全上限' if target > snap.cap else
-                      '缓升中' if snap.strength < capped else None))
+                      '等待输出确认' if snap.strength != capped else None))
             channels[c] = {'target': target, 'capped_target': capped, 'strength': snap.strength,
                            'pattern': pattern if self.status == 'playing' and target else None,
-                           'ramping': self.status == 'playing' and snap.strength < capped, 'reason': reason}
+                           'reason': reason}
         return {'session_id': self.session_id, 'source_id': self.source_id,
                 'status': self.status, 'epoch': self.epoch, 'sequence': self.sequence,
                 'position_ms': self.position_ms,
@@ -98,8 +96,6 @@ class VideoSession:
                 if self.output.inflight_strength or next_block is None:
                     self.output.preempt()
                     self._clear_required = True
-                    for ramp in self._ramps.values():
-                        ramp.cancel()
                 else:
                     self.output.retire_normal()
         self.sequence, self.epoch = sequence, epoch
@@ -127,9 +123,6 @@ class VideoSession:
         self.status, self.error = status, error
         self._lease_until = 0.
         self._clear_required = True
-        for ramp in self._ramps.values():
-            ramp.cancel()
-        self._requested = {'A': None, 'B': None}
         # Crucially not behind _work or a transport lock: this wakes ACK waiters.
         self.output.preempt()
         self._schedule()
@@ -150,8 +143,6 @@ class VideoSession:
                     if find_block(self.plan, block.end_ms) is None or self.output.inflight_strength:
                         self.output.preempt()
                         self._clear_required = True
-                        for ramp in self._ramps.values():
-                            ramp.cancel()
                     else:
                         self.output.retire_normal()
                 self._schedule()
@@ -173,6 +164,33 @@ class VideoSession:
         deadline = min(self._lease_until, now + max(0, block.end_ms - projected) / 1000)
         start = max(now, self._wave_until[channel]) if append else now
         return max(0, int(round((deadline - start) * 1000)))
+
+    def _authorizes_output(self, actions, generations):
+        """Validate executor intent against this live, independently parsed plan."""
+        if (self.closed or self.status != 'playing' or self._clear_required
+                or not self.output.is_current() or generations != self.output.generations
+                or self.clock() >= self._lease_until or len(actions) != 1):
+            return False
+        block = find_block(self.plan, self.position_ms)
+        if block is None:
+            return False
+        action = actions[0]
+        channel = action.get('channel')
+        if channel not in ('A', 'B'):
+            return False
+        snapshot = self.output.snapshot(channel)
+        requested = getattr(block, f'{channel.lower()}_target')
+        if not requested or snapshot.blocked or not snapshot.enabled:
+            return False
+        if action.get('op') == 'hold_strength':
+            return (self._remaining(block, channel, append=False) > 0
+                    and type(action.get('value')) is int
+                    and action['value'] == min(requested, snapshot.cap))
+        # A queued waveform may reach its block deadline while this owner and
+        # lease remain valid. The transport deadline guard discards that stale
+        # fragment as a normal boundary, rather than retiring the session.
+        return (action.get('op') == 'pulse_video'
+                and action.get('pattern') == getattr(block, f'{channel.lower()}_pattern'))
 
     async def _drive(self):
         while self._dirty:
@@ -208,10 +226,7 @@ class VideoSession:
                         break
                     snap = self.output.snapshot(channel)
                     requested = getattr(block, f'{channel.lower()}_target') if block else 0
-                    ramp = self._ramps[channel]
                     if not requested:
-                        ramp.cancel()
-                        self._requested[channel] = 0
                         if snap.strength or self._wave_keys[channel] is not None:
                             await self.output.clear((channel,))
                             if revision != self._revision:
@@ -231,21 +246,16 @@ class VideoSession:
                             self.output.preempt()
                             self._schedule()
                         continue
-                    if self._requested[channel] != requested and min(requested, snap.cap) == snap.strength:
-                        ramp.cancel()
-                    self._requested[channel] = requested
-                    proposal = ramp.propose(requested=requested, confirmed=snap.strength, cap=snap.cap,
-                                            max_step=snap.max_step, now_s=self.clock())
-                    if proposal is not None:
+                    target = min(requested, snap.cap)
+                    if target != snap.strength:
                         submitted_at = self.clock()
                         observed_at, observed_position = self._observed_at, self.position_ms
-                        receipt = await self.output.set_strength(channel, proposal.strength,
+                        receipt = await self.output.set_strength(channel, target,
                             remaining=lambda b=block, c=channel: self._remaining(b, c, append=False))
                         if revision != self._revision:
                             break
                         if not receipt.success:
                             raise RuntimeError(receipt.error)
-                        ramp.confirm(proposal, actual=receipt.strength, now_s=self.clock())
                         self._record(channel, requested, receipt.strength, block.index,
                                      submitted_at, observed_at, observed_position, snap.cap)
                     if revision != self._revision or self.clock() >= self._lease_until:

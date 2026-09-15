@@ -9,7 +9,6 @@ from backend.output_coordinator import OutputIntentKind
 class OutputSnapshot:
     strength: int
     cap: int
-    max_step: int
     enabled: bool
     blocked: bool
 
@@ -31,6 +30,10 @@ class GameLoopVideoOutput:
         self.inflight_strength = False
         self.generations = {}
         self.offsets = {'A': 0, 'B': 0}
+        self._owner_token = None
+
+    def bind_session(self, session):
+        self._owner_token = self.loop._register_video_output(session)
 
     def claim(self):
         self.generations = self.loop.begin_timeline_output(('A', 'B'))
@@ -40,7 +43,7 @@ class GameLoopVideoOutput:
         confirmed = self.loop.output_coordinator.confirmed(channel)
         pending = self.loop.output_coordinator.pending(channel)
         return OutputSnapshot(
-            int(confirmed.strength or 0), safety.cap_for(channel), safety.max_step,
+            int(confirmed.strength or 0), safety.cap_for(channel),
             confirmed.enabled and safety.desired_enabled.get(channel, False),
             safety.estop_active or safety.overheat.get(channel, False)
             or pending.clear_required or pending.target_strength is not None)
@@ -72,7 +75,8 @@ class GameLoopVideoOutput:
         executed, dropped = await self.loop.execute_actions(
             [action], intent=OutputIntentKind.TIMELINE_OR_REPLAY,
             owner_generations=dict(self.generations), waveform_managed_channels=(channel,),
-            video_remaining_ms=remaining)
+            video_remaining_ms=remaining,
+            _video_owner=self._owner_token if remaining is not None else None)
         if dropped or not executed:
             if action.get('op') == 'pulse_video' and dropped and dropped[0].get('reason') == 'video block deadline elapsed':
                 return OutputReceipt(True, self.snapshot(channel).strength)

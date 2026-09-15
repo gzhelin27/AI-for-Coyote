@@ -77,6 +77,24 @@ class VideoReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.output.snapshot('A').strength, 0)
         self.assertEqual(self.output.snapshot('B').strength, 0)
 
+    async def test_late_wave_fragment_at_normal_boundary_is_not_playback_error(self):
+        await self.observe(29400)
+        self.assertEqual(self.output.snapshot('A').strength, 30)
+        self.now = .45
+        await self.h.loop._action_lock.acquire()
+        try:
+            await self.session.tick()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertFalse(self.session._work.done())
+            self.now = .7
+        finally:
+            self.h.loop._action_lock.release()
+        await self.session.flush()
+        self.assertEqual(self.session.status, 'playing', self.session.state())
+        await self.observe(30000)
+        self.assertEqual(self.output.snapshot('A').strength, 30)
+
 
     async def test_delayed_queue_clear_cannot_send_wave_past_block_end(self):
         self.h.safety.dry_run = False

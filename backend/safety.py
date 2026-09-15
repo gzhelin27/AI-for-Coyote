@@ -3,7 +3,7 @@
 
 规则（任何来源——AI 或手动——都必须经过这里）：
 1. 每通道独立强度上限（配置，默认 100），超出的值一律钳制；
-2. 单条指令强度变化量不超过 max_strength_step（防跳变）；
+2. 普通指令限制 max_strength_step；已验证的内部视频会话可直达限幅目标；
 3. 单次波形/临时强度时长不超过配置上限（默认 10s），到点自动归零；
 4. 设备过热时，该通道上限临时降到 overheat_reduce_to；
 5. 急停（estop）：清零全部通道 + 清波形 + 暂停 AI 循环；
@@ -42,6 +42,15 @@ class DeviceOutputError(RuntimeError):
         self.detail = detail
 
 
+class _VideoHoldAuthority:
+    """Immutable in-process capability; snapshots preserve its identity."""
+
+    __slots__ = ()
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 class SafetyManager:
     def __init__(self, cfg) -> None:
         s = cfg["safety"]
@@ -56,6 +65,8 @@ class SafetyManager:
         self.min_pulse_s = float(p["min_duration_s"])
         self.max_temp_s = float(s["max_temp_duration_s"])
         self.max_step = int(s["max_strength_step"])
+        # An in-process identity, never an action/CSV field or global policy switch.
+        self._video_hold_authority = _VideoHoldAuthority()
         self.overheat_reduce_to = int(s["overheat_reduce_to"])
         self.presets = dict(cfg["presets"])  # 中文波形名 -> {waveform, frames, default/max_duration_s}
         self.playback = dict(p)
@@ -106,7 +117,7 @@ class SafetyManager:
         return v
 
     # ---------- 校验入口 ----------
-    def validate(self, action) -> tuple[bool, str, dict | None]:
+    def validate(self, action, *, _video_hold_authority=None) -> tuple[bool, str, dict | None]:
         """校验一条动作指令。
 
         返回 (是否通过, 说明, 内部命令)。
@@ -124,7 +135,7 @@ class SafetyManager:
             if op == "temp_strength":
                 return self._validate_temp(action)
             if op == "hold_strength":
-                return self._validate_hold(action)
+                return self._validate_hold(action, limit_step=_video_hold_authority is not self._video_hold_authority)
             if op == "add_strength":
                 return self._validate_add(action)
             if op == "pulse":
@@ -178,11 +189,11 @@ class SafetyManager:
             return f"{ch} 通道已手动关闭，拒绝动作"
         return None
 
-    def _safe_target(self, ch: str, raw_value) -> tuple[int, int]:
+    def _safe_target(self, ch: str, raw_value, *, limit_step=True) -> tuple[int, int]:
         """统一钳制目标强度。
 
         所有“设到某个值”的入口都必须走这里：先受通道有效上限约束，
-        再限制单条指令的上升幅度。降低强度不限制步长，确保清零、急停
+        再按执行上下文限制单条指令的上升幅度。降低强度不限制步长，确保清零、急停
         和过热降档可以立即生效。
 
         返回 (实际目标值, 当前有效上限)。
@@ -194,7 +205,7 @@ class SafetyManager:
         cap = self.cap_for(ch)
         target = max(0, min(requested, cap))
         current = max(0, min(int(self.current.get(ch, 0)), cap))
-        if target > current:
+        if limit_step and target > current:
             target = min(target, current + self.max_step)
         return target, cap
 
@@ -214,12 +225,12 @@ class SafetyManager:
             {"kind": "temp", "channel": ch, "value": value, "duration_s": duration_s},
         )
 
-    def _validate_hold(self, a: dict):
+    def _validate_hold(self, a: dict, *, limit_step=True):
         """持续强度：保持设定值，直到清除/急停/停止。"""
         ch = self.norm_channel(a.get("channel"))
         if (reason := self._check_enabled(ch)):
             raise SafetyError(reason)
-        value, cap = self._safe_target(ch, a.get("value", 0))
+        value, cap = self._safe_target(ch, a.get("value", 0), limit_step=limit_step)
         return (
             True,
             f"{ch} 通道持续强度 {value}（上限 {cap}，保持到清除）",
