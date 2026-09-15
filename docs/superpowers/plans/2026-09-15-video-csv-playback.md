@@ -1,5 +1,7 @@
 # Video CSV Playback Implementation Plan
 
+> **2026-09-15 approved rule update — supersedes the ramp portions below:** Video strength now directly executes `min(CSV target, current effective channel cap)`, including seek/resume. The earlier conditional-ramp Task 3, ramp module/interfaces, +1 timer behavior, ramp UI fields and ramp-based acceptance examples below are historical and must not be implemented or restored. Use section 4 and acceptance cases 8–11 of the updated [video design](../specs/2026-09-15-video-csv-playback-design.md) as the current contract. Only an internally authorized, valid, exclusive `VideoSession` may use direct strength; external JSON cannot enable it. Ordinary modes retain `max_step`. Existing caps, ownership/generation checks, confirmation, immediate clearing and all safety stops remain mandatory. This update does not change deployment or real-device acceptance gates.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Use superpowers:test-driven-development for implementation and superpowers:verification-before-completion before completion claims. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Play a local video with a validated per-video intensity CSV, deterministic random 30-second waveform blocks, and conditional strength ramps through the existing safety path.
