@@ -1,0 +1,18 @@
+{
+  "backend/game_loop.py": {
+    "baseline_normalized_sha256": "44359bb316c55271b05a5c89af20b9df2b48ba151e9606153aade618462096b6",
+    "result_normalized_sha256": "ed8a068251bc2486847e927eccc7d247c5230b556266d013e614e87abda9243b"
+  },
+  "backend/main.py": {
+    "baseline_normalized_sha256": "2e69e0f5d6523feacbf95620b61467422b252924e5925b617b7acc9c819e571f",
+    "result_normalized_sha256": "9ad809ed935be1f2d3964f39318b6ac37ed6e859306443b4ff06a19e3e29f847"
+  },
+  "frontend/src/App.tsx": {
+    "baseline_normalized_sha256": "869633320c110abeaa294678d995785c9719cfeb15428259fcd72d2f30c02657",
+    "result_normalized_sha256": "720eea34b9cdf6112f5c0d2c374321738b1adfb072c4821104506df6fa579e79"
+  },
+  "tests/test_story_endpoints.py": {
+    "baseline_normalized_sha256": "f90f93842fcd61ee6c47da1f1673020feba900f31b9203da045f904eeebdb507",
+    "result_normalized_sha256": "8f8c5e66d256564b9334a7111df77cc7877324e145dee0a2994e53b7cb1cefc1"
+  }
+}

@@ -1,0 +1,186 @@
+--- a/backend/game_loop.py
++++ b/backend/game_loop.py
+@@ -1234,6 +1234,18 @@
+         applied = self.safety.set_user_cap(channel, requested_cap)
+         if self.safety.cap_for(channel) < previous_effective_cap:
+             self.output_coordinator.invalidate_queued_normal(channel)
++            active_intent, active_generations = self._execution_context
++            if (
++                self._action_lock.locked()
++                and active_intent < OutputIntentKind.SAFETY_REDUCE
++                and (active_generations is None or channel in active_generations)
++            ):
++                # The last confirmed strength may still be below the new cap
++                # while an unacknowledged increase is queued on the phone.
++                # Retire that work before waiting for its action lock. Since
++                # its physical result is uncertain, settle with a full clear
++                # instead of deriving a reduction from the old snapshot.
++                self.require_output_clear((channel,))
+         self._sync_output_coordinator_channel(channel)
+         confirmed_strength = self.output_coordinator.confirmed(channel).strength
+         effective_cap = self.safety.cap_for(channel)
+@@ -1722,6 +1734,8 @@
+         *,
+         intent: OutputIntentKind = OutputIntentKind.MANUAL,
+         owner_generations: Mapping[str, int] | None = None,
++        waveform_managed_channels: tuple[str, ...] = (),
++        video_remaining_ms=None,
+     ) -> tuple[list, list]:
+         """Validate and execute actions through the single output coordinator.
+ 
+@@ -1731,6 +1745,14 @@
+         """
+         if not isinstance(intent, OutputIntentKind):
+             raise ValueError("intent must be an OutputIntentKind")
++        if waveform_managed_channels and (
++            intent is not OutputIntentKind.TIMELINE_OR_REPLAY
++            or owner_generations is None
++            or not set(waveform_managed_channels).issubset(owner_generations)
++        ):
++            raise ValueError("managed waveform channels require timeline ownership")
++        if video_remaining_ms is not None and (not waveform_managed_channels or not callable(video_remaining_ms)):
++            raise ValueError("video deadline requires owned waveform execution")
+         effective_intent = intent
+         if (
+             intent is OutputIntentKind.MANUAL
+@@ -1752,11 +1774,17 @@
+         )
+         async with self._action_lock:
+             previous = self._execution_context
++            previous_managed = getattr(self, "_waveform_managed_channels", ())
++            previous_deadline = getattr(self, "_video_remaining_ms", None)
++            self._waveform_managed_channels = waveform_managed_channels
++            self._video_remaining_ms = video_remaining_ms
+             self._execution_context = (effective_intent, generations)
+             try:
+                 return await self._execute_actions_locked(actions)
+             finally:
+                 self._execution_context = previous
++                self._waveform_managed_channels = previous_managed
++                self._video_remaining_ms = previous_deadline
+ 
+     async def _execute_actions_locked(self, actions: list) -> tuple[list, list]:
+         """校验并执行动作列表，返回 (已执行说明列表, 被拒绝说明列表)。"""
+@@ -1794,7 +1822,7 @@
+                     strength_channel = None
+                 if strength_channel in ("A", "B"):
+                     activation_strength_channels.add(strength_channel)
+-            if candidate.get("op") != "pulse_cycle":
++            if candidate.get("op") not in ("pulse_cycle", "pulse_video"):
+                 continue
+             wave_ok, _, wave_cmd = self.safety.validate(candidate)
+             if wave_ok and wave_cmd and wave_cmd.get("channel") in ("A", "B"):
+@@ -1824,6 +1852,9 @@
+                 if prerequisite_channel in activation_ready:
+                     activation_ready[prerequisite_channel] = False
+             ok, reason, cmd = self.safety.validate(action)
++            if (ok and cmd and action.get("op") in ("pulse_video", "hold_strength")
++                    and getattr(self, "_video_remaining_ms", None) is not None):
++                cmd["_video_remaining_ms"] = self._video_remaining_ms
+             if (
+                 not ok
+                 and self.safety.estop_active
+@@ -1892,6 +1923,7 @@
+                 cmd["kind"] in ("hold", "add", "temp")
+                 and channel in ("A", "B")
+                 and channel not in explicit_cycle_channels
++                and channel not in getattr(self, "_waveform_managed_channels", ())
+                 and channel not in self.loop_tasks
+                 and not self.safety.pulse_active().get(channel)
+             )
+@@ -2015,6 +2047,19 @@
+             ):
+                 state["error"] = "stale output safety policy"
+                 return TransportOutcome(sent=False, error=state["error"])
++            remaining = cmd.get("_video_remaining_ms")
++            if remaining is not None:
++                # Recompute after the action/coordinator locks and any earlier
++                # queue ACK, immediately before building the physical frames.
++                remaining_ms = max(0, int(remaining()))
++                duration = (min(cmd["duration_ms"], remaining_ms) // 100 * 100
++                            if cmd["kind"] == "pulse_cycle" else remaining_ms)
++                if duration < (100 if cmd["kind"] == "pulse_cycle" else 1):
++                    state["error"] = "video block deadline elapsed"
++                    return TransportOutcome(sent=False, error=state["error"])
++                if cmd["kind"] == "pulse_cycle":
++                    cmd["duration_ms"] = duration
++                    cmd["frames"] = cmd["frames"][:duration // 100]
+             helper_cmd = self._default_wave_command(channel) if helper_required else None
+             if helper_required and helper_cmd is None:
+                 state["error"] = "默认波形不可用"
+@@ -2714,7 +2759,7 @@
+             frames.append(
+                 self.ops.pulse(
+                     client_id, slot_id, ch, cmd["frames"],
+-                    cmd["duration_ms"], immediate=True,
++                    cmd["duration_ms"], immediate=cmd.get("immediate", True),
+                 )
+             )
+         elif kind == "clear":
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -2271,6 +2271,8 @@
+     app = FastAPI(title="AI Coyote Tamer")
+     preview_store = PreviewStore(state.story_import_directory.parent / "presentation_previews")
+     install_preview_routes(app, preview_store, lambda key: _story_record(state, key), state.story_source_max_bytes)
++    from .video.api import install_video_routes
++    install_video_routes(app, state, state.story_import_directory.parent / "video")
+ 
+     @app.on_event("startup")
+     async def startup() -> None:
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -8,6 +8,7 @@
+ import ChatPanel from "./components/ChatPanel";
+ import ReplayPanel from "./components/ReplayPanel";
+ import NovelReader from "./components/NovelReader";
++import VideoPlayer from "./components/VideoPlayer";
+ import { PairView, SettingsView } from "./components/views";
+ import { api, mapFullState } from "./api";
+ import type { BackendFullState } from "./types";
+@@ -213,6 +214,7 @@
+             </div>
+           )}
+           {view === "novel" && <NovelReader />}
++          {view === "video" && <VideoPlayer />}
+           {view === "history" && <ReplayPanel historyOnly />}
+           {view === "pair" && <PairView />}
+           {view === "settings" && <SettingsView />}
+--- a/tests/test_story_endpoints.py
++++ b/tests/test_story_endpoints.py
+@@ -699,7 +699,9 @@
+         callback_ran = asyncio.Event()
+ 
+         async def disconnect_after_store_starts():
++            nonlocal started_at
+             await self._wait_for_thread_event(stalled.started)
++            started_at = time.perf_counter()
+             await main_module.AppState.on_relay_event(
+                 self.state, "client_disconnected", {}
+             )
+@@ -1095,7 +1097,9 @@
+         )
+ 
+         async def shutdown_after_store_starts():
++            nonlocal started_at
+             await self._wait_for_thread_event(stalled.started)
++            started_at = time.perf_counter()
+             await self.state.shutdown()
+ 
+         started_at = time.perf_counter()
+@@ -1324,7 +1328,6 @@
+             self.state.story_analysis_store, fallback_timeout=15
+         )
+         self.state.story_analysis_store = stalled
+-        started_at = time.perf_counter()
+         play = asyncio.create_task(
+             self._prepare_and_play(
+                 f"/api/story/{source_id}/chapters/{story_map.chapters[0].id}/play",
+@@ -1335,6 +1338,7 @@
+         self.assertTrue(
+             await asyncio.to_thread(stalled.inspect_started.wait, 0.5)
+         )
++        started_at = time.perf_counter()
+         async with asyncio.timeout(0.1):
+             async with self.state.timeline_transition_lock:
+                 lock_acquired_at = time.perf_counter()
