@@ -82,6 +82,76 @@ class VideoEndpointTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/video/sessions', json={'source_id': 'bad'}).status_code, 400)
         self.assertEqual(self.client.post('/api/video/sessions', json={'source_id': 'a' * 32}).status_code, 404)
 
+    def assert_legacy_handlers_overlap(self):
+        entered = [asyncio.Event(), asyncio.Event()]
+        @self.app.post('/api/story/concurrency/{side}')
+        async def concurrent_handler(side: int):
+            entered[side].set()
+            try:
+                await asyncio.wait_for(entered[1 - side].wait(), 0.3)
+            except asyncio.TimeoutError:
+                return {'overlapped': False}
+            return {'overlapped': True}
+        with ThreadPoolExecutor() as pool:
+            first = pool.submit(self.client.post, '/api/story/concurrency/0')
+            second = pool.submit(self.client.post, '/api/story/concurrency/1')
+            self.assertTrue(first.result().json()['overlapped'])
+            self.assertTrue(second.result().json()['overlapped'])
+
+    def test_no_video_does_not_serialize_cooperating_story_handlers(self):
+        self.assert_legacy_handlers_overlap()
+
+    def test_completed_video_does_not_serialize_cooperating_story_handlers(self):
+        session_id = self.start_session()
+        self.client.post(f'/api/video/sessions/{session_id}/stop')
+        self.assert_legacy_handlers_overlap()
+
+    def test_active_video_handoff_does_not_serialize_cooperating_story_handlers(self):
+        self.start_session()
+        self.assert_legacy_handlers_overlap()
+
+    def test_conflicting_request_during_video_start_closes_new_video_before_handler(self):
+        source_id = self.import_source()
+        self.client.post(f'/api/video/sources/{source_id}/csv', files={'file': ('x.csv', CSV)})
+        entered, release = threading.Event(), threading.Event()
+        original = self.state.loop.stop_timeline_session
+        async def slow_handoff():
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return await original()
+        with patch.object(self.state.loop, 'stop_timeline_session', slow_handoff), ThreadPoolExecutor() as pool:
+            starting = pool.submit(self.client.post, '/api/video/sessions', json={'source_id': source_id})
+            try:
+                self.assertTrue(entered.wait(1))
+                manual = pool.submit(self.client.post, '/api/manual')
+                self.assertFalse(manual.done())
+            finally:
+                release.set()
+            self.assertEqual(starting.result().status_code, 200)
+            self.assertTrue(manual.result().json()['video_closed'])
+
+    def test_new_video_rejects_conflicting_handler_already_in_flight(self):
+        source_id = self.import_source()
+        self.client.post(f'/api/video/sources/{source_id}/csv', files={'file': ('x.csv', CSV)})
+        entered, release = threading.Event(), threading.Event()
+        @self.app.post('/api/story/slow-owner')
+        async def slow_owner():
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return {'done': True}
+        with ThreadPoolExecutor() as pool:
+            legacy = pool.submit(self.client.post, '/api/story/slow-owner')
+            try:
+                self.assertTrue(entered.wait(1))
+                result = self.client.post('/api/video/sessions', json={'source_id': source_id})
+                self.assertEqual(result.status_code, 409)
+                self.assertIsNone(self.state.video_session)
+            finally:
+                release.set()
+            self.assertEqual(legacy.result().status_code, 200)
+
     def test_upload_duration_and_csv_validation(self):
         response = self.client.post('/api/video/sources', data={'duration_ms': '1.5'}, files={'file': ('x', b'abc')})
         self.assertEqual(response.status_code, 422)
@@ -235,7 +305,7 @@ class VideoEndpointTests(unittest.TestCase):
         app = FastAPI()
         install_video_routes(app, self.state, self.root)
         entered, cancelled = threading.Event(), threading.Event()
-        async def blocked_strength(output, channel, target):
+        async def blocked_strength(output, channel, target, **kwargs):
             entered.set()
             try:
                 while output.is_current():

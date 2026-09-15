@@ -1,6 +1,6 @@
 """Local video routes with exclusive output and WebSocket ownership."""
 import asyncio
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from dataclasses import asdict
 import hashlib
@@ -32,6 +32,8 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
     binding_versions = {}
     cleanup_tasks = set()
     retired_sessions = {}
+    legacy_requests = 0
+    starting_video = False
     state.video_session = None
 
     def source_store():
@@ -64,6 +66,47 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
         session = state.video_session
         if session is not None and not session.closed:
             session.output.preempt()
+
+    def needs_handoff():
+        if starting_video:
+            return True
+        session = state.video_session
+        if session is None:
+            return False
+        if not session.closed:
+            return True
+        cleanup = getattr(session, '_close_task', None)
+        if cleanup is None:
+            return bool(session.state().get('clear_pending', False))
+        return not cleanup.done() or cleanup.cancelled() or cleanup.exception() is not None
+
+    @asynccontextmanager
+    async def video_start_guard():
+        nonlocal starting_video
+        async with mode_lock:
+            starting_video = True
+            try:
+                yield
+            finally:
+                starting_video = False
+
+    async def legacy_handler(request, call_next, *, handoff_required):
+        nonlocal legacy_requests
+        legacy_requests += 1
+        try:
+            if handoff_required:
+                preempt_current()
+                async with mode_lock:
+                    try:
+                        await close_current('mode_changed')
+                    except (RuntimeError, OSError):
+                        if request.url.path.rstrip('/') != '/api/resume':
+                            return JSONResponse({'error': 'video output clear failed'}, status_code=409)
+            # Preserve the existing routes' own concurrency and transition locks.
+            # The in-flight count prevents video from taking ownership meanwhile.
+            return await call_next(request)
+        finally:
+            legacy_requests -= 1
 
     async def storage_call(operation, *args):
         try:
@@ -99,18 +142,10 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
                     if not task.cancelled():
                         task.exception()
                 cleanup.add_done_callback(completed)
-            return await call_next(request)
+            return await legacy_handler(request, call_next, handoff_required=False)
         if (request.method == 'POST' and not path.startswith('/api/video')
                 and any(path == prefix or path.startswith(prefix + '/') for prefix in _HANDOFF)):
-            preempt_current()
-            async with mode_lock:
-                try:
-                    await close_current('mode_changed')
-                except (RuntimeError, OSError):
-                    # Safety endpoints must still run their own priority clear.
-                    if path not in ('/api/estop', '/api/resume'):
-                        return JSONResponse({'error': 'video output clear failed'}, status_code=409)
-                return await call_next(request)
+            return await legacy_handler(request, call_next, handoff_required=needs_handoff())
         return await call_next(request)
 
     @app.post('/api/video/sources')
@@ -173,12 +208,14 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
         except (ValueError, TypeError) as exc:
             raise HTTPException(409, str(exc)) from exc
         plan_id = await storage_call(lambda: source_store().save_plan(source_id, plan))
-        async with mode_lock:
+        async with video_start_guard():
             if source_id in binding_sources or version != binding_versions.get(source_id, 0):
                 raise HTTPException(409, 'CSV changed while starting video; retry playback')
             if presets != state.safety.presets:
                 raise HTTPException(409, 'waveform library changed; retry playback')
             async with state.timeline_transition_lock:
+                if legacy_requests:
+                    raise HTTPException(409, 'another playback or device request is in progress')
                 if (getattr(state, 'story_runtime_owner', None) is not None
                         or getattr(state, 'story_planning_task', None) is not None
                         or getattr(state, 'story_preparation_task', None) is not None):
