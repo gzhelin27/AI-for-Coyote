@@ -54,3 +54,12 @@ test('server epoch retires playing heartbeats until explicit user playback', () 
   bridge.syncEpoch(2); bridge.onMediaState('playing', 1000);
   assert.equal(sent.at(-1).epoch, 3); assert.equal(sent.at(-1).sequence, 2);
 });
+test('buffering during a seek does not create an extra seek epoch', () => {
+  const { bridge, sent } = harness();
+  bridge.onMediaState('playing', 0); bridge.onMediaState('seeking', 6000);
+  bridge.onMediaState('waiting', 6000); bridge.onMediaState('seeking', 6000);
+  bridge.onMediaState('playing', 6000);
+  assert.deepEqual(sent.map(message => message.epoch), [1, 2, 2, 2, 2]);
+  assert.equal(bridge.currentSequence, 5);
+  bridge.onMediaState('seeking', 7000); assert.equal(bridge.currentEpoch, 3);
+});

@@ -5,20 +5,26 @@ export class VideoClockBridge {
   private epoch = 1;
   private sequence = 0;
   private state: VideoMediaState = 'paused';
+  private seeking = false;
   private position = 0;
   private lastSent = -Infinity;
   private closed = false;
   constructor(private readonly options: { sessionId: string; send: (message: VideoObservation) => void; now: () => number }) {}
   get currentEpoch(): number { return this.epoch; }
+  get currentSequence(): number { return this.sequence; }
   syncEpoch(epoch: number): void {
     if (Number.isSafeInteger(epoch) && epoch > this.epoch) {
       this.epoch = epoch;
       this.state = 'paused';
+      this.seeking = false;
     }
   }
   onMediaState(state: VideoMediaState, positionMs: number): void {
     if (this.closed || !Number.isFinite(positionMs) || positionMs < 0) return;
-    if (state === 'seeking' && this.state !== 'seeking') this.epoch += 1;
+    if (state === 'seeking') {
+      if (!this.seeking) this.epoch += 1;
+      this.seeking = true;
+    } else if (state !== 'waiting') this.seeking = false;
     this.state = state;
     this.position = Math.floor(positionMs);
     this.emit();

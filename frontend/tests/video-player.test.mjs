@@ -106,3 +106,37 @@ test('failed stop remains retryable before replacing the local source', async ()
     await h.select(); assert.equal(stops, 2);
   } finally { h.restore(); }
 });
+test('playing seek emits seeking waiting seeked playing without pausing native media', async () => {
+  const h = harness(); try {
+    await prepared(h); h.video.paused = false; h.event('playing');
+    h.video.currentTime = 6; h.video.seeking = true; h.event('seeking');
+    h.receive({ ...initial(), status: 'seeking', epoch: 2, sequence: 2 });
+    h.video.readyState = 2; h.event('waiting');
+    h.receive({ ...initial(), status: 'waiting', epoch: 2, sequence: 3 });
+    assert.equal(h.video.paused, false, 'buffering echo must preserve native playback intent');
+    h.video.seeking = false; h.video.readyState = 4; h.event('seeked'); h.event('playing');
+    assert.equal(h.socket.sent.at(-1).state, 'playing');
+    assert.equal(h.socket.sent.at(-1).epoch, 2); assert.equal(h.pauseCount(), 0);
+  } finally { h.restore(); }
+});
+test('older pause echo cannot undo a newer user play in the same epoch', async () => {
+  const h = harness(); try {
+    await prepared(h); h.event('pause');
+    h.video.paused = false; h.event('playing');
+    h.receive({ ...initial(), status: 'paused', epoch: 1, sequence: 1 });
+    assert.equal(h.video.paused, false);
+    h.receive({ ...initial(), status: 'paused', epoch: 2, sequence: 1 });
+    assert.equal(h.video.paused, true, 'new safety epoch overrides even with old processed sequence');
+  } finally { h.restore(); }
+});
+test('current sequence safety pause is authoritative while waiting recovery is native', async () => {
+  const h = harness(); try {
+    await prepared(h); h.video.paused = false; h.event('playing'); h.video.readyState = 2; h.event('waiting');
+    h.receive({ ...initial(), status: 'waiting', sequence: 2 });
+    h.video.readyState = 4; h.event('playing');
+    h.receive({ ...initial(), status: 'waiting', sequence: 2 });
+    assert.equal(h.video.paused, false);
+    h.receive({ ...initial(), status: 'paused', sequence: 3 });
+    assert.equal(h.video.paused, true);
+  } finally { h.restore(); }
+});

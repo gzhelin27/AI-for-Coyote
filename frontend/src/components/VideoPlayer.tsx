@@ -124,12 +124,17 @@ export default function VideoPlayer() {
       socket.onmessage = event => {
         if (connection.current !== current) return;
         try {
-          const incoming = normalizeVideoState(JSON.parse(event.data));
+          const payload = JSON.parse(event.data);
+          const incoming = normalizeVideoState(payload);
           if (incoming.session_id !== current.sessionId || incoming.epoch < bridge.currentEpoch) return;
           const advanced = incoming.epoch > bridge.currentEpoch;
+          // A delayed echo of an earlier pause/wait cannot undo newer local play.
+          // Safety invalidation advances the server epoch and always wins.
+          if (!advanced && Number.isSafeInteger(payload.sequence) && payload.sequence >= 0 &&
+              payload.sequence < bridge.currentSequence && !incoming.error && incoming.status !== 'error') return;
           bridge.syncEpoch(incoming.epoch);
           setState(incoming);
-          if (advanced || ['paused', 'error', 'ended', 'idle', 'waiting'].includes(incoming.status)) {
+          if (advanced || ['paused', 'error', 'ended', 'idle'].includes(incoming.status)) {
             media.current?.pause();
           }
           if (incoming.error) setError(incoming.error);
