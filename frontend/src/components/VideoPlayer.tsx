@@ -15,14 +15,13 @@ export default function VideoPlayer() {
   const objectUrl = useRef('');
   const operation = useRef(0);
   const pending = useRef<AbortController | null>(null);
-  const uploaded = useRef(false);
+  const registered = useRef(false);
   const [url, setUrl] = useState('');
   const [source, setSource] = useState<VideoSource | null>(null);
   const [csv, setCsv] = useState<{ csv_sha256: string; row_count: number } | null>(null);
   const [state, setState] = useState(() => normalizeVideoState(null));
   const [position, setPosition] = useState(0);
   const [busy, setBusy] = useState('');
-  const [progress, setProgress] = useState(0);
   const [error, setError] = useState('');
   const [ready, setReady] = useState(false);
 
@@ -53,9 +52,9 @@ export default function VideoPlayer() {
       if (version !== operation.current) return;
       if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
       selected.current = file;
-      uploaded.current = false;
+      registered.current = false;
       objectUrl.current = URL.createObjectURL(file);
-      setSource(null); setCsv(null); setState(normalizeVideoState(null)); setPosition(0); setProgress(0);
+      setSource(null); setCsv(null); setState(normalizeVideoState(null)); setPosition(0);
       setBusy('读取视频信息…'); setUrl(objectUrl.current);
     } catch (failure) {
       if (version === operation.current) { setError(message(failure)); setBusy(''); }
@@ -64,20 +63,18 @@ export default function VideoPlayer() {
 
   async function loadedMetadata() {
     const video = media.current, file = selected.current;
-    if (!video || !file || uploaded.current) return;
+    if (!video || !file || registered.current) return;
     const duration = Math.floor(video.duration * 1000);
     if (!Number.isSafeInteger(duration) || duration <= 0) { setError('无法读取视频时长，请选择浏览器支持的本地视频'); setBusy(''); return; }
-    uploaded.current = true;
+    registered.current = true;
     const version = operation.current, controller = new AbortController();
     pending.current = controller;
-    setBusy('上传视频…');
+    setBusy('准备本地视频…');
     try {
-      const result = await videoApi.upload(file, duration, controller.signal, value => {
-        if (version === operation.current) setProgress(value);
-      });
+      const result = await videoApi.registerLocal(file, duration, controller.signal);
       if (version === operation.current) setSource(result);
     } catch (failure) {
-      if (version === operation.current) { uploaded.current = false; setError(message(failure)); }
+      if (version === operation.current) { registered.current = false; setError(message(failure)); }
     } finally { if (version === operation.current) setBusy(''); }
   }
 
@@ -224,11 +221,12 @@ export default function VideoPlayer() {
         ++operation.current; void retire().then(() => setState(previous => ({ ...previous, status: 'paused' }))).catch(failure => setError(message(failure)));
       }}>停止会话</button>
     </div>
-    {busy && <p role="status" className="text-sm text-muted">{busy}{busy === '上传视频…' ? ` ${progress}%` : ''}</p>}
+    {busy && <p role="status" className="text-sm text-muted">{busy}</p>}
     {error && <p role="alert" className="rounded-lg border border-bad/40 p-3 text-sm text-bad">{error}</p>}
     <video ref={media} src={url || undefined} controls preload="metadata" playsInline onLoadedMetadata={() => void loadedMetadata()}
       className="max-h-[55vh] w-full rounded-xl bg-black" aria-label="本地视频播放器" />
-    <p className="text-sm text-muted">{ready ? '会话已就绪，请点击视频播放按钮。' : '完成上传和 CSV 校验后，准备会话再点击播放。'} {source?.filename} {csv && `· ${csv.row_count} 个区间`}</p>
+    <p className="text-sm text-muted">{ready ? '会话已就绪，请点击视频播放按钮。' : '选择本地视频并完成 CSV 校验后，准备会话再点击播放。'} {source?.filename} {csv && `· ${csv.row_count} 个区间`}</p>
+    <p className="text-xs text-muted">视频不上传，由浏览器直接读取本地文件；仅发送文件信息和 CSV。刷新页面后需重新选择视频与 CSV。</p>
     <div className="flex flex-wrap gap-4 text-sm"><span>视频 {videoTimecode(position)} / {videoTimecode(source?.duration_ms ?? 0)}</span>
       <span>{statusText[state.status]}{state.dry_run ? ' · 模拟输出' : ''}</span>
       <span>区间：{state.row ? `${videoTimecode(state.row.start_ms)}–${videoTimecode(state.row.end_ms)}` : '空档，两路目标为 0'}</span>
@@ -247,7 +245,7 @@ export default function VideoPlayer() {
     })}</div>
     <details className="text-sm text-muted"><summary className="cursor-pointer">CSV 格式与播放规则</summary>
       <pre className="mt-2 overflow-x-auto rounded-lg bg-ink2 p-3">{'start_time,end_time,A_target,B_target\n0:10:20,0:11:30,20,15'}</pre>
-      <p className="mt-2">时间使用 H:MM:SS 文本格式；未覆盖区间归零。每行独立划分最多 30 秒的随机波形段，定位后保持已选序列。视频与 CSV 单独绑定，上传不会自动播放。</p>
+      <p className="mt-2">时间使用 H:MM:SS 文本格式；未覆盖区间归零。每行独立划分最多 30 秒的随机波形段，定位后保持已选序列。每次选择视频都需重新绑定 CSV，同名文件不会复用旧绑定；准备完成不会自动播放。</p>
       <p className="mt-2">强度直接到达限幅目标，即 CSV 目标与当前安全上限的较小值；定位后继续播放、暂停后恢复也采用同一规则。实际输出以设备确认为准。</p>
     </details>
   </section>;

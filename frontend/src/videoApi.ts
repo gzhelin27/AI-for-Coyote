@@ -12,26 +12,10 @@ async function request(path: string, options?: RequestInit): Promise<unknown> {
 }
 
 export const videoApi = {
-  upload(file: File, durationMs: number, signal: AbortSignal, progress: (percentage: number) => void): Promise<VideoSource> {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      const abort = () => xhr.abort();
-      const cleanup = () => signal.removeEventListener('abort', abort);
-      xhr.open('POST', '/api/video/sources');
-      xhr.responseType = 'json';
-      xhr.upload.onprogress = event => { if (event.lengthComputable) progress(Math.round(event.loaded / event.total * 100)); };
-      xhr.onload = () => {
-        cleanup();
-        if (xhr.status >= 200 && xhr.status < 300 && typeof xhr.response?.source_id === 'string') resolve(xhr.response as VideoSource);
-        else reject(new Error(errorText(xhr.response, `视频上传失败 (${xhr.status})`)));
-      };
-      xhr.onerror = () => { cleanup(); reject(new Error('视频上传失败，请检查连接')); };
-      xhr.onabort = () => { cleanup(); reject(new DOMException('已取消上传', 'AbortError')); };
-      signal.addEventListener('abort', abort, { once: true });
-      if (signal.aborted) { cleanup(); reject(new DOMException('已取消上传', 'AbortError')); return; }
-      const form = new FormData(); form.append('file', file); form.append('duration_ms', String(durationMs));
-      xhr.send(form);
-    });
+  async registerLocal(file: File, durationMs: number, signal: AbortSignal): Promise<VideoSource> {
+    return await request('/api/video/local-sources', { method: 'POST', signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, size: file.size, duration_ms: durationMs, last_modified: file.lastModified }) }) as VideoSource;
   },
   async bindCsv(sourceId: string, file: File, signal: AbortSignal): Promise<{ csv_sha256: string; row_count: number }> {
     const form = new FormData(); form.append('file', file);

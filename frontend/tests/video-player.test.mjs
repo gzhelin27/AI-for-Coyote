@@ -27,7 +27,7 @@ function harness(overrides = {}) {
     addEventListener(name, callback) { listeners.set(name, callback); }, removeEventListener(name) { listeners.delete(name); },
     requestVideoFrameCallback() { return 1; }, cancelVideoFrameCallback() {} };
   const socket = { readyState: 0, sent: [], send(value) { this.sent.push(JSON.parse(value)); }, close() { this.readyState = 3; this.onclose?.(); } };
-  const api = { async upload(...args) { calls.push(['upload', ...args]); return source; },
+  const api = { async registerLocal(...args) { calls.push(['register', ...args]); return source; },
     async bindCsv(...args) { calls.push(['csv', ...args]); return { csv_sha256: 'b'.repeat(64), row_count: 1 }; },
     async createSession(...args) { calls.push(['create', ...args]); return initial(); },
     async stop(id) { calls.push(['stop', id]); }, socket() { return socket; }, ...overrides };
@@ -86,12 +86,35 @@ test('socket loss pauses media and requires preparing a new connection', async (
     assert.ok(h.calls.some(call => call[0] === 'stop'));
   } finally { h.restore(); }
 });
-test('late upload after replacement or unmount cannot bind source or update UI', async () => {
-  const upload = deferred(); const h = harness({ upload: () => upload.promise });
+test('late local registration after unmount cannot bind source or update UI', async () => {
+  const registration = deferred(); const h = harness({ registerLocal: () => registration.promise });
   try {
     await h.select(); const loading = h.metadata(); await flush(); h.unmount();
-    upload.resolve(source); await loading;
+    registration.resolve(source); await loading;
     assert.equal(h.late(), 0); assert.equal(h.calls.length, 0);
+  } finally { h.restore(); }
+});
+test('selecting the same local video again clears old CSV and registers afresh', async () => {
+  const h = harness(); try {
+    await prepared(h); assert.match(h.text(), /1 个区间/);
+    await h.select(); assert.doesNotMatch(h.text(), /1 个区间/);
+    await h.metadata();
+    assert.equal(h.calls.filter(call => call[0] === 'register').length, 2);
+    assert.ok(h.calls.some(call => call[0] === 'stop'));
+    assert.match(h.text(), /视频不上传/); assert.match(h.text(), /刷新页面后.*重新选择/);
+  } finally { h.restore(); }
+});
+test('replacing local video aborts registration and ignores its late response', async () => {
+  const first = deferred(); let count = 0, oldSignal;
+  const h = harness({ registerLocal(file, duration, signal) {
+    if (++count === 1) { oldSignal = signal; return first.promise; }
+    return Promise.resolve({ ...source, source_id: 'source-2', filename: 'new-local.mp4' });
+  } });
+  try {
+    await h.select(); await h.metadata(); await h.select();
+    assert.equal(oldSignal.aborted, true);
+    await h.metadata(); first.resolve({ ...source, filename: 'stale-local.mp4' }); await flush();
+    assert.match(h.text(), /new-local\.mp4/); assert.doesNotMatch(h.text(), /stale-local\.mp4/);
   } finally { h.restore(); }
 });
 test('failed CSV keeps prior validated CSV and exposes error without playback', async () => {
