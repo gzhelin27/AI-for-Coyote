@@ -83,6 +83,50 @@ class VideoEndpointTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/video/sessions', json={'source_id': 'bad'}).status_code, 400)
         self.assertEqual(self.client.post('/api/video/sessions', json={'source_id': 'a' * 32}).status_code, 404)
 
+    def local_metadata(self, **changes):
+        return dict(filename='large-local.mp4', size=10 * 1024**3,
+                    duration_ms=2000, last_modified=1700000000000) | changes
+
+    def test_local_ten_gib_video_registers_and_uses_csv_without_media_bytes(self):
+        source = self.client.post('/api/video/local-sources', json=self.local_metadata())
+        self.assertEqual(source.status_code, 200, source.text)
+        source_id = source.json()['source_id']
+        self.assertEqual(source.json()['size'], 10 * 1024**3)
+        self.assertEqual(source.json()['metadata']['source_kind'], 'browser_local')
+        response = self.client.post(f'/api/video/sources/{source_id}/csv', files={'file': ('x.csv', CSV)})
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post('/api/video/sessions', json={'source_id': source_id})
+        self.assertEqual(response.status_code, 200, response.text)
+        files = list(self.root.iterdir())
+        self.assertTrue(all(path.suffix == '.json' for path in files))
+        self.assertLess(sum(path.stat().st_size for path in files), 16384)
+
+    def test_local_selection_closes_previous_session_and_needs_own_csv(self):
+        self.start_session()
+        previous = self.state.video_session
+        result = self.client.post('/api/video/local-sources', json=self.local_metadata())
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertTrue(previous.closed)
+        source_id = result.json()['source_id']
+        self.assertEqual(self.client.post('/api/video/sessions', json={'source_id': source_id}).status_code, 409)
+
+    def test_local_metadata_is_strict_and_invalid_requests_do_not_stop_playback(self):
+        self.start_session()
+        previous = self.state.video_session
+        for metadata in (self.local_metadata(size=True), self.local_metadata(size=0),
+                         self.local_metadata(duration_ms=1.5), self.local_metadata(last_modified=-1),
+                         self.local_metadata(path='C:/private/video.mp4'), {'filename': 'x'}, []):
+            with self.subTest(metadata=metadata):
+                response = self.client.post('/api/video/local-sources', json=metadata)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertFalse(previous.closed)
+
+    def test_local_registration_rejects_oversize_request_before_creating_store(self):
+        response = self.client.post('/api/video/local-sources', content=b' ' * 4097,
+                                    headers={'content-type': 'application/json'})
+        self.assertEqual(response.status_code, 413)
+        self.assertFalse(self.root.exists())
+
     def assert_legacy_handlers_overlap(self):
         entered = [asyncio.Event(), asyncio.Event()]
         @self.app.post('/api/story/concurrency/{side}')

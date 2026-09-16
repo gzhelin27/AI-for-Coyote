@@ -9,7 +9,7 @@ from pathlib import Path
 import secrets
 import threading
 
-from fastapi import File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .csv_timeline import MAX_CSV_BYTES
@@ -147,6 +147,28 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
                 and any(path == prefix or path.startswith(prefix + '/') for prefix in _HANDOFF)):
             return await legacy_handler(request, call_next, handoff_required=needs_handoff())
         return await call_next(request)
+
+    @app.post('/api/video/local-sources')
+    async def register_local_video(request: Request):
+        # This endpoint receives metadata only, never local paths or media bytes.
+        payload = bytearray()
+        async for chunk in request.stream():
+            if len(payload) + len(chunk) > 4096:
+                raise HTTPException(413, 'local video metadata exceeds size limit')
+            payload.extend(chunk)
+        try:
+            body = json.loads(payload)
+        except (ValueError, UnicodeError) as exc:
+            raise HTTPException(400, 'invalid local video metadata') from exc
+        if not isinstance(body, dict) or set(body) != {'filename', 'size', 'duration_ms', 'last_modified'}:
+            raise HTTPException(400, 'filename, size, duration_ms and last_modified are required')
+        source = await storage_call(lambda: source_store().register_local(**body))
+        async with mode_lock:
+            try:
+                await close_current('source_changed')
+            except (RuntimeError, OSError) as exc:
+                raise HTTPException(409, 'video output clear failed') from exc
+        return asdict(source)
 
     @app.post('/api/video/sources')
     async def upload_video(file: UploadFile = File(...), duration_ms: int = Form(...)):

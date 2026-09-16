@@ -1,5 +1,32 @@
 # 视频版本离线验证记录
 
+## 2026-09-16：本地视频无需上传
+
+视频使用浏览器本地文件播放，`POST /api/video/local-sources` 仅接收不超过 4096 字节
+的注册元数据；选择 10 GiB 视频不会走旧上传大小限制，不创建 `.media` 或读取视频内容。
+CSV 和预解析时间轴仍通过注册 ID 绑定。每次选文件建立新 ID，旧上传记录继续兼容。
+
+Chrome 实际选择了逻辑大小 10,737,418,240 字节的合成稀疏 MP4，注册 JSON 为 109 字节，
+未调用视频上传接口。该素材用文件空洞扩大尺寸，验证大文件选择和本地解码路径，
+不代表对所有真实 10 GiB 视频编码的兼容承诺。
+实际播放验证了时钟同步、30/15 直达、60 裁到 40、暂停/定位/恢复、自然区间切换、
+空档归零、停止重准备、换视频要求新 CSV、刷新后重新选择。页面无异常，真实设备帧为 0。
+截图：Windows Temp 下 `coyote-video-acceptance/video-local-preview.png`。
+浏览器验证日志：`work/video-local-browser-green.log`。
+
+| 检查 | 结果 | 日志 |
+| --- | --- | --- |
+| 完整 unittest discover | 1,198 项，7 项环境跳过，196.024 秒，退出 0 | `work/video-local-full-tests.log` |
+| 视频 API | 21 项全部通过，退出 0 | `work/video-local-api-green.log` |
+| 前端测试 | 59 项全部通过，退出 0 | `work/video-local-frontend-tests.log` |
+| 前端构建 | 退出 0 | `work/video-local-frontend-build.log` |
+| Python compileall | 退出 0 | `work/video-local-compileall.log` |
+
+独立审查未发现阻断问题。本轮改动集中于视频模块和前端导入流程，未改变视频输出调度、安全上限或原有模式的行为。
+
+本轮只修改隔离开发工作树；用于用户试用的 `127.0.0.1:18127` 是临时存储和假设备的
+dry-run 预览。正式服务和本地设备配置未改动。
+
 ## 2026-09-15：视频强度直接执行修订
 
 本次替代原视频缓升策略：合法独占视频会话直接提交 `min(CSV 目标, 当前有效上限)`，
