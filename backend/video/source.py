@@ -1,6 +1,7 @@
-"""Bounded local media imports and atomic, content-bound CSV records.
+"""Browser-local registrations and backward-compatible uploaded media records.
 
 Duration is browser metadata, not a claim that these bytes decode as video.
+Browser-local identity hashes describe registrations, never video content.
 Pinned file primitives are shared with the existing local analysis store.
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ from .models import VideoCsv, VideoPlan
 _CHUNK = 1024 * 1024
 _RECORD_LIMIT = 20 * 1024 * 1024
 _ID = re.compile(r'[0-9a-f]{32}')
+_SAFE_INTEGER = 2**53 - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,14 +64,50 @@ class VideoSourceStore:
             raise OSError('video storage hardlink is unsafe')
         return details
 
-    async def import_stream(self, original_name: str, chunks: AsyncIterable[bytes],
-                            duration_ms: int) -> VideoSource:
-        self._duration(duration_ms)
+    @staticmethod
+    def _filename(original_name):
         if not isinstance(original_name, str):
             raise ValueError('invalid filename')
         filename = re.sub(r'[\x00-\x1f\x7f<>:"|?*]', '_',
                           original_name.replace('\\', '/').split('/')[-1]).strip(' .')[:240]
-        filename = filename or 'video'
+        return filename or 'video'
+
+    @staticmethod
+    def _registration_digest(source_id, filename, size, duration_ms, last_modified):
+        metadata = {'source_id': source_id, 'filename': filename, 'size': size,
+                    'duration_ms': duration_ms, 'last_modified': last_modified}
+        canonical = json.dumps(metadata, sort_keys=True, separators=(',', ':'),
+                               ensure_ascii=False).encode('utf-8')
+        return hashlib.sha256(b'AI-for-Coyote:browser-local-registration:v1\0' + canonical).hexdigest()
+
+    def register_local(self, filename, size, duration_ms, last_modified) -> VideoSource:
+        """Register browser metadata without receiving or opening the video.
+
+        Every selection gets its own identity. This synchronous method writes
+        only a small JSON record and should be called from a worker thread.
+        """
+        self._duration(duration_ms)
+        if type(size) is not int or not 0 < size <= _SAFE_INTEGER:
+            raise ValueError('size must be a positive safe integer')
+        if type(last_modified) is not int or not 0 <= last_modified <= _SAFE_INTEGER:
+            raise ValueError('last_modified must be a nonnegative safe integer')
+        filename = self._filename(filename)
+        source_id = secrets.token_hex(16)
+        source = VideoSource(source_id, filename,
+            self._registration_digest(source_id, filename, size, duration_ms, last_modified),
+            size, duration_ms, {'source_kind': 'browser_local',
+                'identity_origin': 'registration_metadata', 'duration_origin': 'browser',
+                'last_modified': last_modified})
+        self._files._verify_root()
+        self._files._write_atomically(source_id + '.json',
+            {'version': 2, 'source': asdict(source), 'csv': None},
+            maximum_size=4096, create_only=True)
+        return source
+
+    async def import_stream(self, original_name: str, chunks: AsyncIterable[bytes],
+                            duration_ms: int) -> VideoSource:
+        self._duration(duration_ms)
+        filename = self._filename(original_name)
         source_id = secrets.token_hex(16)
         name = source_id + '.media'
         temporary = '.' + source_id + '.tmp'
@@ -165,8 +203,14 @@ class VideoSourceStore:
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ValueError('video record changed during read')
         document = json.loads(payload)
-        if not isinstance(document, dict) or document.get('version') != 1:
+        if (not isinstance(document, dict) or type(document.get('version')) is not int
+                or document['version'] not in (1, 2)):
             raise ValueError('invalid video record')
+        local = document['version'] == 2
+        if local and (set(document) != {'version', 'source', 'csv'}
+                or not isinstance(document['source'], dict)
+                or set(document['source']) != {'source_id', 'filename', 'sha256', 'size', 'duration_ms', 'metadata'}):
+            raise ValueError('invalid browser-local record fields')
         try:
             source = VideoSource(**document['source'])
         except (KeyError, TypeError) as exc:
@@ -174,14 +218,29 @@ class VideoSourceStore:
         self._duration(source.duration_ms)
         if (not isinstance(source.filename, str) or not 1 <= len(source.filename) <= 240
                 or re.search(r'[\\/\x00-\x1f\x7f<>:"|?*]', source.filename)
-                or source.filename != source.filename.strip(' .')
-                or source.metadata != {'duration_origin': 'browser'}):
+                or source.filename != source.filename.strip(' .')):
             raise ValueError('invalid video display metadata')
         if (source.source_id != source_id or type(source.size) is not int
-                or not 0 < source.size <= self.max_bytes
+                or not 0 < source.size <= (_SAFE_INTEGER if local else self.max_bytes)
                 or not isinstance(source.sha256, str)
                 or not re.fullmatch(r'[0-9a-f]{64}', source.sha256)):
             raise ValueError('invalid video source identity')
+        if local:
+            metadata = source.metadata
+            if (not isinstance(metadata, dict)
+                    or set(metadata) != {'source_kind', 'identity_origin', 'duration_origin', 'last_modified'}
+                    or metadata['source_kind'] != 'browser_local'
+                    or metadata['identity_origin'] != 'registration_metadata'
+                    or metadata['duration_origin'] != 'browser'
+                    or type(metadata['last_modified']) is not int
+                    or not 0 <= metadata['last_modified'] <= _SAFE_INTEGER
+                    or source.sha256 != self._registration_digest(source_id, source.filename,
+                        source.size, source.duration_ms, metadata['last_modified'])):
+                raise ValueError('invalid browser-local registration identity')
+            files._verify_root()
+            return source, document
+        if source.metadata != {'duration_origin': 'browser'}:
+            raise ValueError('invalid uploaded video metadata')
         media_name = source_id + '.media'
         with files._open_existing(media_name) as handle:
             before = self._verified(handle, media_name)
@@ -206,7 +265,9 @@ class VideoSourceStore:
         return self._record(source_id)[0]
 
     def media_path(self, source_id: str) -> Path:
-        self.get(source_id)
+        source = self.get(source_id)
+        if source.metadata.get('source_kind') == 'browser_local':
+            raise ValueError('browser-local video has no server media path')
         return self._files._require_root().final_path / (source_id + '.media')
 
     def bind_csv(self, source_id: str, payload: bytes) -> VideoCsv:
