@@ -20,6 +20,7 @@ from .waveforms import resolve_video_plan
 _HANDOFF = ('/api/manual', '/api/estop', '/api/resume', '/api/session', '/api/replays',
             '/api/story', '/api/autopilot', '/api/chat', '/api/device', '/api/dlc/import',
             '/api/character/profile', '/api/history/clear')
+_CLEAR_FAILED = '视频输出清零尚未确认，请确认手机端和设备已连接后重试。'
 
 
 def install_video_routes(app, state, root: Path, *, session_factory=None):
@@ -56,6 +57,13 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
             result = await session.close(reason)
             remember(result)
             return result
+
+    async def close_for_request(reason):
+        try:
+            return await close_current(reason)
+        except (RuntimeError, OSError) as exc:
+            # Keep the pending session: no new owner may skip an unconfirmed clear.
+            raise HTTPException(409, _CLEAR_FAILED) from exc
 
     def remember(result):
         retired_sessions[result['session_id']] = result
@@ -101,7 +109,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
                         await close_current('mode_changed')
                     except (RuntimeError, OSError):
                         if request.url.path.rstrip('/') != '/api/resume':
-                            return JSONResponse({'error': 'video output clear failed'}, status_code=409)
+                            return JSONResponse({'error': _CLEAR_FAILED}, status_code=409)
             # Preserve the existing routes' own concurrency and transition locks.
             # The in-flight count prevents video from taking ownership meanwhile.
             return await call_next(request)
@@ -164,10 +172,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
             raise HTTPException(400, 'filename, size, duration_ms and last_modified are required')
         source = await storage_call(lambda: source_store().register_local(**body))
         async with mode_lock:
-            try:
-                await close_current('source_changed')
-            except (RuntimeError, OSError) as exc:
-                raise HTTPException(409, 'video output clear failed') from exc
+            await close_for_request('source_changed')
         return asdict(source)
 
     @app.post('/api/video/sources')
@@ -175,9 +180,9 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
         async def uploaded_chunks():
             while chunk := await file.read(1024 * 1024):
                 yield chunk
-        async with mode_lock:
-            await close_current('source_changed')
         try:
+            async with mode_lock:
+                await close_for_request('source_changed')
             sources = await storage_call(source_store)
             source = await sources.import_stream(file.filename or 'video', uploaded_chunks(), duration_ms)
             return asdict(source)
@@ -197,7 +202,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
             async with mode_lock:
                 if source_id in binding_sources:
                     raise HTTPException(409, 'CSV import already in progress')
-                await close_current('csv_changed')
+                await close_for_request('csv_changed')
                 binding_sources.add(source_id)
                 binding_versions[source_id] = binding_versions.get(source_id, 0) + 1
             try:
@@ -246,8 +251,13 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
                         or getattr(state, 'story_planning_task', None) is not None
                         or getattr(state, 'story_preparation_task', None) is not None):
                     raise HTTPException(409, 'finish or cancel story preparation before video playback')
+                await close_for_request('session_replaced')
+                # Use the same device target resolution as GameLoop execution.
+                # Cleanup of an existing owner must happen before this preflight.
+                if not state.safety.dry_run and not (
+                        state.loop.relay.first_client_id() and state.loop.relay.get_slot_id()):
+                    raise HTTPException(409, '请先连接手机端和设备，再重试准备视频播放。')
                 try:
-                    await close_current('session_replaced')
                     await state.loop.stop_timeline_session()
                     if hasattr(state, 'set_sensors'):
                         await state.set_sensors(False)
@@ -257,13 +267,17 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
                         factory = VideoSession
                     session = factory(plan, GameLoopVideoOutput(state.loop), source_id=source.source_id,
                                       duration_ms=source.duration_ms, timeline=timeline,
-                                      dry_run=bool(state.cfg.get('app', {}).get('dry_run', True)))
+                                      dry_run=bool(state.safety.dry_run))
                     state.video_session = session
                     result = await session.start()
                     return dict(result, plan_id=plan_id)
                 except (ValueError, TypeError, RuntimeError, OSError) as exc:
-                    await close_current('start_failed')
-                    raise HTTPException(409, str(exc)) from exc
+                    # A second clear failure must not replace the intended HTTP
+                    # response with 500; the session retains clear_pending for retry.
+                    with suppress(RuntimeError, OSError):
+                        await close_current('start_failed')
+                    detail = _CLEAR_FAILED if isinstance(exc, (RuntimeError, OSError)) else str(exc)
+                    raise HTTPException(409, detail) from exc
 
     @app.get('/api/video/state')
     async def current_state():
@@ -278,9 +292,7 @@ def install_video_routes(app, state, root: Path, *, session_factory=None):
         async with mode_lock:
             current = state.video_session
             if current is not None and current.state()['session_id'] == session_id:
-                result = await current.close('operator_stop')
-                remember(result)
-                return result
+                return await close_for_request('operator_stop')
             return retired_sessions.get(session_id, {'session_id': session_id, 'status': 'ended'})
 
     @app.websocket('/api/video/sessions/{session_id}/clock')
