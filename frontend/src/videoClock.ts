@@ -21,6 +21,7 @@ export class VideoClockBridge {
   }
   onMediaState(state: VideoMediaState, positionMs: number): void {
     if (this.closed || !Number.isFinite(positionMs) || positionMs < 0) return;
+    if (state === 'playing' && this.state === 'playing' && Math.floor(positionMs) <= this.position) return;
     if (state === 'seeking') {
       if (!this.seeking) this.epoch += 1;
       this.seeking = true;
@@ -31,6 +32,8 @@ export class VideoClockBridge {
   }
   onVideoFrame(positionMs: number): void {
     if (this.closed || this.state !== 'playing' || this.options.now() - this.lastSent < 100 || !Number.isFinite(positionMs) || positionMs < 0) return;
+    // Neither rendered frames nor fallback samples can renew a frozen clock.
+    if (Math.floor(positionMs) <= this.position) return;
     this.position = Math.floor(positionMs);
     this.emit();
   }

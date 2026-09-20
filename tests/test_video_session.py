@@ -79,6 +79,29 @@ class VideoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.session.state()['status'], 'playing')
         self.assertEqual(self.output.snapshot('A').strength, 0)
 
+    async def test_watchdog_diagnostic_identifies_reason_without_source_details(self):
+        await self.observe(0)
+        self.now = 2
+        with self.assertLogs('ai-for-coyote.video', level='WARNING') as captured:
+            await self.session.tick()
+            await self.session.flush()
+        text = '\n'.join(captured.output)
+        self.assertIn('播放时钟已失联', text)
+        self.assertIn('observation_age_ms=2000', text)
+        self.assertNotIn('source_id', text)
+
+    async def test_failed_clear_diagnostic_is_not_repeated_on_watchdog_retry(self):
+        await self.observe(0)
+        with patch.object(self.output, 'clear', AsyncMock(side_effect=RuntimeError('private device details'))):
+            with self.assertLogs('ai-for-coyote.video', level='WARNING') as captured:
+                await self.observe(100, 'paused')
+                self.now = .3
+                await self.session.tick()
+                await self.session.flush()
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn('输出清零未确认', captured.output[0])
+        self.assertNotIn('private device details', captured.output[0])
+
     async def test_repeated_clock_does_not_reset_wave_or_resend_strength(self):
         await self.observe(0)
         for _ in range(10):

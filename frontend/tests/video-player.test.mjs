@@ -17,9 +17,13 @@ const initial = () => ({ ...types.normalizeVideoState(null), session_id: 'sessio
 // Production TSX event handlers with controlled React hook storage and media/transport.
 // DOM layout and actual codec support remain the integration browser gate.
 function harness(overrides = {}) {
-  const previous = { window: globalThis.window, document: globalThis.document, WebSocket: globalThis.WebSocket };
-  globalThis.window = { setTimeout: () => 1, clearTimeout() {} };
-  globalThis.document = { hidden: false, addEventListener() {}, removeEventListener() {} };
+  const previous = { window: globalThis.window, document: globalThis.document, WebSocket: globalThis.WebSocket, performance: globalThis.performance };
+  let now = 0, nextTimer = 0;
+  const timers = new Map(), documentListeners = new Map();
+  globalThis.performance = { now: () => now };
+  globalThis.window = { setTimeout: () => 1, clearTimeout() {},
+    setInterval(callback) { const id = ++nextTimer; timers.set(id, callback); return id; }, clearInterval(id) { timers.delete(id); } };
+  globalThis.document = { hidden: false, addEventListener(name, callback) { documentListeners.set(name, callback); }, removeEventListener(name) { documentListeners.delete(name); } };
   globalThis.WebSocket = { OPEN: 1 };
   const calls = [], listeners = new Map(); let pauseCount = 0;
   const video = { paused: true, seeking: false, readyState: 4, currentTime: 0, duration: 70, playbackRate: 1,
@@ -45,6 +49,9 @@ function harness(overrides = {}) {
   render();
   const input = (label, file) => { render(); const node = nodes(tree).find(node => node.props?.['aria-label'] === label); assert.ok(node); assert.ok(!node.props.disabled); node.props.onChange({ target: { files: [file], value: file.name } }); };
   const h = { calls, socket, video, late: () => late, pauseCount: () => pauseCount,
+    sample(time, position) { now = time; video.currentTime = position; for (const callback of timers.values()) callback(); },
+    hidden(value) { document.hidden = value; documentListeners.get('visibilitychange')?.(); },
+    timerCount: () => timers.size, listenerCount: () => listeners.size + documentListeners.size,
     async select() { input('选择本地视频', new File(['synthetic'], 'synthetic.mp4')); await flush(); render(); },
     async metadata() { render(); await nodes(tree).find(node => node.type === 'video').props.onLoadedMetadata(); await flush(); render(); },
     async csv() { input('导入强度 CSV', new File(['synthetic csv'], 'intensity.csv')); await flush(); render(); },
@@ -171,5 +178,38 @@ test('video displays direct capped targets without obsolete ramp indicators', as
     assert.match(h.text(), /直接到达限幅目标/);
     assert.match(h.text(), /CSV 目标60限幅目标40已确认强度40/);
     assert.doesNotMatch(h.text(), /缓升|每 2 秒/);
+  } finally { h.restore(); }
+});
+
+test('foreground media progress is observed without rendered frame callbacks and stops on frozen time', async () => {
+  const h = harness(); try {
+    await prepared(h); h.video.paused = false; h.event('playing');
+    h.sample(200, .2); h.sample(400, .4);
+    assert.deepEqual(h.socket.sent.map(m => m.position_ms), [0, 200, 400]);
+    h.sample(600, .4); h.sample(1800, .4);
+    assert.equal(h.socket.sent.length, 3, 'frozen media must expire rather than renew its lease');
+    h.unmount(); assert.equal(h.timerCount(), 0); assert.equal(h.listenerCount(), 0);
+  } finally { h.restore(); }
+});
+
+test('fallback cannot renew waiting, seeking, paused, hidden or disconnected playback', async () => {
+  const h = harness(); try {
+    await prepared(h); h.video.paused = false; h.event('playing');
+    let time = 0;
+    for (const state of ['waiting', 'seeking', 'pause']) {
+      h.event(state); const count = h.socket.sent.length;
+      h.sample(time += 200, time / 1000);
+      assert.equal(h.socket.sent.length, count, state);
+      h.video.paused = false; h.event('playing');
+    }
+    h.hidden(true); const count = h.socket.sent.length;
+    h.video.paused = false; h.sample(time += 200, time / 1000);
+    assert.equal(h.socket.sent.length, count);
+    h.hidden(false); h.sample(time += 200, time / 1000);
+    assert.equal(h.socket.sent.length, count, 'visibility alone cannot resume authorization');
+    h.event('playing'); h.sample(time += 200, time / 1000);
+    assert.equal(h.socket.sent.at(-1).position_ms, time);
+    h.socket.close(); const closedCount = h.socket.sent.length;
+    h.sample(time += 200, time / 1000); assert.equal(h.socket.sent.length, closedCount);
   } finally { h.restore(); }
 });

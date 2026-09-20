@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import secrets
 import time
 
 from .csv_timeline import find_interval
 from .waveforms import find_block
+
+logger = logging.getLogger('ai-for-coyote.video')
 
 
 class VideoSession:
@@ -115,7 +118,15 @@ class VideoSession:
         if self._work is None or self._work.done():
             self._work = asyncio.create_task(self._drive(), name='video-output-update')
 
+    def _log_interruption(self, status, error):
+        if error and (status, error) != (self.status, self.error):
+            logger.warning('Video interrupted: reason=%s status=%s epoch=%s sequence=%s '
+                           'position_ms=%s observation_age_ms=%s', error, status,
+                           self.epoch, self.sequence, self.position_ms,
+                           round(max(0, self.clock() - self._observed_at) * 1000))
+
     def _invalidate(self, status, error=None, *, bump_epoch=False):
+        self._log_interruption(status, error)
         self._revision += 1
         self._boundary_cleared = None
         if bump_epoch:
@@ -204,6 +215,7 @@ class VideoSession:
                     if revision != self._revision:
                         self._dirty = True
                         continue
+                    self._log_interruption('error', '输出清零未确认')
                     self.status, self.error = 'error', '输出清零未确认'
                     self._dirty = False
                     break

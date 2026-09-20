@@ -180,9 +180,15 @@ export default function VideoPlayer() {
     const sample = () => {
       if (stopped) return;
       const positionMs = Math.floor(video.currentTime * 1000);
-      if (!video.paused && !video.seeking) connection.current?.bridge.onVideoFrame(positionMs);
+      const current = connection.current;
+      if (!document.hidden && !video.paused && !video.seeking && !video.ended && video.readyState >= 3 &&
+          current?.socket.readyState === WebSocket.OPEN) current.bridge.onVideoFrame(positionMs);
       if (performance.now() - lastDisplay >= 100) { setPosition(positionMs); lastDisplay = performance.now(); }
     };
+    // Render callbacks can stall while native media time continues advancing.
+    // Sample the actual media clock; the bridge rejects unchanged positions.
+    const sampleTimer = window.setInterval(sample, 100);
+    video.addEventListener('timeupdate', sample);
     if ('requestVideoFrameCallback' in video) {
       const frame = () => { sample(); if (!stopped) frameId = video.requestVideoFrameCallback(frame); };
       frameId = video.requestVideoFrameCallback(frame);
@@ -194,6 +200,8 @@ export default function VideoPlayer() {
       stopped = true;
       listeners.forEach(([name, listener]) => video.removeEventListener(name, listener));
       document.removeEventListener('visibilitychange', visibility);
+      window.clearInterval(sampleTimer);
+      video.removeEventListener('timeupdate', sample);
       if (frameId) video.cancelVideoFrameCallback(frameId);
       if (animationId) cancelAnimationFrame(animationId);
     };

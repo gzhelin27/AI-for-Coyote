@@ -63,3 +63,18 @@ test('buffering during a seek does not create an extra seek epoch', () => {
   assert.equal(bridge.currentSequence, 5);
   bridge.onMediaState('seeking', 7000); assert.equal(bridge.currentEpoch, 3);
 });
+
+test('unchanged or regressing media time cannot renew a playing lease', () => {
+  const { bridge, sent, time } = harness();
+  bridge.onMediaState('playing', 500);
+  for (const [wall, position] of [[200, 500], [400, 499], [1500, 500]]) {
+    time(wall); bridge.onVideoFrame(position);
+    bridge.onMediaState('playing', position);
+  }
+  assert.equal(sent.length, 1);
+  time(1600); bridge.onVideoFrame(600);
+  assert.equal(sent.length, 2);
+  bridge.onMediaState('paused', 600);
+  bridge.onMediaState('playing', 600);
+  assert.equal(sent.at(-1).state, 'playing', 'explicit resume can authorize the current position');
+});
