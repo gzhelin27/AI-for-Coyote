@@ -18,6 +18,7 @@ __all__ = [
     "ConfirmedChannelOutput",
     "DeviceOutputCoordinator",
     "OutputIntentKind",
+    "OutputOwnership",
     "PendingSafetyWork",
     "ReportReconciliation",
     "TransportOutcome",
@@ -113,6 +114,40 @@ _ChannelOperation: TypeAlias = Callable[
 _GlobalOperation: TypeAlias = Callable[
     [Mapping[str, ConfirmedChannelOutput]], Awaitable[TransportOutcome]
 ]
+
+
+class OutputOwnership:
+    """Track a caller's own synchronous mutations without adopting other owners.
+
+    This is an observation token, not permission to bypass coordinator priority.
+    Once another generation or safety policy intervenes it stays retired.
+    """
+
+    def __init__(self, coordinator, channels=_CHANNELS):
+        self.coordinator = coordinator
+        self.channels = tuple(channels)
+        self._expected = self._snapshot()
+        self._retired = False
+
+    def _snapshot(self):
+        return tuple((self.coordinator.generation(c), self.coordinator.normal_policy_epoch(c))
+                     for c in self.channels)
+
+    def retire(self):
+        self._retired = True
+
+    def is_current(self):
+        if self._snapshot() != self._expected:
+            self.retire()
+        return not self._retired
+
+    def advance(self, operation, *args):
+        """Attribute only this synchronous preparation to the existing owner."""
+        current = self.is_current()
+        result = operation(*args)
+        if current:
+            self._expected = self._snapshot()
+        return result
 
 
 class DeviceOutputCoordinator:
@@ -370,10 +405,12 @@ class DeviceOutputCoordinator:
         channel: str,
         kind: OutputIntentKind,
         operation: _ChannelOperation,
+        *,
+        ownership: OutputOwnership | None = None,
     ) -> TransportOutcome:
         slot = self._slot(channel)
         intent = _kind(kind)
-        self._prepare_safety_intent(channel, intent)
+        self._prepare_owned_intent(channel, intent, ownership)
         started_generation = slot.generation
         started_normal_epoch = slot.normal_epoch
         pending_expectation: object = _NO_PENDING_EXPECTATION
@@ -398,12 +435,14 @@ class DeviceOutputCoordinator:
         self,
         kind: OutputIntentKind,
         operation: _GlobalOperation,
+        *,
+        ownership: OutputOwnership | None = None,
     ) -> TransportOutcome:
         """Run one two-channel transport while acquiring A before B."""
 
         intent = _kind(kind)
         for channel in _CHANNELS:
-            self._prepare_safety_intent(channel, intent)
+            self._prepare_owned_intent(channel, intent, ownership)
         generations = {
             channel: self._slots[channel].generation for channel in _CHANNELS
         }
@@ -411,6 +450,14 @@ class DeviceOutputCoordinator:
             self._run_global_locked(generations, intent, operation)
         )
         return await _await_cleanup(task)
+
+    def _prepare_owned_intent(self, channel, intent, ownership):
+        if ownership is None:
+            self._prepare_safety_intent(channel, intent)
+        else:
+            if ownership.coordinator is not self:
+                raise ValueError('ownership belongs to a different coordinator')
+            ownership.advance(self._prepare_safety_intent, channel, intent)
 
     async def release_estop(self) -> bool:
         """Release both estop latches only after a confirmed global clear."""

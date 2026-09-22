@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 import time
 
-from backend.output_coordinator import OutputIntentKind
+from backend.output_coordinator import OutputIntentKind, OutputOwnership
 
 
 @dataclass(frozen=True)
@@ -31,12 +31,18 @@ class GameLoopVideoOutput:
         self.generations = {}
         self.offsets = {'A': 0, 'B': 0}
         self._owner_token = None
+        self._clear_ownership = None
+        self._clearing = False
 
     def bind_session(self, session):
         self._owner_token = self.loop._register_video_output(session)
 
     def claim(self):
+        if self._clear_ownership is not None and not self._clear_ownership.is_current():
+            return False
         self.generations = self.loop.begin_timeline_output(('A', 'B'))
+        self._clear_ownership = None
+        return True
 
     def snapshot(self, channel):
         safety = self.loop.safety
@@ -52,18 +58,37 @@ class GameLoopVideoOutput:
         return bool(self.generations) and all(
             self.loop.output_coordinator.is_current(c, g) for c, g in self.generations.items())
 
+    @property
+    def clearing(self):
+        return self._clearing
+
+    def owns_control(self):
+        return self._clear_ownership.is_current() if self._clear_ownership is not None else self.is_current()
+
     def preempt(self, channels=('A', 'B')):
         # Synchronous: wake ACK waiters before any action/session lock is awaited.
-        self.loop.require_output_clear(channels)
+        if self._clear_ownership is None:
+            current = not self.generations or self.is_current()
+            self._clear_ownership = OutputOwnership(self.loop.output_coordinator)
+            if not current:
+                self._clear_ownership.retire()
+        self._clear_ownership.advance(self.loop.require_output_clear, channels)
 
     def retire_normal(self):
         """Retire a waveform node without resetting known intensity."""
+        if self._clear_ownership is not None or not self.is_current():
+            return
         self.claim()
         self.loop._interrupt_relay_waits(('A', 'B'))
 
     async def clear(self, channels=('A', 'B')):
         self.preempt(channels)
-        result = await self.loop.clear_output(None if set(channels) == {'A', 'B'} else channels[0])
+        self._clearing = True
+        try:
+            result = await self.loop.clear_output(None if set(channels) == {'A', 'B'} else channels[0],
+                                                  _clear_ownership=self._clear_ownership)
+        finally:
+            self._clearing = False
         if not result[0] or result[1]:
             raise RuntimeError('video output clear was not confirmed')
         for channel in channels:

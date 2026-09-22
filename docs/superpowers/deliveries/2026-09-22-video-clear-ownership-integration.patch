@@ -1,0 +1,98 @@
+--- a/backend/game_loop.py
++++ b/backend/game_loop.py
+@@ -1755,6 +1755,7 @@
+         waveform_managed_channels: tuple[str, ...] = (),
+         video_remaining_ms=None,
+         _video_owner=None,
++        _clear_ownership=None,
+     ) -> tuple[list, list]:
+         """Validate and execute actions through the single output coordinator.
+ 
+@@ -1801,6 +1802,8 @@
+             if _video_owner is not None and not self._video_owner_allows(_video_owner, video_revision, actions, generations):
+                 return [], [{"action": action, "reason": "retired video output authority"} for action in actions]
+             previous = self._execution_context
++            previous_clear = getattr(self, '_clear_ownership_context', None)
++            self._clear_ownership_context = _clear_ownership
+             previous_video = getattr(self, "_video_execution_context", None)
+             self._video_execution_context = (_video_owner, video_revision, actions, generations) if _video_owner is not None else None
+             previous_managed = getattr(self, "_waveform_managed_channels", ())
+@@ -1811,6 +1814,7 @@
+             try:
+                 return await self._execute_actions_locked(actions)
+             finally:
++                self._clear_ownership_context = previous_clear
+                 self._execution_context = previous
+                 self._video_execution_context = previous_video
+                 self._waveform_managed_channels = previous_managed
+@@ -1976,6 +1980,7 @@
+                 slot_id=slot_id,
+                 ready=ready,
+                 dry_run=dry_run,
++                _clear_ownership=getattr(self, '_clear_ownership_context', None),
+             )
+             if not transaction["complete"]:
+                 dropped.append(
+@@ -2031,6 +2036,7 @@
+         slot_id: str | None,
+         ready: bool,
+         dry_run: bool,
++        _clear_ownership=None,
+     ) -> dict:
+         """Run one complete high-level action and expose only committed success."""
+         if cmd["kind"] in ("clear", "stop"):
+@@ -2047,6 +2053,7 @@
+                 slot_id=slot_id,
+                 ready=ready,
+                 dry_run=dry_run,
++                _clear_ownership=_clear_ownership,
+             )
+ 
+         channel = cmd["channel"]
+@@ -2363,6 +2370,7 @@
+         slot_id: str | None,
+         ready: bool,
+         dry_run: bool,
++        _clear_ownership=None,
+     ) -> dict:
+         channel = cmd.get("channel")
+         global_clear = cmd["kind"] == "stop" or channel is None
+@@ -2414,7 +2422,8 @@
+                 )
+ 
+             try:
+-                outcome = await self.output_coordinator.run_global(intent, transport)
++                outcome = await self.output_coordinator.run_global(
++                    intent, transport, **({'ownership': _clear_ownership} if _clear_ownership is not None else {}))
+             finally:
+                 for name in ("A", "B"):
+                     self._publish_coordinator_confirmed(name)
+@@ -2456,7 +2465,8 @@
+ 
+             try:
+                 outcome = await self.output_coordinator.run(
+-                    channel, intent, transport
++                    channel, intent, transport,
++                    **({'ownership': _clear_ownership} if _clear_ownership is not None else {})
+                 )
+             finally:
+                 self._publish_coordinator_confirmed(channel)
+@@ -2723,14 +2733,16 @@
+         if not outcome.sent:
+             raise RuntimeError(outcome.error or "waveform clear was not confirmed")
+ 
+-    async def clear_output(self, channel=None) -> tuple[list, list]:
++    async def clear_output(self, channel=None, *, _clear_ownership=None) -> tuple[list, list]:
+         """物理清除输出，不触发或改变急停状态。"""
+         action = (
+             {"op": "stop"}
+             if channel is None
+             else {"op": "clear", "channel": channel}
+         )
+-        return await self.execute_actions([action])
++        if _clear_ownership is None:
++            return await self.execute_actions([action])
++        return await self.execute_actions([action], _clear_ownership=_clear_ownership)
+ 
+     def _effective_result(self, action: dict, cmd: dict) -> dict:
+         """返回适合时间线记账的生效值；设备原始帧不得泄漏到结果。"""

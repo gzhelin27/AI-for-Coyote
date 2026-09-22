@@ -37,7 +37,8 @@ class VideoSession:
     async def start(self):
         await self.output.clear()
         self.output.bind_session(self)
-        self.output.claim()
+        if not self.output.claim():
+            raise RuntimeError('video output ownership changed during startup')
         if self._watch_enabled:
             self._watcher = asyncio.create_task(self._watch(), name='video-lease-watchdog')
         return self.state()
@@ -65,7 +66,7 @@ class VideoSession:
                 'row': None if row is None else {'start_ms': row.start_ms, 'end_ms': row.end_ms},
                 'block': None if block is None else {'start_ms': block.start_ms, 'end_ms': block.end_ms, 'index': block.index},
                 'channels': channels, 'error': self.error, 'dry_run': self.dry_run,
-                'clear_pending': self._clear_required}
+                'clear_pending': self._clear_required or self.output.clearing}
 
     async def observe(self, observation):
         if self.closed:
@@ -143,7 +144,7 @@ class VideoSession:
         if self.status == 'playing':
             if now >= self._lease_until:
                 self._invalidate('paused', '播放时钟已失联', bump_epoch=True)
-            elif not self.output.is_current() and not self._clear_required:
+            elif not self.output.owns_control():
                 self._invalidate('paused', '输出控制权已改变', bump_epoch=True)
             else:
                 block = find_block(self.plan, self.position_ms)
@@ -225,11 +226,17 @@ class VideoSession:
                 self._clear_required = False
                 self._wave_keys = {'A': None, 'B': None}
                 self._wave_until = {'A': 0., 'B': 0.}
-                self.output.claim()
+                if not self.output.claim():
+                    if self.status == 'playing':
+                        self._invalidate('paused', '输出控制权已改变', bump_epoch=True)
+                    continue
             if self.closed or self.status != 'playing':
                 continue
             if self.clock() >= self._lease_until:
                 self._invalidate('paused', '播放时钟已失联', bump_epoch=True)
+                continue
+            if not self.output.owns_control():
+                self._invalidate('paused', '输出控制权已改变', bump_epoch=True)
                 continue
             block = find_block(self.plan, self.position_ms)
             try:
@@ -241,10 +248,13 @@ class VideoSession:
                     if not requested:
                         if snap.strength or self._wave_keys[channel] is not None:
                             await self.output.clear((channel,))
+                            owned = self.output.claim()
+                            self._wave_keys[channel], self._wave_until[channel] = None, 0.
                             if revision != self._revision:
                                 break
-                            self.output.claim()
-                            self._wave_keys[channel], self._wave_until[channel] = None, 0.
+                            if not owned:
+                                self._invalidate('paused', '输出控制权已改变', bump_epoch=True)
+                                break
                         continue
                     if snap.blocked or not snap.enabled:
                         self._invalidate('paused', '通道安全状态阻止播放', bump_epoch=True)
