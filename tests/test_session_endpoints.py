@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import suppress
 from copy import deepcopy
+import gc
 import io
 import json
 from pathlib import Path
@@ -257,6 +258,9 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
                     release.wait(0.25)
                     return original(*args, **kwargs)
 
+                # Earlier endpoint fixtures leave cycles; collect before this
+                # scheduling measurement so their finalizers do not consume it.
+                gc.collect()
                 ticked_at: list[float] = []
                 started_at = time.perf_counter()
 
