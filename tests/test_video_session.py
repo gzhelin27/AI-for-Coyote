@@ -102,6 +102,53 @@ class VideoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('输出清零未确认', captured.output[0])
         self.assertNotIn('private device details', captured.output[0])
 
+    async def test_first_clear_failure_logs_safe_reason_without_exposing_private_text(self):
+        await self.observe(0)
+        with patch.object(self.output, 'clear', AsyncMock(
+            side_effect=RuntimeError('stale output generation'))):
+            with self.assertLogs('ai-for-coyote.video', level='WARNING') as captured:
+                await self.observe(100, 'paused')
+                await self.session.flush()
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn('输出清零未确认', captured.output[0])
+        self.assertIn('stale output generation', captured.output[0])
+        self.assertIn('position_ms=100', captured.output[0])
+
+    async def test_real_clear_adapter_keeps_safe_drop_reason_for_first_failure(self):
+        await self.observe(0)
+        with patch.object(self.h.loop, 'clear_output', AsyncMock(
+            return_value=([], [{'reason': 'stale output generation'}]))):
+            with self.assertLogs('ai-for-coyote.video', level='WARNING') as captured:
+                await self.observe(100, 'paused')
+                await self.session.flush()
+        self.assertIn('输出清零未确认', captured.output[0])
+        self.assertIn('stale output generation', captured.output[0])
+
+    async def test_fake_relay_clear_ack_failure_logs_transport_reason(self):
+        await self.observe(0)
+        self.h.safety.dry_run = False
+        try:
+            with patch.object(self.h.relay, 'send_clear_frames',
+                              AsyncMock(return_value=[False]), create=True):
+                with self.assertLogs('ai-for-coyote.video', level='WARNING') as captured:
+                    await self.observe(100, 'paused')
+                    await self.session.flush()
+            self.assertIn('输出清零未确认', captured.output[0])
+            self.assertIn('APP clear was not confirmed', captured.output[0])
+            self.assertTrue(self.session.state()['clear_pending'])
+        finally:
+            self.h.safety.dry_run = True
+
+    async def test_ownership_interruption_logs_bounded_generation_snapshot(self):
+        await self.observe(0)
+        self.h.loop.require_output_clear(('A', 'B'))
+        with self.assertLogs('ai-for-coyote.video', level='WARNING') as captured:
+            await self.session.tick()
+            await self.session.flush()
+        self.assertIn('输出控制权已改变', captured.output[0])
+        self.assertIn('expected_generation', captured.output[0])
+        self.assertNotIn(self.session.source_id, captured.output[0])
+
     async def test_repeated_clock_does_not_reset_wave_or_resend_strength(self):
         await self.observe(0)
         for _ in range(10):

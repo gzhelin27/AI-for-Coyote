@@ -1,0 +1,111 @@
+--- a/backend/game_loop.py
++++ b/backend/game_loop.py
+@@ -1289,11 +1289,17 @@
+     async def set_channel_enabled(self, channel: str, enabled: bool) -> dict:
+         """Commit enabled state only after any required clear is confirmed."""
+         channel = self.safety.norm_channel(channel)
++        was_desired_enabled = self.safety.desired_enabled[channel]
+         desired = self.safety.request_channel_enabled(channel, enabled)
+         self._sync_output_coordinator_channel(channel)
+         confirmed = self.output_coordinator.confirmed(channel)
+         was_confirmed_enabled = confirmed.enabled
+         pending = self.output_coordinator.pending(channel)
++        if was_desired_enabled and not desired:
++            # A real operator disable is a new intent even when video already
++            # has a pending clear; it must retire the old owner immediately.
++            self.output_coordinator.require_clear(channel)
++            pending = self.output_coordinator.pending(channel)
+         if (
+             not desired
+             and not pending.clear_required
+@@ -1415,7 +1421,9 @@
+             )
+ 
+         try:
+-            result = await self._reconcile_channel_safety_locked(channel)
++            result = await self._reconcile_channel_safety_locked(
++                channel, retry_existing_clear=True
++            )
+         except DeviceOutputError as exc:
+             result = self._safety_failure_result(channel, exc)
+ 
+@@ -1461,7 +1469,9 @@
+             raise failures[0]
+         return results
+ 
+-    async def _reconcile_channel_safety_locked(self, channel: str) -> dict:
++    async def _reconcile_channel_safety_locked(
++        self, channel: str, *, retry_existing_clear: bool = False
++    ) -> dict:
+         coordinator = self.output_coordinator
+         desired_enabled = self.safety.desired_enabled[channel]
+         confirmed = coordinator.confirmed(channel)
+@@ -1491,22 +1501,33 @@
+ 
+         executed: list[dict] = []
+         if pending.clear_required:
+-            self._cancel_loops(channel, reset_pulse=False)
+-            outcome = await self._run_coordinated_safety(
+-                channel,
+-                OutputIntentKind.CLEAR_OR_DISABLE,
+-                lambda snapshot: self._transport_safety_clear(
+-                    channel, snapshot, desired_enabled
+-                ),
+-            )
+-            self._require_safety_outcome(channel, "clear", outcome)
+-            confirmed = coordinator.confirmed(channel)
+-            self.safety.confirm_clear(channel)
+-            self.safety.confirm_channel_enabled(channel, confirmed.enabled)
+-            self.patterns[channel] = None
+-            executed.append(
+-                self._safety_success_result(channel, "clear", outcome)
+-            )
++            operation = lambda snapshot: self._transport_safety_clear(
++                channel, snapshot, desired_enabled
++            )
++            outcome = None
++            if retry_existing_clear:
++                retry = await self._retry_coordinated_clear(channel, operation)
++                if retry.status == "superseded":
++                    return {"executed": executed, "dropped": []}
++                if retry.status == "not_pending":
++                    if coordinator.pending(channel).clear_required:
++                        return {"executed": executed, "dropped": []}
++                else:
++                    outcome = retry.outcome
++            else:
++                self._cancel_loops(channel, reset_pulse=False)
++                outcome = await self._run_coordinated_safety(
++                    channel, OutputIntentKind.CLEAR_OR_DISABLE, operation
++                )
++            if outcome is not None:
++                self._require_safety_outcome(channel, "clear", outcome)
++                confirmed = coordinator.confirmed(channel)
++                self.safety.confirm_clear(channel)
++                self.safety.confirm_channel_enabled(channel, confirmed.enabled)
++                self.patterns[channel] = None
++                executed.append(
++                    self._safety_success_result(channel, "clear", outcome)
++                )
+ 
+         confirmed = coordinator.confirmed(channel)
+         pending = coordinator.pending(channel)
+@@ -1551,6 +1572,18 @@
+         self._interrupt_relay_waits((channel,))
+         try:
+             return await self.output_coordinator.run(channel, kind, operation)
++        finally:
++            self._publish_coordinator_confirmed(channel)
++
++    async def _retry_coordinated_clear(self, channel, operation):
++        """Service a pending report clear only after its owner is rechecked."""
++        async def guarded(snapshot):
++            self._cancel_loops(channel, reset_pulse=False)
++            self._interrupt_relay_waits((channel,))
++            return await operation(snapshot)
++
++        try:
++            return await self.output_coordinator.retry_pending_clear(channel, guarded)
+         finally:
+             self._publish_coordinator_confirmed(channel)
+ 

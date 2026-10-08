@@ -1,0 +1,6 @@
+{
+  "backend/game_loop.py": {
+    "baseline_normalized_sha256": "b7d0b8dc250de897aac74caacf434012964146f012701c7ec0d19d34a4a0e281",
+    "result_normalized_sha256": "4de82a6411f2ff58c1887d558e8af0734b63ccfaa26c5d003fe34246cae787f9"
+  }
+}

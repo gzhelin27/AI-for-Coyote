@@ -65,6 +65,25 @@ class GameLoopVideoOutput:
     def owns_control(self):
         return self._clear_ownership.is_current() if self._clear_ownership is not None else self.is_current()
 
+    def ownership_diagnostics(self):
+        if self._clear_ownership is not None:
+            return self._clear_ownership.diagnostics()
+        coordinator = self.loop.output_coordinator
+        return {
+            'retired': False,
+            'channels': {
+                channel: {
+                    'expected_generation': self.generations.get(channel),
+                    'generation': coordinator.generation(channel),
+                    'expected_policy': None,
+                    'policy': coordinator.normal_policy_epoch(channel),
+                    'clear_required': coordinator.pending(channel).clear_required,
+                    'reduction_pending': coordinator.pending(channel).target_strength is not None,
+                }
+                for channel in ('A', 'B')
+            },
+        }
+
     def preempt(self, channels=('A', 'B')):
         # Synchronous: wake ACK waiters before any action/session lock is awaited.
         if self._clear_ownership is None:
@@ -90,7 +109,9 @@ class GameLoopVideoOutput:
         finally:
             self._clearing = False
         if not result[0] or result[1]:
-            raise RuntimeError('video output clear was not confirmed')
+            dropped = result[1]
+            reason = dropped[0].get('reason') if dropped and isinstance(dropped[0], dict) else None
+            raise RuntimeError(reason or 'video output clear was not confirmed')
         for channel in channels:
             self.offsets[channel] = 0
 

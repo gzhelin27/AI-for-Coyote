@@ -4,6 +4,25 @@ from backend.output_coordinator import DeviceOutputCoordinator, OutputIntentKind
 
 
 class OutputOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_diagnostics_observe_external_change_without_mutating_owner(self):
+        coordinator = DeviceOutputCoordinator()
+        token = OutputOwnership(coordinator)
+        before = token.diagnostics()
+        self.assertFalse(before['retired'])
+        self.assertEqual(before['channels']['A']['generation'], 0)
+        self.assertEqual(before['channels']['A']['expected_generation'], 0)
+        coordinator.require_clear('A')
+        generation = coordinator.generation('A')
+        pending = coordinator.pending('A')
+        changed = token.diagnostics()
+        self.assertEqual(changed['channels']['A']['generation'], generation)
+        self.assertEqual(changed['channels']['A']['expected_generation'], 0)
+        self.assertTrue(changed['channels']['A']['clear_required'])
+        self.assertFalse(changed['retired'])
+        self.assertEqual(coordinator.generation('A'), generation)
+        self.assertEqual(coordinator.pending('A'), pending)
+        self.assertFalse(token.is_current())
+
     async def test_own_clear_preparation_preserves_token_but_external_policy_retires_it(self):
         coordinator = DeviceOutputCoordinator()
         token = OutputOwnership(coordinator)

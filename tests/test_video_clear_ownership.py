@@ -14,6 +14,40 @@ from tests.test_game_loop_timeline import make_game_loop_for_test
 
 
 class VideoClearOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_safe_device_report_during_video_clear_keeps_playing(self):
+        await self.prepare()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.h.loop.clear_output
+        delayed_once = False
+
+        async def delayed(channel=None, **kwargs):
+            nonlocal delayed_once
+            if not delayed_once:
+                delayed_once = True
+                entered.set()
+                await release.wait()
+            return await original(channel, **kwargs)
+
+        try:
+            with patch.object(self.h.loop, 'clear_output', delayed):
+                self.now = 1.05
+                await self.observe(1050)
+                await asyncio.wait_for(entered.wait(), 1)
+                coordinator = self.h.loop.output_coordinator
+                generation = coordinator.generation('A')
+                await self.h.loop.update_device_state(
+                    {'intensityA': 20, 'intensityB': 20}, None)
+                self.assertEqual(coordinator.generation('A'), generation)
+                self.assertTrue(self.output.owns_control())
+                await self.session.tick()
+                release.set()
+                await asyncio.wait_for(self.session.flush(), 2)
+                self.assertEqual(self.session.status, 'playing')
+                self.assertEqual(self.session.epoch, 1)
+                self.assertFalse(self.session.state()['clear_pending'])
+        finally:
+            release.set()
+
     async def asyncSetUp(self):
         self.h = make_game_loop_for_test(Path(self.enterContext(tempfile.TemporaryDirectory())))
         self.now = 0.

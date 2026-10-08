@@ -12,6 +12,29 @@ from .waveforms import find_block
 
 logger = logging.getLogger('ai-for-coyote.video')
 
+_SAFE_OUTPUT_ERRORS = (
+    'stale output generation',
+    'stale output safety policy',
+    'blocked by higher-priority output intent',
+    'pending safety reduction changed',
+    'channel is disabled',
+    'video output clear was not confirmed',
+    'retired video output',
+    'output failed',
+    'channel clear transport failed',
+    'APP clear was not confirmed',
+    'device is not connected',
+)
+
+
+def _failure_detail(exc: Exception) -> str:
+    """Retain known transport reasons without recording device/private content."""
+    message = str(exc)
+    for reason in _SAFE_OUTPUT_ERRORS:
+        if reason in message:
+            return reason
+    return type(exc).__name__
+
 
 class VideoSession:
     LEASE_S = 1.0
@@ -119,15 +142,21 @@ class VideoSession:
         if self._work is None or self._work.done():
             self._work = asyncio.create_task(self._drive(), name='video-output-update')
 
-    def _log_interruption(self, status, error):
+    def _log_interruption(self, status, error, *, detail=None):
         if error and (status, error) != (self.status, self.error):
+            ownership = None
+            if error == '输出控制权已改变':
+                diagnostics = getattr(self.output, 'ownership_diagnostics', None)
+                if callable(diagnostics):
+                    ownership = diagnostics()
             logger.warning('Video interrupted: reason=%s status=%s epoch=%s sequence=%s '
-                           'position_ms=%s observation_age_ms=%s', error, status,
+                           'position_ms=%s observation_age_ms=%s detail=%s ownership=%s', error, status,
                            self.epoch, self.sequence, self.position_ms,
-                           round(max(0, self.clock() - self._observed_at) * 1000))
+                           round(max(0, self.clock() - self._observed_at) * 1000),
+                           detail, ownership)
 
-    def _invalidate(self, status, error=None, *, bump_epoch=False):
-        self._log_interruption(status, error)
+    def _invalidate(self, status, error=None, *, bump_epoch=False, detail=None):
+        self._log_interruption(status, error, detail=detail)
         self._revision += 1
         self._boundary_cleared = None
         if bump_epoch:
@@ -212,11 +241,12 @@ class VideoSession:
                 self._last_clear_attempt = self.clock()
                 try:
                     await self.output.clear()
-                except Exception:
+                except Exception as exc:
                     if revision != self._revision:
                         self._dirty = True
                         continue
-                    self._log_interruption('error', '输出清零未确认')
+                    self._log_interruption('error', '输出清零未确认',
+                                           detail=_failure_detail(exc))
                     self.status, self.error = 'error', '输出清零未确认'
                     self._dirty = False
                     break
@@ -303,7 +333,8 @@ class VideoSession:
                         self._wave_until[channel] = max(self.clock(), self._wave_until[channel]) + receipt.duration_ms / 1000
             except Exception as exc:
                 if revision == self._revision:
-                    self._invalidate('error', '设备输出未确认', bump_epoch=True)
+                    self._invalidate('error', '设备输出未确认', bump_epoch=True,
+                                     detail=_failure_detail(exc))
 
     def _record(self, channel, target, strength, block_index, submitted_at,
                 observed_at, observed_position, cap):

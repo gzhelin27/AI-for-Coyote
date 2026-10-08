@@ -148,6 +148,21 @@ class OutputOwnership:
             self.retire()
         return not self._retired
 
+    def diagnostics(self) -> dict:
+        """Return only owner counters and pending flags, without claiming control."""
+        channels = {}
+        for channel, (generation, policy) in zip(self.channels, self._expected):
+            pending = self.coordinator.pending(channel)
+            channels[channel] = {
+                'expected_generation': generation,
+                'generation': self.coordinator.generation(channel),
+                'expected_policy': policy,
+                'policy': self.coordinator.normal_policy_epoch(channel),
+                'clear_required': pending.clear_required,
+                'reduction_pending': pending.target_strength is not None,
+            }
+        return {'retired': self._retired, 'channels': channels}
+
     def advance(self, operation, *args):
         """Attribute only this synchronous preparation to the existing owner."""
         current = self.is_current()

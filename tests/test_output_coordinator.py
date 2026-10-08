@@ -137,6 +137,74 @@ class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 0)
         self.assertTrue(coordinator.pending("A").clear_required)
 
+    async def test_policy_change_before_lock_skips_pending_retry(self):
+        coordinator = DeviceOutputCoordinator()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def busy(_snapshot):
+            entered.set()
+            await release.wait()
+            return TransportOutcome(True, {"strength": 1})
+
+        active = asyncio.create_task(coordinator.run("A", OutputIntentKind.MANUAL, busy))
+        await entered.wait()
+        coordinator.require_clear("A")
+        called = False
+
+        async def forbidden(_snapshot):
+            nonlocal called
+            called = True
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None})
+
+        retry = asyncio.create_task(coordinator.retry_pending_clear("A", forbidden))
+        await asyncio.sleep(0)
+        coordinator.invalidate_queued_normal("A")
+        release.set()
+        await active
+        result = await retry
+        self.assertEqual(result.status, "superseded")
+        self.assertFalse(called)
+        self.assertTrue(coordinator.pending("A").clear_required)
+
+    async def test_estop_blocks_pending_clear_retry_transport(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.require_clear("A")
+        coordinator.invalidate("A", OutputIntentKind.ESTOP)
+        called = False
+
+        async def forbidden(_snapshot):
+            nonlocal called
+            called = True
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None})
+
+        result = await coordinator.retry_pending_clear("A", forbidden)
+        self.assertEqual(result.status, "attempted")
+        self.assertFalse(result.outcome.sent)
+        self.assertFalse(called)
+        self.assertTrue(coordinator.pending("A").clear_required)
+
+    async def test_cancelled_retry_finishes_owned_cleanup(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.require_clear("A")
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def clear(_snapshot):
+            entered.set()
+            await release.wait()
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None})
+
+        retry = asyncio.create_task(coordinator.retry_pending_clear("A", clear))
+        await entered.wait()
+        retry.cancel()
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await retry
+        self.assertFalse(coordinator.pending("A").clear_required)
+        self.assertEqual(coordinator.confirmed("A").strength, 0)
+
     async def test_identical_safe_report_is_a_strict_ownership_noop(self):
         # Catches a report path that mutates revisions, pending safety work, or
         # any output owner counter even though the physical strength is unchanged.
