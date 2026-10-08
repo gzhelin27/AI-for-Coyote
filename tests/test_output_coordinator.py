@@ -5,6 +5,7 @@ import unittest
 from backend.output_coordinator import (
     DeviceOutputCoordinator,
     OutputIntentKind,
+    OutputOwnership,
     ReportReconciliation,
     TransportOutcome,
 )
@@ -20,6 +21,122 @@ async def async_outcome(
 
 
 class OutputCoordinatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_clear_retry_preserves_existing_owner(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.seed_confirmed("A", strength=20)
+        coordinator.require_clear("A")
+        owner = OutputOwnership(coordinator)
+        generation = coordinator.generation("A")
+        calls = []
+
+        async def clear(snapshot):
+            calls.append(snapshot)
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None
+            })
+
+        result = await coordinator.retry_pending_clear("A", clear)
+        self.assertEqual(result.status, "attempted")
+        self.assertTrue(result.outcome.sent)
+        self.assertTrue(owner.is_current())
+        self.assertEqual(coordinator.generation("A"), generation)
+        again = await coordinator.retry_pending_clear("A", clear)
+        self.assertEqual(again.status, "not_pending")
+        self.assertIsNone(again.outcome)
+        self.assertEqual(len(calls), 1)
+
+    async def test_concurrent_pending_clear_retries_send_once(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.require_clear("A")
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def clear(_snapshot):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None
+            })
+
+        first = asyncio.create_task(coordinator.retry_pending_clear("A", clear))
+        await entered.wait()
+        second = asyncio.create_task(coordinator.retry_pending_clear("A", clear))
+        await asyncio.sleep(0)
+        release.set()
+        a, b = await asyncio.gather(first, second)
+        self.assertEqual((a.status, b.status), ("attempted", "not_pending"))
+        self.assertEqual(calls, 1)
+
+    async def test_failed_pending_clear_remains_retryable(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.require_clear("A")
+        first = await coordinator.retry_pending_clear(
+            "A", lambda _snapshot: async_outcome(sent=False))
+        self.assertEqual(first.status, "attempted")
+        self.assertFalse(first.outcome.sent)
+        self.assertTrue(coordinator.pending("A").clear_required)
+        second = await coordinator.retry_pending_clear(
+            "A", lambda _snapshot: async_outcome(sent=True, effective={
+                "strength": 0, "waveform": None, "waveform_mode": None}))
+        self.assertTrue(second.outcome.sent)
+        self.assertFalse(coordinator.pending("A").clear_required)
+
+    async def test_external_clear_while_retry_waits_keeps_new_pending(self):
+        coordinator = DeviceOutputCoordinator()
+        coordinator.require_clear("A")
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def clear(_snapshot):
+            entered.set()
+            await release.wait()
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None
+            })
+
+        retry = asyncio.create_task(coordinator.retry_pending_clear("A", clear))
+        await entered.wait()
+        coordinator.require_clear("A")
+        release.set()
+        result = await retry
+        self.assertEqual(result.status, "superseded")
+        self.assertTrue(coordinator.pending("A").clear_required)
+        self.assertEqual(coordinator.confirmed("A").strength, 0)
+        self.assertEqual(coordinator._slot("A").minimum_priority,
+                         OutputIntentKind.CLEAR_OR_DISABLE)
+
+    async def test_external_clear_before_lock_skips_stale_retry_transport(self):
+        coordinator = DeviceOutputCoordinator()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def busy(_snapshot):
+            entered.set()
+            await release.wait()
+            return TransportOutcome(True, {"strength": 1})
+
+        active = asyncio.create_task(coordinator.run("A", OutputIntentKind.MANUAL, busy))
+        await entered.wait()
+        coordinator.require_clear("A")
+        calls = 0
+
+        async def clear(_snapshot):
+            nonlocal calls
+            calls += 1
+            return TransportOutcome(True, {
+                "strength": 0, "waveform": None, "waveform_mode": None
+            })
+
+        retry = asyncio.create_task(coordinator.retry_pending_clear("A", clear))
+        await asyncio.sleep(0)
+        coordinator.require_clear("A")
+        release.set()
+        await active
+        result = await retry
+        self.assertEqual(result.status, "superseded")
+        self.assertEqual(calls, 0)
+        self.assertTrue(coordinator.pending("A").clear_required)
+
     async def test_identical_safe_report_is_a_strict_ownership_noop(self):
         # Catches a report path that mutates revisions, pending safety work, or
         # any output owner counter even though the physical strength is unchanged.

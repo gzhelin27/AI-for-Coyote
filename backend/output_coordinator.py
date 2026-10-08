@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from types import MappingProxyType
-from typing import TypeAlias, TypeVar
+from typing import Literal, TypeAlias, TypeVar
 
 
 _CHANNELS = ("A", "B")
@@ -19,6 +19,7 @@ __all__ = [
     "DeviceOutputCoordinator",
     "OutputIntentKind",
     "OutputOwnership",
+    "PendingClearRetryResult",
     "PendingSafetyWork",
     "ReportReconciliation",
     "TransportOutcome",
@@ -93,6 +94,12 @@ class ReportReconciliation:
 
     confirmed: ConfirmedChannelOutput
     reduction_required: bool
+
+
+@dataclass(frozen=True)
+class PendingClearRetryResult:
+    status: Literal["not_pending", "superseded", "attempted"]
+    outcome: TransportOutcome | None = None
 
 
 @dataclass
@@ -399,6 +406,40 @@ class DeviceOutputCoordinator:
 
     def pending(self, channel: str) -> PendingSafetyWork:
         return self._slot(channel).pending
+
+    async def retry_pending_clear(
+        self, channel: str, operation: _ChannelOperation
+    ) -> PendingClearRetryResult:
+        """Retry an existing clear without creating another safety intent."""
+        slot = self._slot(channel)
+        generation, epoch = slot.generation, slot.normal_epoch
+        task = asyncio.create_task(
+            self._retry_pending_clear_locked(slot, generation, epoch, operation)
+        )
+        return await _await_cleanup(task)
+
+    async def _retry_pending_clear_locked(
+        self, slot: _ChannelSlot, generation: int, epoch: int,
+        operation: _ChannelOperation,
+    ) -> PendingClearRetryResult:
+        async with slot.lock:
+            if (slot.generation, slot.normal_epoch) != (generation, epoch):
+                return PendingClearRetryResult("superseded")
+            if not slot.pending.clear_required:
+                return PendingClearRetryResult("not_pending")
+            kind = OutputIntentKind.CLEAR_OR_DISABLE
+            rejection = self._rejection(slot, generation, kind)
+            if rejection is not None:
+                return PendingClearRetryResult("attempted", rejection)
+            outcome = await self._execute(operation, slot.confirmed)
+            changed = (slot.generation, slot.normal_epoch) != (generation, epoch)
+            newer_pending = slot.pending
+            committed = self._commit(slot, kind, outcome)
+            if changed:
+                slot.pending = newer_pending
+                self._refresh_priority(slot)
+                return PendingClearRetryResult("superseded", committed)
+            return PendingClearRetryResult("attempted", committed)
 
     async def run(
         self,
