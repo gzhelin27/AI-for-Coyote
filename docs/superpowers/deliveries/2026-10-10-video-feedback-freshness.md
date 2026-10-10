@@ -51,10 +51,13 @@ time; that separate timing limitation has not been changed here.
   An explicit external clear then paused playback, cleared both channels and
   did not resume automatically. No physical frames were sent.
 
-Deployment is awaiting an appropriate restart point: at verification completion
-the production service was in real-device mode with a running novel session and
-nonzero output. No production files or process have been changed by this repair
-at this point.
+After the user authorized saving the running novel and deploying, its completed
+replay archive and idle/zero-output state were verified. The three runtime files
+were backed up, copied into the production checkout and verified against the
+tested normalized hashes. The backend was restarted and its direct API and
+frontend proxy both verified: real-device mode, idle session, A/B output zero,
+and per-channel caps 40. The local configuration hash was unchanged. Phone
+pairing and real-device playback acceptance remain manual.
 
 Local evidence is retained under ignored `work/oct10-*` paths. Production
 configuration, device caps, imported content and CSV files are outside this
