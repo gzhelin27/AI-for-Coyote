@@ -1378,6 +1378,14 @@ class GameLoop:
         finally:
             self._publish_coordinator_confirmed(channel)
 
+        if reconciliation.reduction_required:
+            logger.warning(
+                "Device feedback safety reduction: channel=%s reported=%s cap=%s "
+                "confirmed=%s overheat=%s",
+                channel, reported_strength, cap,
+                reconciliation.confirmed.strength, self.safety.overheat[channel],
+            )
+
         pending = self.output_coordinator.pending(channel)
         if (
             not reconciliation.reduction_required

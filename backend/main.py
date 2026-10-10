@@ -1331,12 +1331,18 @@ class AppState:
     # ---------- 中继事件 ----------
     async def on_relay_event(self, event: str, payload: dict) -> None:
         if event == "slots_patch":
-            # 取第一台设备的 props/slotState 同步给安全层
-            client = self.relay.clients.get(self.relay.first_client_id() or "")
-            if client:
-                await self.loop.update_device_state(
-                    client.get("props"), client.get("slotState")
-                )
+            # Replaying the cumulative cache here can turn an old waveform
+            # amplitude into a new strength report once that waveform ends.
+            # Only this event's delta for the selected device is authoritative.
+            client_id = self.relay.first_client_id()
+            if client_id is not None and payload.get("client_id") == client_id:
+                slot_id = self.relay.get_slot_id(client_id)
+                for slot in payload.get("slots") or []:
+                    if (isinstance(slot, dict) and slot_id is not None
+                            and slot.get("slotId") == slot_id):
+                        await self.loop.update_device_state(
+                            slot.get("props"), slot.get("slotState")
+                        )
         elif event == "client_attached" and not self.auto_opened:
             # 首次配对成功：AI 主动开场（挑逗 + 第一个轻微试探）
             self.auto_opened = True

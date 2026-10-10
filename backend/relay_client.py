@@ -8,6 +8,7 @@
 - APP 上行：devices.snapshot（设备列表）、slots.patch（强度/状态）、custom.action（反馈按钮）。
 """
 import asyncio
+from copy import deepcopy
 import json
 import logging
 
@@ -172,6 +173,11 @@ class RelayClient:
                 ] + list(added)
                 asyncio.create_task(self._emit("devices_patch", data))
             elif ev == "slots.patch":
+                # The display cache is cumulative and its nested dictionaries
+                # can be mutated by later patches before an async callback runs.
+                # Safety consumers need the exact delta from this sender.
+                report = deepcopy(data)
+                report["client_id"] = cid
                 for slot in data.get("slots") or []:
                     sid = slot.get("slotId")
                     if not sid:
@@ -181,7 +187,7 @@ class RelayClient:
                     client["props"], client["slotState"] = props, slot_state
                     # 设备当前是这台 slot 时，直接给 props 打上 slotId 方便安全层读取
                     props.setdefault("slotId", sid)
-                asyncio.create_task(self._emit("slots_patch", data))
+                asyncio.create_task(self._emit("slots_patch", report))
             elif ev == "custom.action":
                 action = data.get("action")
                 logger.info("收到 APP 反馈按钮: %s (来自 %s)", action, cid)

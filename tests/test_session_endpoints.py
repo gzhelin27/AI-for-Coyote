@@ -44,6 +44,17 @@ class FakeSensor:
         return {"running": False, "error": None}
 
 
+async def deliver_slot_patch(state):
+    """Send the fixture as a device delta, with the relay sender and slot."""
+    client = state.relay.clients["client-test"]
+    await state.on_relay_event("slots_patch", {
+        "client_id": "client-test", "slots": [{
+            "slotId": "slot-test", "props": deepcopy(client["props"]),
+            "slotState": deepcopy(client["slotState"]),
+        }],
+    })
+
+
 class CapturingWebSocket:
     def __init__(self):
         self.messages = []
@@ -480,7 +491,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             }
         }
 
-        await self.state.on_relay_event("slots_patch", {})
+        await deliver_slot_patch(self.state)
 
         self.assertTrue(self.harness.safety.overheat["A"])
         self.assertEqual(self.harness.safety.current["A"], 20)
@@ -509,7 +520,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
             }
         }
 
-        await self.state.on_relay_event("slots_patch", {})
+        await deliver_slot_patch(self.state)
 
         self.assertTrue(self.harness.safety.overheat["A"])
         self.assertIsNone(self.harness.safety.app_caps["A"])
@@ -539,7 +550,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
                 }
             }
 
-            await self.state.on_relay_event("slots_patch", {})
+            await deliver_slot_patch(self.state)
             await self._complete_active_cycle("A")
             await self._complete_active_cycle("A")
 
@@ -579,7 +590,7 @@ class SessionEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "slotState": {},
                 }
             }
-            await self.state.on_relay_event("slots_patch", {})
+            await deliver_slot_patch(self.state)
             remaining = self.harness.clock.next_remaining_ms
             self.assertIsNotNone(remaining)
             self.harness.clock.advance(remaining)
